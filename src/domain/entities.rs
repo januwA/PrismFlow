@@ -87,6 +87,15 @@ pub struct PullRequestFilePatch {
 pub struct SimpleComment {
     pub id: u64,
     pub body: String,
+    pub author_login: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+pub struct SimplePullReview {
+    pub id: u64,
+    pub body: String,
+    pub state: String,
+    pub author_login: Option<String>,
 }
 
 #[allow(dead_code)]

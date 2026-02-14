@@ -8,7 +8,9 @@ use serde_json::json;
 use tokio::sync::Semaphore;
 
 use crate::domain::{
-    entities::{PullRequestFilePatch, PullRequestSummary, ReviewComment, SimpleComment},
+    entities::{
+        PullRequestFilePatch, PullRequestSummary, ReviewComment, SimpleComment, SimplePullReview,
+    },
     ports::GitHubRepository,
 };
 
@@ -38,6 +40,16 @@ impl OctocrabGitHubRepository {
 
 #[async_trait]
 impl GitHubRepository for OctocrabGitHubRepository {
+    async fn current_user_login(&self) -> Result<String> {
+        #[derive(Debug, Deserialize)]
+        struct UserDto {
+            login: String,
+        }
+        let _permit = self.acquire_api_permit().await?;
+        let me: UserDto = self.client.get("/user", None::<&()>).await?;
+        Ok(me.login)
+    }
+
     async fn list_open_pull_requests(&self, owner: &str, repo: &str) -> Result<Vec<PullRequestSummary>> {
         let _permit = self.acquire_api_permit().await?;
         let page = self
@@ -136,6 +148,11 @@ impl GitHubRepository for OctocrabGitHubRepository {
         struct CommentDto {
             id: u64,
             body: Option<String>,
+            user: Option<UserDto>,
+        }
+        #[derive(Debug, Deserialize)]
+        struct UserDto {
+            login: String,
         }
 
         let _permit = self.acquire_api_permit().await?;
@@ -146,6 +163,7 @@ impl GitHubRepository for OctocrabGitHubRepository {
             .map(|i| SimpleComment {
                 id: i.id,
                 body: i.body.unwrap_or_default(),
+                author_login: i.user.map(|u| u.login),
             })
             .collect())
     }
@@ -254,6 +272,11 @@ impl GitHubRepository for OctocrabGitHubRepository {
         struct CommentDto {
             id: u64,
             body: Option<String>,
+            user: Option<UserDto>,
+        }
+        #[derive(Debug, Deserialize)]
+        struct UserDto {
+            login: String,
         }
         let _permit = self.acquire_api_permit().await?;
         let route = format!("/repos/{owner}/{repo}/pulls/{pull_number}/comments");
@@ -263,6 +286,38 @@ impl GitHubRepository for OctocrabGitHubRepository {
             .map(|i| SimpleComment {
                 id: i.id,
                 body: i.body.unwrap_or_default(),
+                author_login: i.user.map(|u| u.login),
+            })
+            .collect())
+    }
+
+    async fn list_pull_reviews(
+        &self,
+        owner: &str,
+        repo: &str,
+        pull_number: u64,
+    ) -> Result<Vec<SimplePullReview>> {
+        #[derive(Debug, Deserialize)]
+        struct ReviewDto {
+            id: u64,
+            body: Option<String>,
+            state: Option<String>,
+            user: Option<UserDto>,
+        }
+        #[derive(Debug, Deserialize)]
+        struct UserDto {
+            login: String,
+        }
+        let _permit = self.acquire_api_permit().await?;
+        let route = format!("/repos/{owner}/{repo}/pulls/{pull_number}/reviews");
+        let items: Vec<ReviewDto> = self.client.get(route, None::<&()>).await?;
+        Ok(items
+            .into_iter()
+            .map(|i| SimplePullReview {
+                id: i.id,
+                body: i.body.unwrap_or_default(),
+                state: i.state.unwrap_or_default(),
+                author_login: i.user.map(|u| u.login),
             })
             .collect())
     }
@@ -288,6 +343,34 @@ impl GitHubRepository for OctocrabGitHubRepository {
         let _permit = self.acquire_api_permit().await?;
         let route = format!("/repos/{owner}/{repo}/pulls/comments/{comment_id}");
         let _: serde_json::Value = self.client.delete(route, None::<&()>).await?;
+        Ok(())
+    }
+
+    async fn delete_pending_pull_review(
+        &self,
+        owner: &str,
+        repo: &str,
+        pull_number: u64,
+        review_id: u64,
+    ) -> Result<()> {
+        let _permit = self.acquire_api_permit().await?;
+        let route = format!("/repos/{owner}/{repo}/pulls/{pull_number}/reviews/{review_id}");
+        let _: serde_json::Value = self.client.delete(route, None::<&()>).await?;
+        Ok(())
+    }
+
+    async fn dismiss_pull_review(
+        &self,
+        owner: &str,
+        repo: &str,
+        pull_number: u64,
+        review_id: u64,
+        message: &str,
+    ) -> Result<()> {
+        let _permit = self.acquire_api_permit().await?;
+        let route = format!("/repos/{owner}/{repo}/pulls/{pull_number}/reviews/{review_id}/dismissals");
+        let payload = json!({ "message": message });
+        let _: serde_json::Value = self.client.put(route, Some(&payload)).await?;
         Ok(())
     }
 }

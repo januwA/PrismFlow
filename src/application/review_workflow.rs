@@ -1307,6 +1307,10 @@ mod tests {
 
     #[async_trait]
     impl GitHubRepository for MockGitHub {
+        async fn current_user_login(&self) -> Result<String> {
+            Ok("mock-user".to_string())
+        }
+
         async fn list_open_pull_requests(&self, _owner: &str, _repo: &str) -> Result<Vec<PullRequestSummary>> {
             if let Some(msg) = &self.list_pr_fail_msg {
                 return Err(anyhow!(msg.clone()));
@@ -1370,6 +1374,7 @@ mod tests {
                 .map(|(idx, body)| crate::domain::entities::SimpleComment {
                     id: (idx + 1) as u64,
                     body,
+                    author_login: Some("mock-user".to_string()),
                 })
                 .collect())
         }
@@ -1465,6 +1470,15 @@ mod tests {
             Ok(vec![])
         }
 
+        async fn list_pull_reviews(
+            &self,
+            _owner: &str,
+            _repo: &str,
+            _pull_number: u64,
+        ) -> Result<Vec<crate::domain::entities::SimplePullReview>> {
+            Ok(vec![])
+        }
+
         async fn delete_issue_comment(
             &self,
             _owner: &str,
@@ -1479,6 +1493,27 @@ mod tests {
             _owner: &str,
             _repo: &str,
             _comment_id: u64,
+        ) -> Result<()> {
+            Ok(())
+        }
+
+        async fn delete_pending_pull_review(
+            &self,
+            _owner: &str,
+            _repo: &str,
+            _pull_number: u64,
+            _review_id: u64,
+        ) -> Result<()> {
+            Ok(())
+        }
+
+        async fn dismiss_pull_review(
+            &self,
+            _owner: &str,
+            _repo: &str,
+            _pull_number: u64,
+            _review_id: u64,
+            _message: &str,
         ) -> Result<()> {
             Ok(())
         }

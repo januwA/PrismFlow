@@ -203,8 +203,8 @@ pub enum ReviewSubcommand {
     },
     #[command(about = "清理指定 PR 上 PrismFlow 留下的评论与标签痕迹（尽力而为）")]
     Clean {
-        #[arg(help = "GitHub PR 链接，例如 https://github.com/owner/repo/pull/123")]
-        pr_url: String,
+        #[arg(help = "一个或多个 GitHub PR 链接，例如 https://github.com/owner/repo/pull/123", num_args = 1..)]
+        pr_urls: Vec<String>,
         #[arg(long, default_value_t = 8, help = "全局 API 并发阈值")]
         max_concurrent_api: usize,
     },

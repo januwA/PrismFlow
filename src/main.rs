@@ -565,19 +565,37 @@ async fn main() -> Result<()> {
                 .await?;
             }
             ReviewSubcommand::Clean {
-                pr_url,
+                pr_urls,
                 max_concurrent_api,
             } => {
-                let (owner, repo, pr_number) = parse_github_pr_url(&pr_url)
-                    .with_context(|| format!("invalid GitHub PR URL: {pr_url}"))?;
-                run_review_clean(
-                    &auth_manager,
-                    owner,
-                    repo,
-                    pr_number,
-                    max_concurrent_api,
-                )
-                .await?;
+                let mut failed = 0usize;
+                for pr_url in pr_urls {
+                    match parse_github_pr_url(&pr_url)
+                        .with_context(|| format!("invalid GitHub PR URL: {pr_url}"))
+                    {
+                        Ok((owner, repo, pr_number)) => {
+                            if let Err(err) = run_review_clean(
+                                &auth_manager,
+                                owner,
+                                repo,
+                                pr_number,
+                                max_concurrent_api,
+                            )
+                            .await
+                            {
+                                failed += 1;
+                                eprintln!("clean_failed url={} error={err:#}", pr_url);
+                            }
+                        }
+                        Err(err) => {
+                            failed += 1;
+                            eprintln!("clean_failed url={} error={err:#}", pr_url);
+                        }
+                    }
+                }
+                if failed > 0 {
+                    anyhow::bail!("clean finished with failures: {}", failed);
+                }
             }
         },
     }
@@ -708,10 +726,16 @@ async fn run_review_clean(
         .context("token required for clean; run `prismflow auth login <token>` or configure gh/GITHUB_TOKEN")?;
 
     let github = OctocrabGitHubRepository::new(token, max_concurrent_api)?;
+    let me = github.current_user_login().await.ok();
     let issue_comments = github.list_issue_comments(owner, repo, pr_number).await?;
     let mut removed_issue_comments = 0usize;
     for c in issue_comments {
-        if is_prismflow_trace_comment(&c.body) {
+        if is_prismflow_trace_comment(&c.body)
+            || me
+                .as_ref()
+                .map(|m| c.author_login.as_deref() == Some(m.as_str()))
+                .unwrap_or(false)
+        {
             if github.delete_issue_comment(owner, repo, c.id).await.is_ok() {
                 removed_issue_comments += 1;
             }
@@ -721,10 +745,52 @@ async fn run_review_clean(
     let review_comments = github.list_pull_review_comments(owner, repo, pr_number).await?;
     let mut removed_review_comments = 0usize;
     for c in review_comments {
-        if is_prismflow_trace_comment(&c.body) {
+        if is_prismflow_trace_comment(&c.body)
+            || me
+                .as_ref()
+                .map(|m| c.author_login.as_deref() == Some(m.as_str()))
+                .unwrap_or(false)
+        {
             if github.delete_pull_review_comment(owner, repo, c.id).await.is_ok() {
                 removed_review_comments += 1;
             }
+        }
+    }
+
+    let reviews = github.list_pull_reviews(owner, repo, pr_number).await?;
+    let mut deleted_pending_reviews = 0usize;
+    let mut dismissed_reviews = 0usize;
+    for r in reviews {
+        let owned = me
+            .as_ref()
+            .map(|m| r.author_login.as_deref() == Some(m.as_str()))
+            .unwrap_or(false);
+        if !owned && !is_prismflow_trace_comment(&r.body) {
+            continue;
+        }
+
+        let state_lower = r.state.to_ascii_lowercase();
+        if state_lower == "pending"
+            && github
+                .delete_pending_pull_review(owner, repo, pr_number, r.id)
+                .await
+                .is_ok()
+        {
+            deleted_pending_reviews += 1;
+            continue;
+        }
+        if github
+            .dismiss_pull_review(
+                owner,
+                repo,
+                pr_number,
+                r.id,
+                "PrismFlow clean: dismiss stale auto review",
+            )
+            .await
+            .is_ok()
+        {
+            dismissed_reviews += 1;
         }
     }
 
@@ -739,8 +805,8 @@ async fn run_review_clean(
     }
 
     println!(
-        "clean_result repo={}/{} pr={} removed_issue_comments={} removed_review_comments={} removed_labels={}",
-        owner, repo, pr_number, removed_issue_comments, removed_review_comments, removed_labels
+        "clean_result repo={}/{} pr={} removed_issue_comments={} removed_review_comments={} deleted_pending_reviews={} dismissed_reviews={} removed_labels={}",
+        owner, repo, pr_number, removed_issue_comments, removed_review_comments, deleted_pending_reviews, dismissed_reviews, removed_labels
     );
     Ok(())
 }
