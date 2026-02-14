@@ -100,7 +100,7 @@ pub enum ScanSubcommand {
 }
 
 #[derive(Debug, Args)]
-#[command(after_long_help = "review COMMAND 可选：\n  once [--engine-fingerprint <值>] [--engine-command <命令>] [--engine <指纹> <命令>] [--clone-repo] [--clone-workspace-dir <目录>] [--engine-prompt <提示词>] [--engine-prompt-file <文件>] [--agent <名称>] [--keep-diff-files] [--max-concurrent-repos <值>] [--max-concurrent-prs <值>] [--max-concurrent-api <值>]\n  daemon [--interval-secs <秒>] [--ui] [--ui-bind <地址>] [--ui-token <口令>] [--engine-fingerprint <值>] [--engine-command <命令>] [--engine <指纹> <命令>] [--clone-repo] [--clone-workspace-dir <目录>] [--engine-prompt <提示词>] [--engine-prompt-file <文件>] [--agent <名称>] [--keep-diff-files] [--max-concurrent-repos <值>] [--max-concurrent-prs <值>] [--max-concurrent-api <值>]\n  ad-hoc <pr_url> [--engine-fingerprint <值>] [--engine-command <命令>] [--engine <指纹> <命令>] [--clone-repo] [--clone-workspace-dir <目录>] [--engine-prompt <提示词>] [--engine-prompt-file <文件>] [--agent <名称>] [--keep-diff-files] [--max-concurrent-api <值>]\n\n说明：\n  review 会向 GitHub 提交评论。\n  review 固定使用 shell 模式，本地命令支持 {patch_file} 占位符。\n  启用 --clone-repo 后，可额外使用 {repo_dir}、{repo_head_sha}、{repo_head_ref} 占位符。\n  --engine-prompt 或 --engine-prompt-file 会注入到 patch_file 顶部，便于定制模型行为。\n  --engine-prompt 和 --engine-prompt-file 不能同时使用。\n  --engine 可重复传入，每次必须给两个参数：<fingerprint> <command>，按 PR 轮询使用。\n  --engine 与 --engine-command 不能同时使用。\n  --agent 会先按全局 agent 目录配置查找；再回退到 当前目录/.prismflow/prompts 与系统配置目录 pr-reviewer/prompts。\n  --ui 启动本地 HTTP 管理页面；若开放局域网访问，建议同时设置 --ui-token。\n  默认会自动删除生成的 diff 文件；加 --keep-diff-files 可保留到 .prismflow/tmp-diffs。\n\n示例：\n  cargo run -- review once --clone-repo --engine qwen-v1 \"qwen -y \\\"diff={patch_file} repo={repo_dir} sha={repo_head_sha}\\\"\" --engine-prompt-file prompts/bug-only.txt --agent logic\n  cargo run -- review ad-hoc https://github.com/owner/repo/pull/123 --engine ollama:qwen2.5:1.5b \"cat {patch_file} | ollama run qwen2.5:1.5b\" --engine-prompt-file prompts/bug-only.txt --agent security\n  cargo run -- review daemon --ui --ui-bind 0.0.0.0:8787 --ui-token mysecret --interval-secs 30 --engine qwen-v1 \"qwen -y \\\"diff: {patch_file}\\\"\" --max-concurrent-repos 3 --max-concurrent-prs 6 --max-concurrent-api 12")]
+#[command(after_long_help = "review COMMAND 可选：\n  once [--engine-fingerprint <值>] [--engine-command <命令>] [--engine <指纹> <命令>] [--clone-repo] [--clone-workspace-dir <目录>] [--clone-depth <值>] [--engine-prompt <提示词>] [--engine-prompt-file <文件>] [--agent <名称>] [--keep-diff-files] [--max-concurrent-repos <值>] [--max-concurrent-prs <值>] [--max-concurrent-api <值>]\n  daemon [--interval-secs <秒>] [--ui] [--ui-bind <地址>] [--ui-token <口令>] [--engine-fingerprint <值>] [--engine-command <命令>] [--engine <指纹> <命令>] [--clone-repo] [--clone-workspace-dir <目录>] [--clone-depth <值>] [--engine-prompt <提示词>] [--engine-prompt-file <文件>] [--agent <名称>] [--keep-diff-files] [--max-concurrent-repos <值>] [--max-concurrent-prs <值>] [--max-concurrent-api <值>]\n  ad-hoc <pr_url> [--engine-fingerprint <值>] [--engine-command <命令>] [--engine <指纹> <命令>] [--clone-repo] [--clone-workspace-dir <目录>] [--clone-depth <值>] [--engine-prompt <提示词>] [--engine-prompt-file <文件>] [--agent <名称>] [--keep-diff-files] [--max-concurrent-api <值>]\n\n说明：\n  review 会向 GitHub 提交评论。\n  review 固定使用 shell 模式，本地命令支持 {patch_file}、{agents_file} 与 {changed_files_file} 占位符。\n  启用 --clone-repo 后，可额外使用 {repo_dir}、{repo_head_sha}、{repo_head_ref} 占位符。\n  --clone-depth 控制 clone/fetch 深度，默认 1；设置为 2 可获取最近两个提交用于对比。\n  {patch_file} 仅包含 diff 内容；{agents_file} 包含 --engine-prompt/--engine-prompt-file 与 Agent 汇总内容；{changed_files_file} 仅包含变更文件名列表。\n  --engine-prompt 和 --engine-prompt-file 不能同时使用。\n  --engine 可重复传入，每次必须给两个参数：<fingerprint> <command>，按 PR 轮询使用。\n  --engine 与 --engine-command 不能同时使用。\n  --agent 会先按全局 agent 目录配置查找；再回退到 当前目录/.prismflow/prompts 与系统配置目录 pr-reviewer/prompts。\n  --ui 启动本地 HTTP 管理页面；若开放局域网访问，建议同时设置 --ui-token。\n  默认会自动删除生成的 diff 文件；加 --keep-diff-files 可保留到 .prismflow/tmp-diffs。\n\n示例：\n  cargo run -- review once --clone-repo --clone-depth 2 --engine qwen-v1 \"qwen -y \\\"diff={patch_file} agents={agents_file} files={changed_files_file} repo={repo_dir} sha={repo_head_sha}\\\"\" --engine-prompt-file prompts/bug-only.txt --agent logic\n  cargo run -- review ad-hoc https://github.com/owner/repo/pull/123 --engine ollama:qwen2.5:1.5b \"cat {patch_file} {agents_file} {changed_files_file} | ollama run qwen2.5:1.5b\" --engine-prompt-file prompts/bug-only.txt --agent security\n  cargo run -- review daemon --ui --ui-bind 0.0.0.0:8787 --ui-token mysecret --interval-secs 30 --clone-repo --clone-depth 2 --engine qwen-v1 \"qwen -y \\\"diff: {patch_file} agents: {agents_file} files: {changed_files_file}\\\"\" --max-concurrent-repos 3 --max-concurrent-prs 6 --max-concurrent-api 12")]
 pub struct ReviewCommand {
     #[command(subcommand)]
     pub command: ReviewSubcommand,
@@ -112,7 +112,7 @@ pub enum ReviewSubcommand {
     Once {
         #[arg(long, default_value = "default-engine", help = "审查引擎指纹，用于幂等去重键计算")]
         engine_fingerprint: String,
-        #[arg(long, help = "shell 模式命令，例如：qwen --review --input {patch_file}（支持 {patch_file} 占位符）")]
+        #[arg(long, help = "shell 模式命令，例如：qwen --review --input {patch_file} --agents {agents_file} --files {changed_files_file}（支持 {patch_file}/{agents_file}/{changed_files_file} 占位符）")]
         engine_command: Option<String>,
         #[arg(
             long = "engine",
@@ -137,6 +137,8 @@ pub enum ReviewSubcommand {
         clone_repo: bool,
         #[arg(long, default_value = ".prismflow/repo-cache", help = "clone 缓存目录")]
         clone_workspace_dir: String,
+        #[arg(long, default_value_t = 1, help = "clone/fetch 深度（最小为 1）")]
+        clone_depth: usize,
         #[arg(long, default_value_t = false, help = "保留生成的 diff 文件（默认审查后自动删除）")]
         keep_diff_files: bool,
         #[arg(long, default_value_t = 2, help = "仓库并发数")]
@@ -162,7 +164,7 @@ pub enum ReviewSubcommand {
         ui_token: Option<String>,
         #[arg(long, default_value = "default-engine", help = "审查引擎指纹，用于幂等去重键计算")]
         engine_fingerprint: String,
-        #[arg(long, help = "shell 模式命令，例如：qwen --review --input {patch_file}（支持 {patch_file} 占位符）")]
+        #[arg(long, help = "shell 模式命令，例如：qwen --review --input {patch_file} --agents {agents_file} --files {changed_files_file}（支持 {patch_file}/{agents_file}/{changed_files_file} 占位符）")]
         engine_command: Option<String>,
         #[arg(
             long = "engine",
@@ -187,6 +189,8 @@ pub enum ReviewSubcommand {
         clone_repo: bool,
         #[arg(long, default_value = ".prismflow/repo-cache", help = "clone 缓存目录")]
         clone_workspace_dir: String,
+        #[arg(long, default_value_t = 1, help = "clone/fetch 深度（最小为 1）")]
+        clone_depth: usize,
         #[arg(long, default_value_t = false, help = "保留生成的 diff 文件（默认审查后自动删除）")]
         keep_diff_files: bool,
         #[arg(long, default_value_t = 2, help = "仓库并发数")]
@@ -206,7 +210,7 @@ pub enum ReviewSubcommand {
         pr_url: String,
         #[arg(long, default_value = "default-engine", help = "审查引擎指纹，用于幂等去重键计算")]
         engine_fingerprint: String,
-        #[arg(long, help = "shell 模式命令，例如：qwen --review --input {patch_file}（支持 {patch_file} 占位符）")]
+        #[arg(long, help = "shell 模式命令，例如：qwen --review --input {patch_file} --agents {agents_file} --files {changed_files_file}（支持 {patch_file}/{agents_file}/{changed_files_file} 占位符）")]
         engine_command: Option<String>,
         #[arg(
             long = "engine",
@@ -231,6 +235,8 @@ pub enum ReviewSubcommand {
         clone_repo: bool,
         #[arg(long, default_value = ".prismflow/repo-cache", help = "clone 缓存目录")]
         clone_workspace_dir: String,
+        #[arg(long, default_value_t = 1, help = "clone/fetch 深度（最小为 1）")]
+        clone_depth: usize,
         #[arg(long, default_value_t = false, help = "保留生成的 diff 文件（默认审查后自动删除）")]
         keep_diff_files: bool,
         #[arg(long, default_value_t = 8, help = "全局 API 并发阈值")]

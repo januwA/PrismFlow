@@ -72,6 +72,7 @@ pub struct ReviewWorkflowOptions {
     pub keep_diff_files: bool,
     pub clone_repo_enabled: bool,
     pub clone_workspace_dir: String,
+    pub clone_depth: usize,
     pub large_pr_max_files: u64,
     pub large_pr_max_changed_lines: u64,
     pub cli_agents: Vec<String>,
@@ -92,6 +93,7 @@ impl Default for ReviewWorkflowOptions {
             keep_diff_files: false,
             clone_repo_enabled: false,
             clone_workspace_dir: ".prismflow/repo-cache".to_string(),
+            clone_depth: 1,
             large_pr_max_files: DEFAULT_LARGE_PR_MAX_FILES,
             large_pr_max_changed_lines: DEFAULT_LARGE_PR_MAX_CHANGED_LINES,
             cli_agents: vec![],
@@ -532,6 +534,7 @@ impl<'a> ReviewWorkflow<'a> {
                     repo,
                     pr.number,
                     &self.options.clone_workspace_dir,
+                    self.options.clone_depth,
                 ) {
                     repo_dir_for_shell = Some(repo_dir.to_string_lossy().to_string());
                     repo_head_ref_for_shell = ctx.head_ref;
@@ -810,21 +813,20 @@ impl<'a> ReviewWorkflow<'a> {
             .ok_or_else(|| anyhow!("shell adapter is unavailable"))?;
         let mut command = selected_engine.command.clone();
 
-        let patch = if let Some(custom_prompt) = effective_prompt {
-            build_patch_dump_with_custom_prompt(
-                owner,
-                repo,
-                pr_number,
-                head_sha,
-                files,
-                custom_prompt,
-            )
-        } else {
-            build_patch_dump(owner, repo, pr_number, head_sha, files)
-        };
+        let patch = build_patch_dump(owner, repo, pr_number, head_sha, files);
         let patch_file = write_temp_patch_file(&format!("{owner}/{repo}"), pr_number, &patch)?;
+        let agents_payload = effective_prompt.unwrap_or_default();
+        let agents_file =
+            write_temp_agents_file(&format!("{owner}/{repo}"), pr_number, agents_payload)?;
+        let files_payload = build_changed_files_list(owner, repo, pr_number, head_sha, files);
+        let changed_files_file =
+            write_temp_files_file(&format!("{owner}/{repo}"), pr_number, &files_payload)?;
         let patch_file_str = patch_file.to_string_lossy().to_string();
+        let agents_file_str = agents_file.to_string_lossy().to_string();
+        let changed_files_file_str = changed_files_file.to_string_lossy().to_string();
         command = command.replace("{patch_file}", &patch_file_str);
+        command = command.replace("{agents_file}", &agents_file_str);
+        command = command.replace("{changed_files_file}", &changed_files_file_str);
         command = command.replace("{repo_head_sha}", head_sha);
         command = command.replace("{repo_dir}", repo_dir.unwrap_or(""));
         command = command.replace("{repo_head_ref}", repo_head_ref);
@@ -833,12 +835,16 @@ impl<'a> ReviewWorkflow<'a> {
             Ok(v) => {
                 if !self.options.keep_diff_files {
                     let _ = fs::remove_file(&patch_file);
+                    let _ = fs::remove_file(&agents_file);
+                    let _ = fs::remove_file(&changed_files_file);
                 }
                 v
             }
             Err(e) => {
                 if !self.options.keep_diff_files {
                     let _ = fs::remove_file(&patch_file);
+                    let _ = fs::remove_file(&agents_file);
+                    let _ = fs::remove_file(&changed_files_file);
                 }
                 return Err(e);
             }
@@ -882,6 +888,7 @@ fn prepare_repo_checkout(
     repo: &str,
     pr_number: u64,
     workspace_dir: &str,
+    clone_depth: usize,
 ) -> Result<PathBuf> {
     let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
     let root = cwd.join(workspace_dir);
@@ -895,6 +902,7 @@ fn prepare_repo_checkout(
     );
     let target = root.join(dir_name);
     let target_str = target.to_string_lossy().to_string();
+    let depth_str = clone_depth.max(1).to_string();
     if !target.join(".git").exists() {
         let status = Command::new("git")
             .args(["clone", "--no-checkout", clone_url, &target_str])
@@ -909,7 +917,7 @@ fn prepare_repo_checkout(
             &target_str,
             "fetch",
             "--depth",
-            "1",
+            &depth_str,
             "origin",
             head_sha,
         ])
@@ -922,7 +930,7 @@ fn prepare_repo_checkout(
                 &target_str,
                 "fetch",
                 "--depth",
-                "1",
+                &depth_str,
                 "origin",
                 &refspec,
             ])
@@ -1169,22 +1177,6 @@ fn build_patch_dump(
     out
 }
 
-fn build_patch_dump_with_custom_prompt(
-    owner: &str,
-    repo: &str,
-    pr_number: u64,
-    head_sha: &str,
-    files: &[PullRequestFilePatch],
-    custom_prompt: &str,
-) -> String {
-    let mut out = String::new();
-    out.push_str("# PrismFlow User Custom Prompt\n");
-    out.push_str(custom_prompt);
-    out.push_str("\n\n");
-    out.push_str(&build_patch_dump(owner, repo, pr_number, head_sha, files));
-    out
-}
-
 fn write_temp_patch_file(repo: &str, pr_number: u64, content: &str) -> Result<PathBuf> {
     let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
     let root = cwd.join(".prismflow").join("tmp-diffs");
@@ -1192,6 +1184,47 @@ fn write_temp_patch_file(repo: &str, pr_number: u64, content: &str) -> Result<Pa
 
     let sanitized = repo.replace('/', "_");
     let path = root.join(format!("prismflow_{}_{}_patch.diff", sanitized, pr_number));
+    fs::write(&path, content)?;
+    Ok(path)
+}
+
+fn write_temp_agents_file(repo: &str, pr_number: u64, content: &str) -> Result<PathBuf> {
+    let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+    let root = cwd.join(".prismflow").join("tmp-diffs");
+    fs::create_dir_all(&root)?;
+
+    let sanitized = repo.replace('/', "_");
+    let path = root.join(format!("prismflow_{}_{}_agents.txt", sanitized, pr_number));
+    fs::write(&path, content)?;
+    Ok(path)
+}
+
+fn build_changed_files_list(
+    owner: &str,
+    repo: &str,
+    pr_number: u64,
+    head_sha: &str,
+    files: &[PullRequestFilePatch],
+) -> String {
+    let mut out = String::new();
+    out.push_str("# PrismFlow Changed Files\n");
+    out.push_str(&format!(
+        "Repo: {owner}/{repo}\nPR: #{pr_number}\nSHA: {head_sha}\n\n"
+    ));
+    for f in files {
+        out.push_str(&f.path);
+        out.push('\n');
+    }
+    out
+}
+
+fn write_temp_files_file(repo: &str, pr_number: u64, content: &str) -> Result<PathBuf> {
+    let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+    let root = cwd.join(".prismflow").join("tmp-diffs");
+    fs::create_dir_all(&root)?;
+
+    let sanitized = repo.replace('/', "_");
+    let path = root.join(format!("prismflow_{}_{}_files.txt", sanitized, pr_number));
     fs::write(&path, content)?;
     Ok(path)
 }
