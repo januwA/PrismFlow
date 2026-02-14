@@ -1,5 +1,6 @@
 use std::{
     fs,
+    process::Command,
     path::PathBuf,
     sync::{Arc, atomic::{AtomicBool, AtomicUsize, Ordering}},
     time::{Duration, SystemTime, UNIX_EPOCH},
@@ -26,6 +27,8 @@ const DEFAULT_RETRY_ATTEMPTS: usize = 3;
 const DEFAULT_RETRY_BACKOFF_MS: u64 = 300;
 const PROCESSING_TTL_SECS: i64 = 30 * 60;
 const ADHOC_COOLDOWN_SECS: i64 = 10 * 60;
+const DEFAULT_LARGE_PR_MAX_FILES: u64 = 120;
+const DEFAULT_LARGE_PR_MAX_CHANGED_LINES: u64 = 4000;
 
 #[derive(Debug, Clone)]
 pub struct ScanPrReport {
@@ -67,6 +70,10 @@ pub struct ReviewWorkflowOptions {
     pub engine_prompt: Option<String>,
     pub agent_prompt_dirs: Vec<String>,
     pub keep_diff_files: bool,
+    pub clone_repo_enabled: bool,
+    pub clone_workspace_dir: String,
+    pub large_pr_max_files: u64,
+    pub large_pr_max_changed_lines: u64,
     pub cli_agents: Vec<String>,
     pub status_tx: Option<broadcast::Sender<String>>,
     pub skip_flag: Option<Arc<AtomicBool>>,
@@ -83,6 +90,10 @@ impl Default for ReviewWorkflowOptions {
             engine_prompt: None,
             agent_prompt_dirs: vec![],
             keep_diff_files: false,
+            clone_repo_enabled: false,
+            clone_workspace_dir: ".prismflow/repo-cache".to_string(),
+            large_pr_max_files: DEFAULT_LARGE_PR_MAX_FILES,
+            large_pr_max_changed_lines: DEFAULT_LARGE_PR_MAX_CHANGED_LINES,
             cli_agents: vec![],
             status_tx: None,
             skip_flag: None,
@@ -386,6 +397,7 @@ impl<'a> ReviewWorkflow<'a> {
             }
         };
         let reviewed_label = reviewed_label_for_sha(&pr.head_sha);
+        let large_skip_label = large_skipped_label_for_sha(&pr.head_sha);
         let previous_reviewed_short_sha = labels
             .iter()
             .find_map(|l| {
@@ -397,6 +409,7 @@ impl<'a> ReviewWorkflow<'a> {
         if !force_run {
             if comments.iter().any(|body| body.contains(&completed_anchor))
                 || labels.iter().any(|l| l == &reviewed_label)
+                || labels.iter().any(|l| l == &large_skip_label)
             {
                 return PrReviewOutcome::SkippedCompleted;
             }
@@ -412,6 +425,28 @@ impl<'a> ReviewWorkflow<'a> {
             if age_secs <= ADHOC_COOLDOWN_SECS {
                 return PrReviewOutcome::SkippedProcessing;
             }
+        }
+
+        let metrics = self
+            .github
+            .get_pull_request_metrics(owner, repo, pr.number)
+            .await
+            .unwrap_or_default();
+        if metrics.changed_files >= self.options.large_pr_max_files
+            || metrics.additions.saturating_add(metrics.deletions)
+                >= self.options.large_pr_max_changed_lines
+        {
+            if let Err(err) = self
+                .sync_large_skip_labels(owner, repo, pr.number, &large_skip_label)
+                .await
+            {
+                return match classify_error(&err) {
+                    ErrorClass::Retryable => PrReviewOutcome::FailedRetryable(err.to_string()),
+                    ErrorClass::Fatal => PrReviewOutcome::FailedFatal(err.to_string()),
+                };
+            }
+            self.mark_stage(ReviewStage::Skipped, full_repo_name, pr.number);
+            return PrReviewOutcome::SkippedFiltered;
         }
 
         let selected_engine = match self.pick_engine_for_pr() {
@@ -481,6 +516,29 @@ impl<'a> ReviewWorkflow<'a> {
             return PrReviewOutcome::SkippedFiltered;
         }
 
+        let mut repo_dir_for_shell: Option<String> = None;
+        let mut repo_head_ref_for_shell = String::new();
+        if self.options.clone_repo_enabled {
+            if let Ok(ctx) = self
+                .github
+                .get_pull_request_git_context(owner, repo, pr.number)
+                .await
+            {
+                if let Ok(repo_dir) = prepare_repo_checkout(
+                    &ctx.head_clone_url,
+                    &ctx.head_sha,
+                    &ctx.head_ref,
+                    owner,
+                    repo,
+                    pr.number,
+                    &self.options.clone_workspace_dir,
+                ) {
+                    repo_dir_for_shell = Some(repo_dir.to_string_lossy().to_string());
+                    repo_head_ref_for_shell = ctx.head_ref;
+                }
+            }
+        }
+
         let effective_prompt = self.resolve_effective_prompt(agents);
         let analysis = match self.analyze_review(
             owner,
@@ -490,6 +548,8 @@ impl<'a> ReviewWorkflow<'a> {
             &files,
             effective_prompt.as_deref(),
             &selected_engine,
+            repo_dir_for_shell.as_deref(),
+            &repo_head_ref_for_shell,
         ) {
             Ok(v) => v,
             Err(err) => {
@@ -660,6 +720,34 @@ impl<'a> ReviewWorkflow<'a> {
         Ok(())
     }
 
+    async fn sync_large_skip_labels(
+        &self,
+        owner: &str,
+        repo: &str,
+        issue_number: u64,
+        target_label: &str,
+    ) -> Result<()> {
+        let labels = self
+            .with_retry(|| self.github.list_issue_labels(owner, repo, issue_number))
+            .await?;
+        let prefix = "pr-reviewer:skipped-large:";
+        for old in labels.iter().filter(|l| l.starts_with(prefix) && l.as_str() != target_label) {
+            let _ = self
+                .with_retry(|| self.github.remove_issue_label(owner, repo, issue_number, old))
+                .await;
+        }
+
+        if !labels.iter().any(|l| l == target_label) {
+            let label_vec = vec![target_label.to_string()];
+            self.with_retry(|| {
+                self.github
+                    .add_issue_labels(owner, repo, issue_number, &label_vec)
+            })
+            .await?;
+        }
+        Ok(())
+    }
+
     fn emit_status(&self, msg: String) {
         if let Some(tx) = &self.options.status_tx {
             let _ = tx.send(msg);
@@ -714,11 +802,13 @@ impl<'a> ReviewWorkflow<'a> {
         files: &[PullRequestFilePatch],
         effective_prompt: Option<&str>,
         selected_engine: &EngineSpec,
+        repo_dir: Option<&str>,
+        repo_head_ref: &str,
     ) -> Result<ReviewAnalysis> {
         let shell = self
             .shell
             .ok_or_else(|| anyhow!("shell adapter is unavailable"))?;
-        let command = &selected_engine.command;
+        let mut command = selected_engine.command.clone();
 
         let patch = if let Some(custom_prompt) = effective_prompt {
             build_patch_dump_with_custom_prompt(
@@ -734,7 +824,11 @@ impl<'a> ReviewWorkflow<'a> {
         };
         let patch_file = write_temp_patch_file(&format!("{owner}/{repo}"), pr_number, &patch)?;
         let patch_file_str = patch_file.to_string_lossy().to_string();
-        let command_line = command.replace("{patch_file}", &patch_file_str);
+        command = command.replace("{patch_file}", &patch_file_str);
+        command = command.replace("{repo_head_sha}", head_sha);
+        command = command.replace("{repo_dir}", repo_dir.unwrap_or(""));
+        command = command.replace("{repo_head_ref}", repo_head_ref);
+        let command_line = command;
         let output = match shell.run_command_line(&command_line) {
             Ok(v) => {
                 if !self.options.keep_diff_files {
@@ -778,6 +872,72 @@ impl<'a> ReviewWorkflow<'a> {
         let pick = idx % self.options.engine_specs.len();
         Ok(self.options.engine_specs[pick].clone())
     }
+}
+
+fn prepare_repo_checkout(
+    clone_url: &str,
+    head_sha: &str,
+    head_ref: &str,
+    owner: &str,
+    repo: &str,
+    pr_number: u64,
+    workspace_dir: &str,
+) -> Result<PathBuf> {
+    let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+    let root = cwd.join(workspace_dir);
+    fs::create_dir_all(&root)?;
+    let dir_name = format!(
+        "{}_{}_pr{}_{}",
+        owner.replace('/', "_"),
+        repo.replace('/', "_"),
+        pr_number,
+        &head_sha.chars().take(12).collect::<String>()
+    );
+    let target = root.join(dir_name);
+    let target_str = target.to_string_lossy().to_string();
+    if !target.join(".git").exists() {
+        let status = Command::new("git")
+            .args(["clone", "--no-checkout", clone_url, &target_str])
+            .status()?;
+        if !status.success() {
+            anyhow::bail!("git clone failed for {}", clone_url);
+        }
+    }
+    let fetch_status = Command::new("git")
+        .args([
+            "-C",
+            &target_str,
+            "fetch",
+            "--depth",
+            "1",
+            "origin",
+            head_sha,
+        ])
+        .status()?;
+    if !fetch_status.success() {
+        let refspec = format!("refs/heads/{head_ref}");
+        let fetch_ref_status = Command::new("git")
+            .args([
+                "-C",
+                &target_str,
+                "fetch",
+                "--depth",
+                "1",
+                "origin",
+                &refspec,
+            ])
+            .status()?;
+        if !fetch_ref_status.success() {
+            anyhow::bail!("git fetch failed for sha={} ref={}", head_sha, head_ref);
+        }
+    }
+    let checkout_status = Command::new("git")
+        .args(["-C", &target_str, "checkout", "--force", head_sha])
+        .status()?;
+    if !checkout_status.success() {
+        anyhow::bail!("git checkout failed for sha={}", head_sha);
+    }
+    Ok(target)
 }
 
 #[derive(Debug)]
@@ -914,6 +1074,11 @@ fn dedupe_key(repo: &str, pr: u64, head_sha: &str, engine_fingerprint: &str) -> 
 fn reviewed_label_for_sha(head_sha: &str) -> String {
     let short = &head_sha[..head_sha.len().min(12)];
     format!("pr-reviewer:reviewed:{short}")
+}
+
+fn large_skipped_label_for_sha(head_sha: &str) -> String {
+    let short = &head_sha[..head_sha.len().min(12)];
+    format!("pr-reviewer:skipped-large:{short}")
 }
 
 fn processing_anchor_prefix(key: &str) -> String {
@@ -1329,6 +1494,55 @@ mod tests {
                 .find(|p| p.number == pull_number)
                 .cloned()
                 .ok_or_else(|| anyhow!("pull request not found"))
+        }
+
+        async fn get_pull_request_git_context(
+            &self,
+            owner: &str,
+            repo: &str,
+            pull_number: u64,
+        ) -> Result<crate::domain::entities::PullRequestGitContext> {
+            let pr = self
+                .prs
+                .iter()
+                .find(|p| p.number == pull_number)
+                .ok_or_else(|| anyhow!("pull request not found"))?;
+            Ok(crate::domain::entities::PullRequestGitContext {
+                head_sha: pr.head_sha.clone(),
+                head_ref: "mock-ref".to_string(),
+                head_clone_url: format!("https://github.com/{owner}/{repo}.git"),
+            })
+        }
+
+        async fn get_pull_request_metrics(
+            &self,
+            _owner: &str,
+            _repo: &str,
+            pull_number: u64,
+        ) -> Result<crate::domain::entities::PullRequestMetrics> {
+            let files = self.files.get(&pull_number).cloned().unwrap_or_default();
+            let mut additions = 0u64;
+            let mut deletions = 0u64;
+            for f in files {
+                if let Some(patch) = f.patch {
+                    for line in patch.lines() {
+                        if line.starts_with('+') && !line.starts_with("+++") {
+                            additions += 1;
+                        } else if line.starts_with('-') && !line.starts_with("---") {
+                            deletions += 1;
+                        }
+                    }
+                }
+            }
+            Ok(crate::domain::entities::PullRequestMetrics {
+                changed_files: self
+                    .files
+                    .get(&pull_number)
+                    .map(|v| v.len() as u64)
+                    .unwrap_or(0),
+                additions,
+                deletions,
+            })
         }
 
         async fn list_pull_request_files(

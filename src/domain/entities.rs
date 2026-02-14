@@ -77,6 +77,20 @@ pub struct PullRequestSummary {
     pub html_url: Option<String>,
 }
 
+#[derive(Debug, Clone, Default)]
+pub struct PullRequestMetrics {
+    pub changed_files: u64,
+    pub additions: u64,
+    pub deletions: u64,
+}
+
+#[derive(Debug, Clone)]
+pub struct PullRequestGitContext {
+    pub head_sha: String,
+    pub head_ref: String,
+    pub head_clone_url: String,
+}
+
 #[derive(Debug, Clone)]
 pub struct PullRequestFilePatch {
     pub path: String,

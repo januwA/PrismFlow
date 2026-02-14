@@ -253,10 +253,14 @@ async fn main() -> Result<()> {
                 engine_prompt,
                 engine_prompt_file,
                 agents,
+                clone_repo,
+                clone_workspace_dir,
                 keep_diff_files,
                 max_concurrent_repos,
                 max_concurrent_prs,
                 max_concurrent_api,
+                large_pr_max_files,
+                large_pr_max_lines,
             } => {
                 let resolved_prompt = resolve_engine_prompt(engine_prompt, engine_prompt_file)?;
                 let resolved_engines =
@@ -266,6 +270,10 @@ async fn main() -> Result<()> {
                     engine_prompt: resolved_prompt,
                     agent_prompt_dirs: repo_manager.list_agent_prompt_dirs()?,
                     cli_agents: agents,
+                    clone_repo_enabled: clone_repo,
+                    clone_workspace_dir,
+                    large_pr_max_files,
+                    large_pr_max_changed_lines: large_pr_max_lines,
                     keep_diff_files,
                     max_concurrent_repos,
                     max_concurrent_prs,
@@ -293,10 +301,14 @@ async fn main() -> Result<()> {
                 engine_prompt,
                 engine_prompt_file,
                 agents,
+                clone_repo,
+                clone_workspace_dir,
                 keep_diff_files,
                 max_concurrent_repos,
                 max_concurrent_prs,
                 max_concurrent_api,
+                large_pr_max_files,
+                large_pr_max_lines,
             } => {
                 let resolved_prompt = resolve_engine_prompt(engine_prompt, engine_prompt_file)?;
                 let resolved_engines =
@@ -306,6 +318,10 @@ async fn main() -> Result<()> {
                     engine_prompt: resolved_prompt,
                     agent_prompt_dirs: repo_manager.list_agent_prompt_dirs()?,
                     cli_agents: agents,
+                    clone_repo_enabled: clone_repo,
+                    clone_workspace_dir,
+                    large_pr_max_files,
+                    large_pr_max_changed_lines: large_pr_max_lines,
                     keep_diff_files,
                     max_concurrent_repos,
                     max_concurrent_prs,
@@ -535,8 +551,12 @@ async fn main() -> Result<()> {
                 engine_prompt,
                 engine_prompt_file,
                 agents,
+                clone_repo,
+                clone_workspace_dir,
                 keep_diff_files,
                 max_concurrent_api,
+                large_pr_max_files,
+                large_pr_max_lines,
             } => {
                 let (owner, repo, pr_number) = parse_github_pr_url(&pr_url)
                     .with_context(|| format!("invalid GitHub PR URL: {pr_url}"))?;
@@ -548,6 +568,10 @@ async fn main() -> Result<()> {
                     engine_prompt: resolved_prompt,
                     agent_prompt_dirs: repo_manager.list_agent_prompt_dirs()?,
                     cli_agents: agents,
+                    clone_repo_enabled: clone_repo,
+                    clone_workspace_dir,
+                    large_pr_max_files,
+                    large_pr_max_changed_lines: large_pr_max_lines,
                     keep_diff_files,
                     ..ReviewWorkflowOptions::default()
                 };
