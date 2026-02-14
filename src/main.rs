@@ -4,10 +4,18 @@ mod infrastructure;
 mod interface;
 
 use std::fs;
+use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::{Arc, atomic::{AtomicBool, Ordering}};
 
 use anyhow::{Context, Result};
+use axum::{
+    Router,
+    extract::{Form, Query, State},
+    http::StatusCode,
+    response::{Html, IntoResponse, Redirect},
+    routing::{get, post},
+};
 use application::{
     auth_manager::AuthManager,
     repo_manager::RepoManager,
@@ -21,21 +29,44 @@ use infrastructure::{
     shell_adapter::CommandShellAdapter,
     token_providers::{EnvTokenProvider, GhCliTokenProvider, StoredTokenProvider},
 };
+use serde::Deserialize;
 use interface::cli::{
     AuthSubcommand, Cli, Commands, RepoAgentSubcommand, RepoSubcommand,
     ReviewSubcommand, ScanSubcommand,
 };
-use tokio::sync::broadcast;
+use tokio::sync::{Mutex, Notify, broadcast, mpsc};
 use tokio::time::{Duration, sleep};
 use tracing_subscriber::EnvFilter;
 use serde::Serialize;
+
+#[derive(Debug, Clone)]
+enum UiCommand {
+    TriggerReviewNow,
+    TriggerSkip,
+    AdHoc(String),
+    RepoAdd(String),
+    RepoRemove(String),
+    AgentAdd { repo: String, agent: String },
+    AgentRemove { repo: String, agent: String },
+    DirAdd(String),
+    DirRemove(String),
+}
+
+#[derive(Clone)]
+struct UiState {
+    token: Option<String>,
+    status_log: Arc<Mutex<Vec<String>>>,
+    command_tx: mpsc::UnboundedSender<UiCommand>,
+    notify: Arc<Notify>,
+    config_repo: Arc<LocalConfigAdapter>,
+}
 
 #[tokio::main]
 async fn main() -> Result<()> {
     init_tracing();
 
     let cli = Cli::parse();
-    let config_repo = LocalConfigAdapter::new()?;
+    let config_repo = Arc::new(LocalConfigAdapter::new()?);
     let shell = CommandShellAdapter;
     let stored_provider = StoredTokenProvider::new(config_repo.auth_token_path());
     let gh_provider = GhCliTokenProvider::new(&shell);
@@ -45,7 +76,7 @@ async fn main() -> Result<()> {
         vec![&gh_provider, &env_provider, &stored_provider],
         &stored_provider,
     );
-    let repo_manager = RepoManager::new(&config_repo);
+    let repo_manager = RepoManager::new(config_repo.as_ref());
 
     match cli.command {
         Commands::Repo(repo) => match repo.command {
@@ -191,7 +222,7 @@ async fn main() -> Result<()> {
 
                 let github = OctocrabGitHubRepository::new(token, max_concurrent_api)?;
                 let workflow = ReviewWorkflow::new(
-                    &config_repo,
+                    config_repo.as_ref(),
                     &github,
                     None,
                     engine_fingerprint,
@@ -242,7 +273,7 @@ async fn main() -> Result<()> {
                 };
                 run_review_once(
                     &auth_manager,
-                    &config_repo,
+                    config_repo.as_ref(),
                     &shell,
                     engine_fingerprint,
                     max_concurrent_api,
@@ -253,6 +284,9 @@ async fn main() -> Result<()> {
             }
             ReviewSubcommand::Daemon {
                 interval_secs,
+                ui,
+                ui_bind,
+                ui_token,
                 engine_fingerprint,
                 engine_command,
                 engines,
@@ -267,7 +301,7 @@ async fn main() -> Result<()> {
                 let resolved_prompt = resolve_engine_prompt(engine_prompt, engine_prompt_file)?;
                 let resolved_engines =
                     resolve_engine_specs(&engine_fingerprint, engine_command, engines)?;
-                let options = ReviewWorkflowOptions {
+                let mut options = ReviewWorkflowOptions {
                     engine_specs: resolved_engines,
                     engine_prompt: resolved_prompt,
                     agent_prompt_dirs: repo_manager.list_agent_prompt_dirs()?,
@@ -278,19 +312,53 @@ async fn main() -> Result<()> {
                     ..ReviewWorkflowOptions::default()
                 };
                 let (status_tx, mut status_rx) = broadcast::channel::<String>(256);
+                let status_log = Arc::new(Mutex::new(Vec::<String>::new()));
+                let status_log_for_task = status_log.clone();
                 let skip_flag = Arc::new(AtomicBool::new(false));
+                let (ui_cmd_tx, mut ui_cmd_rx) = mpsc::unbounded_channel::<UiCommand>();
+                let ui_notify = Arc::new(Notify::new());
                 let status_task = tokio::spawn(async move {
                     while let Ok(msg) = status_rx.recv().await {
                         println!("[STATUS] {msg}");
+                        let mut log = status_log_for_task.lock().await;
+                        log.push(msg);
+                        if log.len() > 200 {
+                            let drop_n = log.len().saturating_sub(200);
+                            log.drain(0..drop_n);
+                        }
                     }
                 });
+                let mut ui_task = None;
+                if ui {
+                    let addr: SocketAddr = ui_bind
+                        .parse()
+                        .with_context(|| format!("invalid --ui-bind address: {ui_bind}"))?;
+                    let ui_state = UiState {
+                        token: ui_token.clone(),
+                        status_log: status_log.clone(),
+                        command_tx: ui_cmd_tx.clone(),
+                        notify: ui_notify.clone(),
+                        config_repo: config_repo.clone(),
+                    };
+                    println!("ui started: http://{addr}/");
+                    if let Some(token) = &ui_token {
+                        println!("ui token required: append ?token={token} in URL");
+                    }
+                    ui_task = Some(tokio::spawn(async move {
+                        if let Err(err) = run_ui_server(addr, ui_state).await {
+                            eprintln!("ui server stopped: {err:#}");
+                        }
+                    }));
+                }
                 let skip_flag_for_input = skip_flag.clone();
+                let ui_notify_for_input = ui_notify.clone();
                 let input_task = tokio::task::spawn_blocking(move || {
                     use std::io::{self, BufRead};
                     let stdin = io::stdin();
                     for line in stdin.lock().lines().map_while(|v| v.ok()) {
                         if line.trim().eq_ignore_ascii_case("skip") {
                             skip_flag_for_input.store(true, Ordering::Relaxed);
+                            ui_notify_for_input.notify_one();
                             println!("[CONTROL] skip received; next pending PR will be skipped");
                         }
                     }
@@ -299,11 +367,118 @@ async fn main() -> Result<()> {
                 println!("review daemon started: interval={}s", interval_secs);
                 println!("control: type `skip` then Enter to skip next pending PR");
                 loop {
+                    if let Ok(dirs) = repo_manager.list_agent_prompt_dirs() {
+                        options.agent_prompt_dirs = dirs;
+                    }
+                    let mut run_now = false;
+                    while let Ok(cmd) = ui_cmd_rx.try_recv() {
+                        match cmd {
+                            UiCommand::TriggerReviewNow => run_now = true,
+                            UiCommand::TriggerSkip => {
+                                skip_flag.store(true, Ordering::Relaxed);
+                            }
+                            UiCommand::AdHoc(pr_url) => {
+                                let _ = status_tx.send(format!("ui:adhoc requested url={pr_url}"));
+                                match parse_github_pr_url(&pr_url) {
+                                    Ok((owner, repo, pr_number)) => {
+                                        let mut adhoc_opts = options.clone();
+                                        adhoc_opts.status_tx = Some(status_tx.clone());
+                                        if let Err(err) = run_review_ad_hoc(
+                                            &auth_manager,
+                                            config_repo.as_ref(),
+                                            &shell,
+                                            owner,
+                                            repo,
+                                            pr_number,
+                                            engine_fingerprint.clone(),
+                                            max_concurrent_api,
+                                            adhoc_opts,
+                                        )
+                                        .await
+                                        {
+                                            let _ = status_tx.send(format!("ui:adhoc failed error={err:#}"));
+                                        } else {
+                                            let _ = status_tx.send("ui:adhoc done".to_string());
+                                        }
+                                    }
+                                    Err(err) => {
+                                        let _ = status_tx.send(format!("ui:adhoc invalid_url error={err:#}"));
+                                    }
+                                }
+                            }
+                            UiCommand::RepoAdd(repo) => {
+                                match repo_manager.add_repo(&repo) {
+                                    Ok(v) => {
+                                        let _ = status_tx.send(format!("ui:repo added {v}"));
+                                    }
+                                    Err(err) => {
+                                        let _ = status_tx.send(format!("ui:repo add failed error={err:#}"));
+                                    }
+                                }
+                            }
+                            UiCommand::RepoRemove(repo) => {
+                                match repo_manager.remove_repo(&repo) {
+                                    Ok(_) => {
+                                        let _ = status_tx.send(format!("ui:repo removed {repo}"));
+                                    }
+                                    Err(err) => {
+                                        let _ = status_tx.send(format!("ui:repo remove failed error={err:#}"));
+                                    }
+                                }
+                            }
+                            UiCommand::AgentAdd { repo, agent } => {
+                                match repo_manager.add_agent(&repo, &agent) {
+                                    Ok(_) => {
+                                        let _ = status_tx.send(format!("ui:agent added repo={repo} agent={agent}"));
+                                    }
+                                    Err(err) => {
+                                        let _ = status_tx.send(format!("ui:agent add failed error={err:#}"));
+                                    }
+                                }
+                            }
+                            UiCommand::AgentRemove { repo, agent } => {
+                                match repo_manager.remove_agent(&repo, &agent) {
+                                    Ok(_) => {
+                                        let _ = status_tx.send(format!("ui:agent removed repo={repo} agent={agent}"));
+                                    }
+                                    Err(err) => {
+                                        let _ = status_tx.send(format!("ui:agent remove failed error={err:#}"));
+                                    }
+                                }
+                            }
+                            UiCommand::DirAdd(dir) => {
+                                match repo_manager.add_agent_prompt_dir(&dir) {
+                                    Ok(_) => {
+                                        if let Ok(dirs) = repo_manager.list_agent_prompt_dirs() {
+                                            options.agent_prompt_dirs = dirs;
+                                        }
+                                        let _ = status_tx.send(format!("ui:global dir added {dir}"));
+                                    }
+                                    Err(err) => {
+                                        let _ = status_tx.send(format!("ui:global dir add failed error={err:#}"));
+                                    }
+                                }
+                            }
+                            UiCommand::DirRemove(dir) => {
+                                match repo_manager.remove_agent_prompt_dir(&dir) {
+                                    Ok(_) => {
+                                        if let Ok(dirs) = repo_manager.list_agent_prompt_dirs() {
+                                            options.agent_prompt_dirs = dirs;
+                                        }
+                                        let _ = status_tx.send(format!("ui:global dir removed {dir}"));
+                                    }
+                                    Err(err) => {
+                                        let _ = status_tx.send(format!("ui:global dir remove failed error={err:#}"));
+                                    }
+                                }
+                            }
+                        }
+                    }
                     let _ = status_tx.send("cycle:start".to_string());
                     tokio::select! {
                         r = run_review_once(
                             &auth_manager,
-                            &config_repo,
+                            config_repo.as_ref(),
                             &shell,
                             engine_fingerprint.clone(),
                             max_concurrent_api,
@@ -327,9 +502,17 @@ async fn main() -> Result<()> {
                         }
                     }
 
+                    if run_now {
+                        let _ = status_tx.send("ui:triggered immediate next cycle".to_string());
+                        continue;
+                    }
+
                     tokio::select! {
                         _ = sleep(Duration::from_secs(interval_secs)) => {
                             let _ = status_tx.send("daemon:sleep_done".to_string());
+                        }
+                        _ = ui_notify.notified() => {
+                            let _ = status_tx.send("ui:wakeup".to_string());
                         }
                         _ = tokio::signal::ctrl_c() => {
                             println!("received Ctrl+C, exiting daemon");
@@ -340,6 +523,9 @@ async fn main() -> Result<()> {
                 drop(status_tx);
                 let _ = status_task.await;
                 input_task.abort();
+                if let Some(task) = ui_task {
+                    task.abort();
+                }
             }
             ReviewSubcommand::AdHoc {
                 pr_url,
@@ -367,7 +553,7 @@ async fn main() -> Result<()> {
                 };
                 run_review_ad_hoc(
                     &auth_manager,
-                    &config_repo,
+                    config_repo.as_ref(),
                     &shell,
                     owner,
                     repo,
@@ -695,6 +881,292 @@ fn resolve_engine_specs(
         fingerprint: engine_fingerprint.to_string(),
         command,
     }])
+}
+
+#[derive(Debug, Deserialize, Default)]
+struct UiTokenQuery {
+    token: Option<String>,
+}
+
+#[derive(Debug, Deserialize, Default)]
+struct UiActionForm {
+    token: Option<String>,
+    pr_url: Option<String>,
+    repo: Option<String>,
+    agent: Option<String>,
+    dir: Option<String>,
+}
+
+async fn run_ui_server(addr: SocketAddr, state: UiState) -> Result<()> {
+    let app = Router::new()
+        .route("/", get(ui_index))
+        .route("/api/trigger-review", post(ui_trigger_review))
+        .route("/api/skip", post(ui_skip))
+        .route("/api/adhoc", post(ui_adhoc))
+        .route("/api/repo/add", post(ui_repo_add))
+        .route("/api/repo/remove", post(ui_repo_remove))
+        .route("/api/agent/add", post(ui_agent_add))
+        .route("/api/agent/remove", post(ui_agent_remove))
+        .route("/api/dir/add", post(ui_dir_add))
+        .route("/api/dir/remove", post(ui_dir_remove))
+        .with_state(state);
+
+    let listener = tokio::net::TcpListener::bind(addr).await?;
+    axum::serve(listener, app).await?;
+    Ok(())
+}
+
+async fn ui_index(
+    State(state): State<UiState>,
+    Query(q): Query<UiTokenQuery>,
+) -> impl IntoResponse {
+    if !authorized(&state.token, q.token.as_deref()) {
+        return (StatusCode::UNAUTHORIZED, "unauthorized").into_response();
+    }
+
+    let cfg = match state.config_repo.load_config() {
+        Ok(v) => v,
+        Err(err) => {
+            return (StatusCode::INTERNAL_SERVER_ERROR, format!("config load failed: {err:#}"))
+                .into_response();
+        }
+    };
+    let log = state.status_log.lock().await.clone();
+    let token = q.token.unwrap_or_default();
+    let token_hidden = if token.is_empty() {
+        String::new()
+    } else {
+        format!("<input type=\"hidden\" name=\"token\" value=\"{}\" />", html_escape(&token))
+    };
+
+    let repos_html = if cfg.repos.is_empty() {
+        "<li>(no repos)</li>".to_string()
+    } else {
+        cfg.repos
+            .iter()
+            .map(|r| {
+                let agents = if r.agents.is_empty() {
+                    "-".to_string()
+                } else {
+                    r.agents.join(", ")
+                };
+                format!(
+                    "<li><b>{}</b> | agents={} | last_sha={}</li>",
+                    html_escape(&r.full_name),
+                    html_escape(&agents),
+                    html_escape(r.last_sha.as_deref().unwrap_or("-"))
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("")
+    };
+    let dirs_html = if cfg.agent_prompt_dirs.is_empty() {
+        "<li>(no global dirs)</li>".to_string()
+    } else {
+        cfg.agent_prompt_dirs
+            .iter()
+            .map(|d| format!("<li>{}</li>", html_escape(d)))
+            .collect::<Vec<_>>()
+            .join("")
+    };
+    let logs_html = if log.is_empty() {
+        "<li>(no status yet)</li>".to_string()
+    } else {
+        log.iter()
+            .rev()
+            .take(30)
+            .map(|s| format!("<li>{}</li>", html_escape(s)))
+            .collect::<Vec<_>>()
+            .join("")
+    };
+
+    let page = format!(
+        "<html><body>\
+<h1>PrismFlow UI</h1>\
+<p>Token protected: {}</p>\
+<h2>Actions</h2>\
+<form method=\"post\" action=\"/api/trigger-review\">{}<button type=\"submit\">Trigger Review Now</button></form>\
+<form method=\"post\" action=\"/api/skip\">{}<button type=\"submit\">Skip Next PR</button></form>\
+<form method=\"post\" action=\"/api/adhoc\">{}<input name=\"pr_url\" placeholder=\"https://github.com/owner/repo/pull/123\" size=\"70\"/><button type=\"submit\">Run Ad-hoc</button></form>\
+<h2>Repo Management</h2>\
+<form method=\"post\" action=\"/api/repo/add\">{}<input name=\"repo\" placeholder=\"owner/repo or github url\" size=\"70\"/><button type=\"submit\">Repo Add</button></form>\
+<form method=\"post\" action=\"/api/repo/remove\">{}<input name=\"repo\" placeholder=\"owner/repo\" size=\"40\"/><button type=\"submit\">Repo Remove</button></form>\
+<h2>Agent Management</h2>\
+<form method=\"post\" action=\"/api/agent/add\">{}<input name=\"repo\" placeholder=\"owner/repo\" size=\"35\"/><input name=\"agent\" placeholder=\"agent\" size=\"20\"/><button type=\"submit\">Agent Add</button></form>\
+<form method=\"post\" action=\"/api/agent/remove\">{}<input name=\"repo\" placeholder=\"owner/repo\" size=\"35\"/><input name=\"agent\" placeholder=\"agent\" size=\"20\"/><button type=\"submit\">Agent Remove</button></form>\
+<h2>Global Agent Dirs</h2>\
+<form method=\"post\" action=\"/api/dir/add\">{}<input name=\"dir\" placeholder=\"path/to/prompts\" size=\"60\"/><button type=\"submit\">Dir Add</button></form>\
+<form method=\"post\" action=\"/api/dir/remove\">{}<input name=\"dir\" placeholder=\"path/to/prompts\" size=\"60\"/><button type=\"submit\">Dir Remove</button></form>\
+<h3>Configured Global Dirs</h3><ul>{}</ul>\
+<h3>Repos</h3><ul>{}</ul>\
+<h3>Recent Status</h3><ul>{}</ul>\
+<p><a href=\"/?token={}\">Refresh</a></p>\
+</body></html>",
+        if state.token.is_some() { "yes" } else { "no" },
+        token_hidden,
+        token_hidden,
+        token_hidden,
+        token_hidden,
+        token_hidden,
+        token_hidden,
+        token_hidden,
+        token_hidden,
+        token_hidden,
+        dirs_html,
+        repos_html,
+        logs_html,
+        html_escape(&token)
+    );
+    Html(page).into_response()
+}
+
+async fn ui_trigger_review(
+    State(state): State<UiState>,
+    Form(form): Form<UiActionForm>,
+) -> impl IntoResponse {
+    if !authorized(&state.token, form.token.as_deref()) {
+        return StatusCode::UNAUTHORIZED.into_response();
+    }
+    let _ = state.command_tx.send(UiCommand::TriggerReviewNow);
+    state.notify.notify_one();
+    ui_redirect(&state.token, form.token.as_deref()).into_response()
+}
+
+async fn ui_skip(
+    State(state): State<UiState>,
+    Form(form): Form<UiActionForm>,
+) -> impl IntoResponse {
+    if !authorized(&state.token, form.token.as_deref()) {
+        return StatusCode::UNAUTHORIZED.into_response();
+    }
+    let _ = state.command_tx.send(UiCommand::TriggerSkip);
+    state.notify.notify_one();
+    ui_redirect(&state.token, form.token.as_deref()).into_response()
+}
+
+async fn ui_adhoc(
+    State(state): State<UiState>,
+    Form(form): Form<UiActionForm>,
+) -> impl IntoResponse {
+    if !authorized(&state.token, form.token.as_deref()) {
+        return StatusCode::UNAUTHORIZED.into_response();
+    }
+    if let Some(pr_url) = form.pr_url.filter(|v| !v.trim().is_empty()) {
+        let _ = state.command_tx.send(UiCommand::AdHoc(pr_url));
+        state.notify.notify_one();
+    }
+    ui_redirect(&state.token, form.token.as_deref()).into_response()
+}
+
+async fn ui_repo_add(
+    State(state): State<UiState>,
+    Form(form): Form<UiActionForm>,
+) -> impl IntoResponse {
+    if !authorized(&state.token, form.token.as_deref()) {
+        return StatusCode::UNAUTHORIZED.into_response();
+    }
+    if let Some(repo) = form.repo.filter(|v| !v.trim().is_empty()) {
+        let _ = state.command_tx.send(UiCommand::RepoAdd(repo));
+        state.notify.notify_one();
+    }
+    ui_redirect(&state.token, form.token.as_deref()).into_response()
+}
+
+async fn ui_repo_remove(
+    State(state): State<UiState>,
+    Form(form): Form<UiActionForm>,
+) -> impl IntoResponse {
+    if !authorized(&state.token, form.token.as_deref()) {
+        return StatusCode::UNAUTHORIZED.into_response();
+    }
+    if let Some(repo) = form.repo.filter(|v| !v.trim().is_empty()) {
+        let _ = state.command_tx.send(UiCommand::RepoRemove(repo));
+        state.notify.notify_one();
+    }
+    ui_redirect(&state.token, form.token.as_deref()).into_response()
+}
+
+async fn ui_agent_add(
+    State(state): State<UiState>,
+    Form(form): Form<UiActionForm>,
+) -> impl IntoResponse {
+    if !authorized(&state.token, form.token.as_deref()) {
+        return StatusCode::UNAUTHORIZED.into_response();
+    }
+    if let (Some(repo), Some(agent)) = (form.repo, form.agent) {
+        if !repo.trim().is_empty() && !agent.trim().is_empty() {
+            let _ = state.command_tx.send(UiCommand::AgentAdd { repo, agent });
+            state.notify.notify_one();
+        }
+    }
+    ui_redirect(&state.token, form.token.as_deref()).into_response()
+}
+
+async fn ui_agent_remove(
+    State(state): State<UiState>,
+    Form(form): Form<UiActionForm>,
+) -> impl IntoResponse {
+    if !authorized(&state.token, form.token.as_deref()) {
+        return StatusCode::UNAUTHORIZED.into_response();
+    }
+    if let (Some(repo), Some(agent)) = (form.repo, form.agent) {
+        if !repo.trim().is_empty() && !agent.trim().is_empty() {
+            let _ = state.command_tx.send(UiCommand::AgentRemove { repo, agent });
+            state.notify.notify_one();
+        }
+    }
+    ui_redirect(&state.token, form.token.as_deref()).into_response()
+}
+
+async fn ui_dir_add(
+    State(state): State<UiState>,
+    Form(form): Form<UiActionForm>,
+) -> impl IntoResponse {
+    if !authorized(&state.token, form.token.as_deref()) {
+        return StatusCode::UNAUTHORIZED.into_response();
+    }
+    if let Some(dir) = form.dir.filter(|v| !v.trim().is_empty()) {
+        let _ = state.command_tx.send(UiCommand::DirAdd(dir));
+        state.notify.notify_one();
+    }
+    ui_redirect(&state.token, form.token.as_deref()).into_response()
+}
+
+async fn ui_dir_remove(
+    State(state): State<UiState>,
+    Form(form): Form<UiActionForm>,
+) -> impl IntoResponse {
+    if !authorized(&state.token, form.token.as_deref()) {
+        return StatusCode::UNAUTHORIZED.into_response();
+    }
+    if let Some(dir) = form.dir.filter(|v| !v.trim().is_empty()) {
+        let _ = state.command_tx.send(UiCommand::DirRemove(dir));
+        state.notify.notify_one();
+    }
+    ui_redirect(&state.token, form.token.as_deref()).into_response()
+}
+
+fn ui_redirect(expected: &Option<String>, provided: Option<&str>) -> Redirect {
+    if expected.is_some() {
+        let token = provided.unwrap_or_default();
+        Redirect::to(&format!("/?token={token}"))
+    } else {
+        Redirect::to("/")
+    }
+}
+
+fn authorized(expected: &Option<String>, provided: Option<&str>) -> bool {
+    match expected {
+        Some(v) => provided.map(|s| s == v).unwrap_or(false),
+        None => true,
+    }
+}
+
+fn html_escape(v: &str) -> String {
+    v.replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('\"', "&quot;")
 }
 
 fn is_prismflow_trace_comment(body: &str) -> bool {

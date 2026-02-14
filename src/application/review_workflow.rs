@@ -25,6 +25,7 @@ const MAX_INLINE_COMMENTS: usize = 20;
 const DEFAULT_RETRY_ATTEMPTS: usize = 3;
 const DEFAULT_RETRY_BACKOFF_MS: u64 = 300;
 const PROCESSING_TTL_SECS: i64 = 30 * 60;
+const ADHOC_COOLDOWN_SECS: i64 = 10 * 60;
 
 #[derive(Debug, Clone)]
 pub struct ScanPrReport {
@@ -385,6 +386,13 @@ impl<'a> ReviewWorkflow<'a> {
             }
         };
         let reviewed_label = reviewed_label_for_sha(&pr.head_sha);
+        let previous_reviewed_short_sha = labels
+            .iter()
+            .find_map(|l| {
+                l.strip_prefix("pr-reviewer:reviewed:")
+                    .filter(|short| *short != pr.head_sha.get(0..12).unwrap_or_default())
+                    .map(|v| v.to_string())
+            });
 
         if !force_run {
             if comments.iter().any(|body| body.contains(&completed_anchor))
@@ -398,6 +406,11 @@ impl<'a> ReviewWorkflow<'a> {
                 if age_secs <= PROCESSING_TTL_SECS {
                     return PrReviewOutcome::SkippedProcessing;
                 }
+            }
+        } else if let Some(latest_ts) = newest_processing_ts(&comments, &processing_prefix) {
+            let age_secs = now_unix_secs() - latest_ts;
+            if age_secs <= ADHOC_COOLDOWN_SECS {
+                return PrReviewOutcome::SkippedProcessing;
             }
         }
 
@@ -487,13 +500,23 @@ impl<'a> ReviewWorkflow<'a> {
             }
         };
 
+        let outdated_notice = previous_reviewed_short_sha.as_ref().map(|old| {
+            format!(
+                "Previous review for `{old}` is outdated.\n\n"
+            )
+        });
+        let summary_with_outdated = match outdated_notice {
+            Some(ref notice) => format!("{notice}{}", analysis.summary),
+            None => analysis.summary.clone(),
+        };
+
         let review_body = format!(
             "PrismFlow review summary for `{}`\n\n- Engine: `{}`\n- Analyzer: `{}`\n- Inline findings: {}\n\n{}",
             pr.head_sha,
             selected_engine_fingerprint,
             analysis.source,
             analysis.inline_comments.len(),
-            analysis.summary
+            summary_with_outdated
         );
 
         let mut used_fallback = false;
@@ -527,7 +550,7 @@ impl<'a> ReviewWorkflow<'a> {
             if inline_submit.is_err() {
                 used_fallback = true;
                 let fallback =
-                    build_fallback_summary(&pr.head_sha, selected_engine_fingerprint, &analysis.inline_comments, &analysis.summary);
+                    build_fallback_summary(&pr.head_sha, selected_engine_fingerprint, &analysis.inline_comments, &summary_with_outdated);
                 if let Err(err) = self
                     .with_retry(|| {
                         self.github
@@ -1710,5 +1733,79 @@ mod tests {
             .await
             .expect("review_once");
         assert_eq!(stats[0].skipped_filtered, 1);
+    }
+
+    #[tokio::test]
+    async fn adhoc_respects_cooldown_for_same_sha() {
+        let sha = "abc123";
+        let key = dedupe_key("owner/repo", 1, sha, "engine");
+        let recent_processing = processing_anchor(&key);
+
+        let github = MockGitHub {
+            prs: vec![PullRequestSummary {
+                number: 1,
+                title: "t".to_string(),
+                head_sha: sha.to_string(),
+                html_url: None,
+            }],
+            files: HashMap::from([(
+                1,
+                vec![PullRequestFilePatch {
+                    path: "src/lib.rs".to_string(),
+                    patch: Some("@@ -1,1 +1,2 @@\n line\n+let x = y.unwrap();".to_string()),
+                }],
+            )]),
+            issue_comments: Mutex::new(HashMap::from([(1, vec![recent_processing])])),
+            ..Default::default()
+        };
+        let config = InMemoryConfigRepo::new(config_with_repo());
+        let stats = workflow(&config, &github, ReviewWorkflowOptions::default())
+            .review_ad_hoc("owner", "repo", 1)
+            .await
+            .expect("review_ad_hoc");
+        assert_eq!(stats.skipped_processing, 1);
+        assert_eq!(stats.processed, 0);
+    }
+
+    #[tokio::test]
+    async fn adds_outdated_notice_when_sha_label_changes() {
+        let old_sha = "111111111111";
+        let github = MockGitHub {
+            prs: vec![PullRequestSummary {
+                number: 1,
+                title: "t".to_string(),
+                head_sha: "abc123".to_string(),
+                html_url: None,
+            }],
+            files: HashMap::from([(
+                1,
+                vec![PullRequestFilePatch {
+                    path: "src/lib.rs".to_string(),
+                    patch: Some("@@ -1,1 +1,2 @@\n line\n+let x = y.unwrap();".to_string()),
+                }],
+            )]),
+            issue_labels: Mutex::new(HashMap::from([(
+                1,
+                vec![format!("pr-reviewer:reviewed:{old_sha}")],
+            )])),
+            inline_fail: true,
+            ..Default::default()
+        };
+        let config = InMemoryConfigRepo::new(config_with_repo());
+        let stats = workflow(&config, &github, ReviewWorkflowOptions::default())
+            .review_once()
+            .await
+            .expect("review_once");
+        assert_eq!(stats[0].processed, 1);
+
+        let comments = github
+            .issue_comments
+            .lock()
+            .expect("lock")
+            .get(&1)
+            .cloned()
+            .unwrap_or_default();
+        let merged = comments.join("\n\n");
+        assert!(merged.contains("Previous review for `111111111111` is outdated."));
     }
 }
