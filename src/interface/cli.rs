@@ -33,7 +33,7 @@ pub enum Commands {
 
 #[derive(Debug, Args)]
 #[command(
-    after_long_help = "repo COMMAND 可选：\n  add <owner/repo|github_url>         添加监控仓库（支持仓库/PR URL）\n  remove [owner/repo]                 移除监控仓库（不带参数时可交互选择）\n  list                                列出监控仓库\n  agent add <owner/repo> <agent>      给仓库绑定 Agent\n  agent remove <owner/repo> <agent>   解绑 Agent\n  agent list [owner/repo]             列出单仓库或全部仓库 Agent\n  agent dir-add <dir>                 添加全局 Agent 提示词搜索目录（所有仓库共享）\n  agent dir-remove <dir>              移除全局 Agent 提示词搜索目录\n  agent dir-list                      列出全局目录\n\nrepos.json 位置：系统配置目录/pr-reviewer/repos.json\nWindows 示例：C:\\Users\\<用户名>\\AppData\\Roaming\\pr-reviewer\\repos.json\n\n示例：\n  cargo run -- repo add owner/repo\n  cargo run -- repo add https://github.com/owner/repo/pull/123\n  cargo run -- repo agent add owner/repo security\n  cargo run -- repo agent dir-add .prismflow/prompts\n  cargo run -- repo agent dir-list\n  cargo run -- repo remove\n  cargo run -- repo remove owner/repo"
+    after_long_help = "repo COMMAND 可选：\n  add <owner/repo|github_url>         添加监控仓库（支持仓库/PR URL）\n  remove [owner/repo]                 移除监控仓库（不带参数时可交互选择）\n  list                                列出监控仓库\n  agent add [owner/repo] <agent>      给仓库绑定 Agent（不带仓库参数时可交互选择）\n  agent remove [owner/repo] <agent>   解绑 Agent（不带仓库参数时可交互选择）\n  agent list [owner/repo]             列出单仓库或全部仓库 Agent\n  agent dir-add <dir>                 添加全局 Agent 提示词搜索目录（所有仓库共享）\n  agent dir-remove <dir>              移除全局 Agent 提示词搜索目录\n  agent dir-list                      列出全局目录\n\nrepos.json 位置：系统配置目录/pr-reviewer/repos.json\nWindows 示例：C:\\Users\\<用户名>\\AppData\\Roaming\\pr-reviewer\\repos.json\n\n示例：\n  cargo run -- repo add owner/repo\n  cargo run -- repo add https://github.com/owner/repo/pull/123\n  cargo run -- repo agent add owner/repo security\n  cargo run -- repo agent add security\n  cargo run -- repo agent dir-add .prismflow/prompts\n  cargo run -- repo agent dir-list\n  cargo run -- repo remove\n  cargo run -- repo remove owner/repo"
 )]
 pub struct RepoCommand {
     #[command(subcommand)]
@@ -61,9 +61,15 @@ pub struct RepoAgentCommand {
 #[derive(Debug, Subcommand)]
 pub enum RepoAgentSubcommand {
     #[command(about = "给仓库添加 Agent")]
-    Add { full_name: String, agent: String },
+    Add {
+        #[arg(num_args = 1..=2, value_names = ["OWNER_REPO", "AGENT"])]
+        args: Vec<String>,
+    },
     #[command(about = "从仓库移除 Agent")]
-    Remove { full_name: String, agent: String },
+    Remove {
+        #[arg(num_args = 1..=2, value_names = ["OWNER_REPO", "AGENT"])]
+        args: Vec<String>,
+    },
     #[command(about = "列出仓库已绑定的 Agent")]
     List { full_name: Option<String> },
     #[command(about = "添加全局 Agent 提示词搜索目录（所有仓库共享）")]

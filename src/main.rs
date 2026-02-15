@@ -140,13 +140,41 @@ async fn main() -> Result<()> {
                 }
             }
             RepoSubcommand::Agent(agent) => match agent.command {
-                RepoAgentSubcommand::Add { full_name, agent } => {
-                    repo_manager.add_agent(&full_name, &agent)?;
-                    println!("repo={} agent_added={}", full_name, agent);
+                RepoAgentSubcommand::Add { args } => {
+                    let (full_name, agent) = parse_repo_agent_args(args)?;
+                    let target = if let Some(full_name) = full_name {
+                        full_name
+                    } else {
+                        let Some(selected) = select_repo_interactively(
+                            &repo_manager,
+                            "select repository to add agent:",
+                        )?
+                        else {
+                            println!("no repositories configured");
+                            return Ok(());
+                        };
+                        selected
+                    };
+                    repo_manager.add_agent(&target, &agent)?;
+                    println!("repo={} agent_added={}", target, agent);
                 }
-                RepoAgentSubcommand::Remove { full_name, agent } => {
-                    repo_manager.remove_agent(&full_name, &agent)?;
-                    println!("repo={} agent_removed={}", full_name, agent);
+                RepoAgentSubcommand::Remove { args } => {
+                    let (full_name, agent) = parse_repo_agent_args(args)?;
+                    let target = if let Some(full_name) = full_name {
+                        full_name
+                    } else {
+                        let Some(selected) = select_repo_interactively(
+                            &repo_manager,
+                            "select repository to remove agent:",
+                        )?
+                        else {
+                            println!("no repositories configured");
+                            return Ok(());
+                        };
+                        selected
+                    };
+                    repo_manager.remove_agent(&target, &agent)?;
+                    println!("repo={} agent_removed={}", target, agent);
                 }
                 RepoAgentSubcommand::List { full_name } => {
                     if let Some(full_name) = full_name {
@@ -898,6 +926,44 @@ fn github_client_for_action(
             )
         })?;
     OctocrabGitHubRepository::new(token, max_concurrent_api)
+}
+
+fn select_repo_interactively(
+    repo_manager: &RepoManager<'_>,
+    prompt: &str,
+) -> Result<Option<String>> {
+    let repos = repo_manager.list_repos()?;
+    if repos.is_empty() {
+        return Ok(None);
+    }
+
+    println!("{prompt}");
+    for (idx, item) in repos.iter().enumerate() {
+        println!("  {}. {}", idx + 1, item.full_name);
+    }
+    print!("enter number: ");
+    {
+        use std::io::Write as _;
+        std::io::stdout().flush()?;
+    }
+    let mut input = String::new();
+    std::io::stdin().read_line(&mut input)?;
+    let selected = input
+        .trim()
+        .parse::<usize>()
+        .with_context(|| "invalid selection: expected a number")?;
+    if selected == 0 || selected > repos.len() {
+        anyhow::bail!("invalid selection: out of range");
+    }
+    Ok(Some(repos[selected - 1].full_name.clone()))
+}
+
+fn parse_repo_agent_args(args: Vec<String>) -> Result<(Option<String>, String)> {
+    match args.len() {
+        1 => Ok((None, args[0].clone())),
+        2 => Ok((Some(args[0].clone()), args[1].clone())),
+        _ => anyhow::bail!("agent command expects: [owner/repo] <agent>"),
+    }
 }
 
 #[derive(Debug, Serialize)]
