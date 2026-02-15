@@ -6,7 +6,7 @@ use clap::{ArgAction, Args, Parser, Subcommand};
     version,
     about = "异步 PR 审查编排器",
     long_about = "PrismFlow：用于扫描并自动审查 GitHub Pull Request 的命令行工具。",
-    after_long_help = "顶层 COMMAND 可选：\n  repo    仓库管理\n  auth    认证管理\n  scan    扫描模式（只读）\n  ci      CI 失败分析并回写建议\n  review  审查模式（会写评论）\n\n配置文件位置：\n  repos.json 位于系统配置目录下的 pr-reviewer/repos.json\n  Windows 示例：C:\\Users\\<用户名>\\AppData\\Roaming\\pr-reviewer\\repos.json\n  token 文件：同目录下 auth_token\n\n示例：\n  cargo run -- repo list\n  cargo run -- scan once\n  cargo run -- ci once --engine-command \"...\"\n  cargo run -- review daemon --interval-secs 30"
+    after_long_help = "顶层 COMMAND 可选：\n  repo    仓库管理\n  auth    认证管理\n  scan    扫描模式（只读）\n  ci      CI 失败分析并回写建议\n  review  审查模式（会写评论）\n\n配置文件位置：\n  repos.json 位于系统配置目录下的 pr-reviewer/repos.json\n  Windows 示例：C:\\Users\\<用户名>\\AppData\\Roaming\\pr-reviewer\\repos.json\n  token 文件：同目录下 auth_token\n\n示例：\n  cargo run -- repo list\n  cargo run -- scan once\n  cargo run -- ci once --engine gemini-cli \"gemini -y -p \\\"$(cat {ci_file})\\\"\"\n  cargo run -- review daemon --interval-secs 30"
 )]
 pub struct Cli {
     #[arg(
@@ -110,7 +110,7 @@ pub struct ScanCommand {
 
 #[derive(Debug, Args)]
 #[command(
-    after_long_help = "ci COMMAND 可选：\n  once [--engine <指纹> <命令>] [--clone-repo] [--clone-workspace-dir <目录>] [--clone-depth <值>] [--engine-prompt <提示词>] [--engine-prompt-file <文件>] [--max-concurrent-api <值>] [--repo <owner/repo>] [--exclude-repo <owner/repo>]\n\n说明：\n  ci 会读取 PR 的失败 CI 状态并调用引擎生成修复建议，随后写入 PR 评论。\n  命令支持 {ci_file}、{repo_dir}、{repo_head_sha}、{repo_head_ref} 占位符。\n\n示例：\n  cargo run -- ci once --engine gemini-cli \"gemini -y -p \\\"$(cat {ci_file})\\\"\"\n  cargo run -- ci once --clone-repo --engine gemini-cli \"cd \\\"{repo_dir}\\\" && gemini -y -p \\\"$(cat {ci_file})\\\"\" --repo owner/repo"
+    after_long_help = "ci COMMAND 可选：\n  once [--engine <指纹> <命令>] [--clone-repo] [--clone-workspace-dir <目录>] [--clone-depth <值>] [--engine-prompt <提示词>] [--engine-prompt-file <文件>] [--max-concurrent-api <值>] [--repo <owner/repo>] [--exclude-repo <owner/repo>]\n  daemon [--interval-secs <秒>] [--engine <指纹> <命令>] [--clone-repo] [--clone-workspace-dir <目录>] [--clone-depth <值>] [--engine-prompt <提示词>] [--engine-prompt-file <文件>] [--max-concurrent-api <值>] [--repo <owner/repo>] [--exclude-repo <owner/repo>]\n\n说明：\n  ci 会读取 PR 的失败 CI 状态并调用引擎生成修复建议，随后写入 PR 评论。\n  命令支持 {ci_file}、{repo_dir}、{repo_head_sha}、{repo_head_ref} 占位符。\n\n示例：\n  cargo run -- ci once --engine gemini-cli \"gemini -y -p \\\"$(cat {ci_file})\\\"\"\n  cargo run -- ci daemon --interval-secs 60 --engine gemini-cli \"gemini -y -p \\\"$(cat {ci_file})\\\"\""
 )]
 pub struct CiCommand {
     #[command(subcommand)]
@@ -136,7 +136,57 @@ pub enum CiSubcommand {
         engine_prompt_file: Option<String>,
         #[arg(long, default_value_t = false, help = "启用仓库 clone 上下文模式")]
         clone_repo: bool,
-        #[arg(long, default_value = ".prismflow/repo-cache", help = "clone 缓存目录")]
+        #[arg(
+            long,
+            default_value = ".prismflow/ci-repo-cache",
+            help = "clone 缓存目录"
+        )]
+        clone_workspace_dir: String,
+        #[arg(long, default_value_t = 1, help = "clone/fetch 深度（最小为 1）")]
+        clone_depth: usize,
+        #[arg(long, default_value_t = 2, help = "仓库并发数")]
+        max_concurrent_repos: usize,
+        #[arg(long, default_value_t = 8, help = "全局 API 并发阈值")]
+        max_concurrent_api: usize,
+        #[arg(
+            long = "repo",
+            num_args = 1..,
+            action = ArgAction::Append,
+            help = "仅处理指定仓库（owner/repo 或 github URL，可重复）"
+        )]
+        repos: Vec<String>,
+        #[arg(
+            long = "exclude-repo",
+            num_args = 1..,
+            action = ArgAction::Append,
+            help = "排除指定仓库（owner/repo 或 github URL，可重复）"
+        )]
+        exclude_repos: Vec<String>,
+    },
+    #[command(about = "守护模式持续执行 CI 失败分析")]
+    Daemon {
+        #[arg(long, default_value_t = 60, help = "轮询间隔（秒）")]
+        interval_secs: u64,
+        #[arg(
+            long = "engine",
+            num_args = 2,
+            action = ArgAction::Append,
+            value_names = ["FINGERPRINT", "COMMAND"],
+            required = true,
+            help = "可重复指定：<指纹> <命令>，按 PR 轮询使用"
+        )]
+        engines: Vec<String>,
+        #[arg(long, help = "追加到 ci payload 顶部的自定义提示词")]
+        engine_prompt: Option<String>,
+        #[arg(long, help = "提示词文件路径，读取内容并追加到 ci payload 顶部")]
+        engine_prompt_file: Option<String>,
+        #[arg(long, default_value_t = false, help = "启用仓库 clone 上下文模式")]
+        clone_repo: bool,
+        #[arg(
+            long,
+            default_value = ".prismflow/ci-repo-cache",
+            help = "clone 缓存目录"
+        )]
         clone_workspace_dir: String,
         #[arg(long, default_value_t = 1, help = "clone/fetch 深度（最小为 1）")]
         clone_depth: usize,

@@ -291,17 +291,13 @@ async fn main() -> Result<()> {
                 repos,
                 exclude_repos,
             } => {
-                if repo_manager.list_repos()?.is_empty() {
-                    println!("no repositories configured");
-                    return Ok(());
-                }
                 let resolved_prompt = resolve_engine_prompt(engine_prompt, engine_prompt_file)?;
                 let resolved_engines = resolve_engine_specs(engines)?;
-                let github = github_client_for_action(&auth_manager, max_concurrent_api, "ci")?;
-                let workflow = CiWorkflow::new(
+                run_ci_once(
+                    &auth_manager,
                     config_repo.as_ref(),
-                    &github,
                     &shell,
+                    max_concurrent_api,
                     CiWorkflowOptions {
                         max_concurrent_repos,
                         engine_specs: resolved_engines,
@@ -312,20 +308,58 @@ async fn main() -> Result<()> {
                         include_repos: repos,
                         exclude_repos,
                     },
-                );
-                let stats = run_with_heartbeat("ci-once", workflow.run_once()).await?;
-                if stats.is_empty() {
-                    println!("no repositories matched current filters");
-                } else {
-                    for item in stats {
-                        println!(
-                            "repo={} analyzed={} skipped_no_failures={} skipped_completed={} failed={}",
-                            item.repo,
-                            item.analyzed,
-                            item.skipped_no_failures,
-                            item.skipped_completed,
-                            item.failed
-                        );
+                )
+                .await?;
+            }
+            CiSubcommand::Daemon {
+                interval_secs,
+                engines,
+                engine_prompt,
+                engine_prompt_file,
+                clone_repo,
+                clone_workspace_dir,
+                clone_depth,
+                max_concurrent_repos,
+                max_concurrent_api,
+                repos,
+                exclude_repos,
+            } => {
+                let resolved_prompt = resolve_engine_prompt(engine_prompt, engine_prompt_file)?;
+                let options = CiWorkflowOptions {
+                    max_concurrent_repos,
+                    engine_specs: resolve_engine_specs(engines)?,
+                    engine_prompt: resolved_prompt,
+                    clone_repo_enabled: clone_repo,
+                    clone_workspace_dir,
+                    clone_depth,
+                    include_repos: repos,
+                    exclude_repos,
+                };
+                println!("ci daemon started: interval={}s", interval_secs);
+                loop {
+                    tokio::select! {
+                        r = run_ci_once(
+                            &auth_manager,
+                            config_repo.as_ref(),
+                            &shell,
+                            max_concurrent_api,
+                            options.clone(),
+                        ) => {
+                            if let Err(err) = r {
+                                eprintln!("ci cycle failed: {err:#}");
+                            }
+                        }
+                        _ = tokio::signal::ctrl_c() => {
+                            println!("received Ctrl+C, exiting ci daemon");
+                            break;
+                        }
+                    }
+                    tokio::select! {
+                        _ = sleep(Duration::from_secs(interval_secs)) => {}
+                        _ = tokio::signal::ctrl_c() => {
+                            println!("received Ctrl+C, exiting ci daemon");
+                            break;
+                        }
                     }
                 }
             }
@@ -783,6 +817,38 @@ async fn run_review_once(
         }
     }
 
+    Ok(())
+}
+
+async fn run_ci_once(
+    auth_manager: &AuthManager<'_>,
+    config_repo: &LocalConfigAdapter,
+    shell: &CommandShellAdapter,
+    max_concurrent_api: usize,
+    options: CiWorkflowOptions,
+) -> Result<()> {
+    if config_repo.load_config()?.repos.is_empty() {
+        println!("no repositories configured");
+        return Ok(());
+    }
+
+    let github = github_client_for_action(auth_manager, max_concurrent_api, "ci")?;
+    let workflow = CiWorkflow::new(config_repo, &github, shell, options);
+    let stats = run_with_heartbeat("ci-once", workflow.run_once()).await?;
+    if stats.is_empty() {
+        println!("no repositories matched current filters");
+    } else {
+        for item in stats {
+            println!(
+                "repo={} analyzed={} skipped_no_failures={} skipped_completed={} failed={}",
+                item.repo,
+                item.analyzed,
+                item.skipped_no_failures,
+                item.skipped_completed,
+                item.failed
+            );
+        }
+    }
     Ok(())
 }
 

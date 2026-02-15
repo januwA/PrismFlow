@@ -62,6 +62,7 @@ cargo run -- review ad-hoc https://github.com/owner/repo/pull/123 --engine qwen-
 
 ```bash
 cargo run -- ci once --engine gemini-cli "gemini -y -p \"$(cat {ci_file})\""
+cargo run -- ci daemon --interval-secs 60 --engine gemini-cli "gemini -y -p \"$(cat {ci_file})\""
 ```
 
 ---
@@ -71,12 +72,19 @@ cargo run -- ci once --engine gemini-cli "gemini -y -p \"$(cat {ci_file})\""
 - `--shell "<path>"`：指定命令执行 shell（例如 `D:\apps\Git\bin\bash.exe`）
 - `--repo` / `--exclude-repo`：包含/排除仓库（可重复）
 - `--clone-repo`：启用仓库 clone 上下文
+- `--clone-workspace-dir`：可指定 clone 缓存目录（`review` 与 `ci` 建议使用不同目录）
 
 可用占位符：
 
 - 审查：`{patch_file}`、`{agents_file}`、`{changed_files_file}`
 - CI：`{ci_file}`
 - clone 上下文：`{repo_dir}`、`{repo_head_sha}`、`{repo_head_ref}`
+
+并行运行建议（推荐）：
+
+- 终端 A：`review daemon`
+- 终端 B：`ci daemon`
+- 使用默认目录时已分离：`review => .prismflow/repo-cache`，`ci => .prismflow/ci-repo-cache`
 
 ---
 

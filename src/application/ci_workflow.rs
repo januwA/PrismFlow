@@ -48,7 +48,7 @@ impl Default for CiWorkflowOptions {
             engine_specs: vec![],
             engine_prompt: None,
             clone_repo_enabled: false,
-            clone_workspace_dir: ".prismflow/repo-cache".to_string(),
+            clone_workspace_dir: ".prismflow/ci-repo-cache".to_string(),
             clone_depth: 1,
             include_repos: vec![],
             exclude_repos: vec![],
