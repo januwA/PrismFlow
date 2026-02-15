@@ -70,8 +70,9 @@ async fn main() -> Result<()> {
     init_tracing();
 
     let cli = Cli::parse();
+    let shell_override = cli.shell.clone();
     let config_repo = Arc::new(LocalConfigAdapter::new()?);
-    let shell = CommandShellAdapter;
+    let shell = CommandShellAdapter::new(shell_override);
     let stored_provider = StoredTokenProvider::new(config_repo.auth_token_path());
     let gh_provider = GhCliTokenProvider::new(&shell);
     let env_provider = EnvTokenProvider;

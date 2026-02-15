@@ -9,6 +9,12 @@ use clap::{ArgAction, Args, Parser, Subcommand};
     after_long_help = "顶层 COMMAND 可选：\n  repo    仓库管理\n  auth    认证管理\n  scan    扫描模式（只读）\n  review  审查模式（会写评论）\n\n配置文件位置：\n  repos.json 位于系统配置目录下的 pr-reviewer/repos.json\n  Windows 示例：C:\\Users\\<用户名>\\AppData\\Roaming\\pr-reviewer\\repos.json\n  token 文件：同目录下 auth_token\n\n示例：\n  cargo run -- repo list\n  cargo run -- scan once\n  cargo run -- review daemon --interval-secs 30"
 )]
 pub struct Cli {
+    #[arg(
+        long,
+        global = true,
+        help = "指定命令执行 shell（示例：D:\\apps\\Git\\bin\\bash.exe）；默认自动检测当前环境 shell"
+    )]
+    pub shell: Option<String>,
     #[command(subcommand)]
     pub command: Commands,
 }

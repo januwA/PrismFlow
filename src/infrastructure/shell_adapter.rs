@@ -1,4 +1,5 @@
 use anyhow::{Context, Result};
+use std::path::Path;
 use std::process::Command;
 
 pub trait ShellAdapter: Send + Sync {
@@ -6,8 +7,77 @@ pub trait ShellAdapter: Send + Sync {
     fn run_command_line(&self, command_line: &str) -> Result<String>;
 }
 
-#[derive(Debug, Default)]
-pub struct CommandShellAdapter;
+#[derive(Debug, Clone, Default)]
+pub struct CommandShellAdapter {
+    shell_override: Option<String>,
+}
+
+impl CommandShellAdapter {
+    pub fn new(shell_override: Option<String>) -> Self {
+        Self {
+            shell_override: shell_override
+                .map(|v| v.trim().to_string())
+                .filter(|v| !v.is_empty()),
+        }
+    }
+
+    fn resolve_shell_program(&self) -> String {
+        if let Some(v) = &self.shell_override {
+            return v.clone();
+        }
+        if let Ok(v) = std::env::var("PRISMFLOW_SHELL") {
+            let trimmed = v.trim();
+            if !trimmed.is_empty() {
+                return trimmed.to_string();
+            }
+        }
+        if let Ok(v) = std::env::var("SHELL") {
+            let trimmed = v.trim();
+            if !trimmed.is_empty() {
+                return trimmed.to_string();
+            }
+        }
+        #[cfg(target_os = "windows")]
+        {
+            if std::env::var("PSModulePath").is_ok() {
+                return "powershell".to_string();
+            }
+            if let Ok(v) = std::env::var("ComSpec") {
+                let trimmed = v.trim();
+                if !trimmed.is_empty() {
+                    return trimmed.to_string();
+                }
+            }
+            return "cmd".to_string();
+        }
+        #[cfg(not(target_os = "windows"))]
+        {
+            "sh".to_string()
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+enum ShellKind {
+    Cmd,
+    PowerShell,
+    Posix,
+}
+
+fn shell_kind(program: &str) -> ShellKind {
+    let name = Path::new(program)
+        .file_name()
+        .and_then(|s| s.to_str())
+        .unwrap_or(program)
+        .to_ascii_lowercase();
+    if name == "cmd" || name == "cmd.exe" {
+        return ShellKind::Cmd;
+    }
+    if name.contains("powershell") || name == "pwsh" || name == "pwsh.exe" {
+        return ShellKind::PowerShell;
+    }
+    ShellKind::Posix
+}
 
 impl ShellAdapter for CommandShellAdapter {
     fn run_capture(&self, program: &str, args: &[&str]) -> Result<String> {
@@ -28,17 +98,21 @@ impl ShellAdapter for CommandShellAdapter {
     }
 
     fn run_command_line(&self, command_line: &str) -> Result<String> {
-        #[cfg(target_os = "windows")]
-        let output = Command::new("cmd")
-            .args(["/C", command_line])
-            .output()
-            .with_context(|| "failed to execute command line via cmd".to_string())?;
-
-        #[cfg(not(target_os = "windows"))]
-        let output = Command::new("sh")
-            .args(["-lc", command_line])
-            .output()
-            .with_context(|| "failed to execute command line via sh".to_string())?;
+        let shell_program = self.resolve_shell_program();
+        let output = match shell_kind(&shell_program) {
+            ShellKind::Cmd => Command::new(&shell_program)
+                .args(["/C", command_line])
+                .output()
+                .with_context(|| format!("failed to execute command line via {}", shell_program))?,
+            ShellKind::PowerShell => Command::new(&shell_program)
+                .args(["-NoProfile", "-Command", command_line])
+                .output()
+                .with_context(|| format!("failed to execute command line via {}", shell_program))?,
+            ShellKind::Posix => Command::new(&shell_program)
+                .args(["-lc", command_line])
+                .output()
+                .with_context(|| format!("failed to execute command line via {}", shell_program))?,
+        };
 
         if !output.status.success() {
             anyhow::bail!(
