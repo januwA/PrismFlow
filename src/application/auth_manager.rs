@@ -1,9 +1,6 @@
 use anyhow::{Result, bail};
 
-use crate::{
-    domain::ports::TokenProvider,
-    infrastructure::token_providers::StoredTokenProvider,
-};
+use crate::{domain::ports::TokenProvider, infrastructure::token_providers::StoredTokenProvider};
 
 #[derive(Debug, Clone)]
 pub struct TokenResolution {

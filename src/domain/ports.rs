@@ -4,8 +4,8 @@ use anyhow::Result;
 use async_trait::async_trait;
 
 use crate::domain::entities::{
-    AppConfig, PullRequestFilePatch, PullRequestGitContext, PullRequestMetrics,
-    PullRequestSummary, ReviewComment, SimpleComment, SimplePullReview,
+    AppConfig, PullRequestFilePatch, PullRequestGitContext, PullRequestMetrics, PullRequestSummary,
+    ReviewComment, SimpleComment, SimplePullReview,
 };
 
 pub trait ConfigRepository: Send + Sync {
@@ -22,7 +22,11 @@ pub trait TokenProvider: Send + Sync {
 #[async_trait]
 pub trait GitHubRepository: Send + Sync {
     async fn current_user_login(&self) -> Result<String>;
-    async fn list_open_pull_requests(&self, owner: &str, repo: &str) -> Result<Vec<PullRequestSummary>>;
+    async fn list_open_pull_requests(
+        &self,
+        owner: &str,
+        repo: &str,
+    ) -> Result<Vec<PullRequestSummary>>;
     async fn get_pull_request(
         &self,
         owner: &str,
@@ -106,12 +110,7 @@ pub trait GitHubRepository: Send + Sync {
         repo: &str,
         pull_number: u64,
     ) -> Result<Vec<SimplePullReview>>;
-    async fn delete_issue_comment(
-        &self,
-        owner: &str,
-        repo: &str,
-        comment_id: u64,
-    ) -> Result<()>;
+    async fn delete_issue_comment(&self, owner: &str, repo: &str, comment_id: u64) -> Result<()>;
     async fn delete_pull_review_comment(
         &self,
         owner: &str,

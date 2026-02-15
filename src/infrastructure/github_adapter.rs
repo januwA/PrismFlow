@@ -9,8 +9,8 @@ use tokio::sync::Semaphore;
 
 use crate::domain::{
     entities::{
-        PullRequestFilePatch, PullRequestGitContext, PullRequestMetrics, PullRequestSummary, ReviewComment,
-        SimpleComment, SimplePullReview,
+        PullRequestFilePatch, PullRequestGitContext, PullRequestMetrics, PullRequestSummary,
+        ReviewComment, SimpleComment, SimplePullReview,
     },
     ports::GitHubRepository,
 };
@@ -23,7 +23,9 @@ pub struct OctocrabGitHubRepository {
 
 impl OctocrabGitHubRepository {
     pub fn new(token: String, max_concurrent_api: usize) -> Result<Self> {
-        let client = octocrab::Octocrab::builder().personal_token(token).build()?;
+        let client = octocrab::Octocrab::builder()
+            .personal_token(token)
+            .build()?;
         Ok(Self {
             client,
             api_semaphore: Arc::new(Semaphore::new(max_concurrent_api.max(1))),
@@ -51,7 +53,11 @@ impl GitHubRepository for OctocrabGitHubRepository {
         Ok(me.login)
     }
 
-    async fn list_open_pull_requests(&self, owner: &str, repo: &str) -> Result<Vec<PullRequestSummary>> {
+    async fn list_open_pull_requests(
+        &self,
+        owner: &str,
+        repo: &str,
+    ) -> Result<Vec<PullRequestSummary>> {
         let _permit = self.acquire_api_permit().await?;
         let page = self
             .client
@@ -383,12 +389,7 @@ impl GitHubRepository for OctocrabGitHubRepository {
             .collect())
     }
 
-    async fn delete_issue_comment(
-        &self,
-        owner: &str,
-        repo: &str,
-        comment_id: u64,
-    ) -> Result<()> {
+    async fn delete_issue_comment(&self, owner: &str, repo: &str, comment_id: u64) -> Result<()> {
         let _permit = self.acquire_api_permit().await?;
         let route = format!("/repos/{owner}/{repo}/issues/comments/{comment_id}");
         let _: serde_json::Value = self.client.delete(route, None::<&()>).await?;
@@ -429,7 +430,8 @@ impl GitHubRepository for OctocrabGitHubRepository {
         message: &str,
     ) -> Result<()> {
         let _permit = self.acquire_api_permit().await?;
-        let route = format!("/repos/{owner}/{repo}/pulls/{pull_number}/reviews/{review_id}/dismissals");
+        let route =
+            format!("/repos/{owner}/{repo}/pulls/{pull_number}/reviews/{review_id}/dismissals");
         let payload = json!({ "message": message });
         let _: serde_json::Value = self.client.put(route, Some(&payload)).await?;
         Ok(())

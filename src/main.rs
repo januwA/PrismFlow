@@ -6,20 +6,24 @@ mod interface;
 use std::fs;
 use std::net::SocketAddr;
 use std::path::PathBuf;
-use std::sync::{Arc, atomic::{AtomicBool, Ordering}};
+use std::sync::{
+    Arc,
+    atomic::{AtomicBool, Ordering},
+};
 
 use anyhow::{Context, Result};
+use application::{
+    agent_preflight::{panic_if_cli_agents_missing, panic_if_required_agents_missing},
+    auth_manager::AuthManager,
+    repo_manager::RepoManager,
+    review_workflow::{EngineSpec, ReviewWorkflow, ReviewWorkflowOptions},
+};
 use axum::{
     Router,
     extract::{Form, Query, State},
     http::StatusCode,
     response::{Html, IntoResponse, Redirect},
     routing::{get, post},
-};
-use application::{
-    auth_manager::AuthManager,
-    repo_manager::RepoManager,
-    review_workflow::{EngineSpec, ReviewWorkflow, ReviewWorkflowOptions},
 };
 use clap::Parser;
 use domain::ports::{ConfigRepository, GitHubRepository};
@@ -29,15 +33,15 @@ use infrastructure::{
     shell_adapter::CommandShellAdapter,
     token_providers::{EnvTokenProvider, GhCliTokenProvider, StoredTokenProvider},
 };
-use serde::Deserialize;
 use interface::cli::{
-    AuthSubcommand, Cli, Commands, RepoAgentSubcommand, RepoSubcommand,
-    ReviewSubcommand, ScanSubcommand,
+    AuthSubcommand, Cli, Commands, RepoAgentSubcommand, RepoSubcommand, ReviewSubcommand,
+    ScanSubcommand,
 };
+use serde::Deserialize;
+use serde::Serialize;
 use tokio::sync::{Mutex, Notify, broadcast, mpsc};
 use tokio::time::{Duration, sleep};
 use tracing_subscriber::EnvFilter;
-use serde::Serialize;
 
 #[derive(Debug, Clone)]
 enum UiCommand {
@@ -215,12 +219,7 @@ async fn main() -> Result<()> {
                     return Ok(());
                 }
 
-                let token = auth_manager
-                    .resolve_token()?
-                    .map(|r| r.token)
-                    .context("token required for scan; run `prismflow auth login <token>` or configure gh/GITHUB_TOKEN")?;
-
-                let github = OctocrabGitHubRepository::new(token, max_concurrent_api)?;
+                let github = github_client_for_action(&auth_manager, max_concurrent_api, "scan")?;
                 let workflow = ReviewWorkflow::new(
                     config_repo.as_ref(),
                     &github,
@@ -416,53 +415,59 @@ async fn main() -> Result<()> {
                                         )
                                         .await
                                         {
-                                            let _ = status_tx.send(format!("ui:adhoc failed error={err:#}"));
+                                            let _ = status_tx
+                                                .send(format!("ui:adhoc failed error={err:#}"));
                                         } else {
                                             let _ = status_tx.send("ui:adhoc done".to_string());
                                         }
                                     }
                                     Err(err) => {
-                                        let _ = status_tx.send(format!("ui:adhoc invalid_url error={err:#}"));
+                                        let _ = status_tx
+                                            .send(format!("ui:adhoc invalid_url error={err:#}"));
                                     }
                                 }
                             }
-                            UiCommand::RepoAdd(repo) => {
-                                match repo_manager.add_repo(&repo) {
-                                    Ok(v) => {
-                                        let _ = status_tx.send(format!("ui:repo added {v}"));
-                                    }
-                                    Err(err) => {
-                                        let _ = status_tx.send(format!("ui:repo add failed error={err:#}"));
-                                    }
+                            UiCommand::RepoAdd(repo) => match repo_manager.add_repo(&repo) {
+                                Ok(v) => {
+                                    let _ = status_tx.send(format!("ui:repo added {v}"));
                                 }
-                            }
-                            UiCommand::RepoRemove(repo) => {
-                                match repo_manager.remove_repo(&repo) {
-                                    Ok(_) => {
-                                        let _ = status_tx.send(format!("ui:repo removed {repo}"));
-                                    }
-                                    Err(err) => {
-                                        let _ = status_tx.send(format!("ui:repo remove failed error={err:#}"));
-                                    }
+                                Err(err) => {
+                                    let _ =
+                                        status_tx.send(format!("ui:repo add failed error={err:#}"));
                                 }
-                            }
+                            },
+                            UiCommand::RepoRemove(repo) => match repo_manager.remove_repo(&repo) {
+                                Ok(_) => {
+                                    let _ = status_tx.send(format!("ui:repo removed {repo}"));
+                                }
+                                Err(err) => {
+                                    let _ = status_tx
+                                        .send(format!("ui:repo remove failed error={err:#}"));
+                                }
+                            },
                             UiCommand::AgentAdd { repo, agent } => {
                                 match repo_manager.add_agent(&repo, &agent) {
                                     Ok(_) => {
-                                        let _ = status_tx.send(format!("ui:agent added repo={repo} agent={agent}"));
+                                        let _ = status_tx.send(format!(
+                                            "ui:agent added repo={repo} agent={agent}"
+                                        ));
                                     }
                                     Err(err) => {
-                                        let _ = status_tx.send(format!("ui:agent add failed error={err:#}"));
+                                        let _ = status_tx
+                                            .send(format!("ui:agent add failed error={err:#}"));
                                     }
                                 }
                             }
                             UiCommand::AgentRemove { repo, agent } => {
                                 match repo_manager.remove_agent(&repo, &agent) {
                                     Ok(_) => {
-                                        let _ = status_tx.send(format!("ui:agent removed repo={repo} agent={agent}"));
+                                        let _ = status_tx.send(format!(
+                                            "ui:agent removed repo={repo} agent={agent}"
+                                        ));
                                     }
                                     Err(err) => {
-                                        let _ = status_tx.send(format!("ui:agent remove failed error={err:#}"));
+                                        let _ = status_tx
+                                            .send(format!("ui:agent remove failed error={err:#}"));
                                     }
                                 }
                             }
@@ -472,10 +477,13 @@ async fn main() -> Result<()> {
                                         if let Ok(dirs) = repo_manager.list_agent_prompt_dirs() {
                                             options.agent_prompt_dirs = dirs;
                                         }
-                                        let _ = status_tx.send(format!("ui:global dir added {dir}"));
+                                        let _ =
+                                            status_tx.send(format!("ui:global dir added {dir}"));
                                     }
                                     Err(err) => {
-                                        let _ = status_tx.send(format!("ui:global dir add failed error={err:#}"));
+                                        let _ = status_tx.send(format!(
+                                            "ui:global dir add failed error={err:#}"
+                                        ));
                                     }
                                 }
                             }
@@ -485,10 +493,13 @@ async fn main() -> Result<()> {
                                         if let Ok(dirs) = repo_manager.list_agent_prompt_dirs() {
                                             options.agent_prompt_dirs = dirs;
                                         }
-                                        let _ = status_tx.send(format!("ui:global dir removed {dir}"));
+                                        let _ =
+                                            status_tx.send(format!("ui:global dir removed {dir}"));
                                     }
                                     Err(err) => {
-                                        let _ = status_tx.send(format!("ui:global dir remove failed error={err:#}"));
+                                        let _ = status_tx.send(format!(
+                                            "ui:global dir remove failed error={err:#}"
+                                        ));
                                     }
                                 }
                             }
@@ -642,18 +653,21 @@ async fn run_review_once(
     options: ReviewWorkflowOptions,
     status_tx: Option<&broadcast::Sender<String>>,
 ) -> Result<()> {
-    if config_repo.load_config()?.repos.is_empty() {
+    let config = config_repo.load_config()?;
+    if config.repos.is_empty() {
         println!("no repositories configured");
         return Ok(());
     }
+    panic_if_required_agents_missing(&config, &options, "review-once");
 
-    let token = auth_manager
-        .resolve_token()?
-        .map(|r| r.token)
-        .context("token required for review; run `prismflow auth login <token>` or configure gh/GITHUB_TOKEN")?;
-
-    let github = OctocrabGitHubRepository::new(token, max_concurrent_api)?;
-    let workflow = ReviewWorkflow::new(config_repo, &github, Some(shell), engine_fingerprint, options);
+    let github = github_client_for_action(auth_manager, max_concurrent_api, "review")?;
+    let workflow = ReviewWorkflow::new(
+        config_repo,
+        &github,
+        Some(shell),
+        engine_fingerprint,
+        options,
+    );
     let stats = run_with_heartbeat("review-once", workflow.review_once()).await?;
 
     if stats.is_empty() {
@@ -709,13 +723,15 @@ async fn run_review_ad_hoc(
     max_concurrent_api: usize,
     options: ReviewWorkflowOptions,
 ) -> Result<()> {
-    let token = auth_manager
-        .resolve_token()?
-        .map(|r| r.token)
-        .context("token required for ad-hoc review; run `prismflow auth login <token>` or configure gh/GITHUB_TOKEN")?;
-
-    let github = OctocrabGitHubRepository::new(token, max_concurrent_api)?;
-    let workflow = ReviewWorkflow::new(config_repo, &github, Some(shell), engine_fingerprint, options);
+    panic_if_cli_agents_missing(&options, "review-ad-hoc");
+    let github = github_client_for_action(auth_manager, max_concurrent_api, "ad-hoc review")?;
+    let workflow = ReviewWorkflow::new(
+        config_repo,
+        &github,
+        Some(shell),
+        engine_fingerprint,
+        options,
+    );
     let stats = run_with_heartbeat(
         "review-ad-hoc",
         workflow.review_ad_hoc(owner, repo, pr_number),
@@ -750,12 +766,7 @@ async fn run_review_clean(
     pr_number: u64,
     max_concurrent_api: usize,
 ) -> Result<()> {
-    let token = auth_manager
-        .resolve_token()?
-        .map(|r| r.token)
-        .context("token required for clean; run `prismflow auth login <token>` or configure gh/GITHUB_TOKEN")?;
-
-    let github = OctocrabGitHubRepository::new(token, max_concurrent_api)?;
+    let github = github_client_for_action(auth_manager, max_concurrent_api, "clean")?;
     let me = github.current_user_login().await.ok();
     let issue_comments = github.list_issue_comments(owner, repo, pr_number).await?;
     let mut removed_issue_comments = 0usize;
@@ -772,7 +783,9 @@ async fn run_review_clean(
         }
     }
 
-    let review_comments = github.list_pull_review_comments(owner, repo, pr_number).await?;
+    let review_comments = github
+        .list_pull_review_comments(owner, repo, pr_number)
+        .await?;
     let mut removed_review_comments = 0usize;
     for c in review_comments {
         if is_prismflow_trace_comment(&c.body)
@@ -781,7 +794,11 @@ async fn run_review_clean(
                 .map(|m| c.author_login.as_deref() == Some(m.as_str()))
                 .unwrap_or(false)
         {
-            if github.delete_pull_review_comment(owner, repo, c.id).await.is_ok() {
+            if github
+                .delete_pull_review_comment(owner, repo, c.id)
+                .await
+                .is_ok()
+            {
                 removed_review_comments += 1;
             }
         }
@@ -828,7 +845,11 @@ async fn run_review_clean(
     let mut removed_labels = 0usize;
     for label in labels {
         if label.starts_with("pr-reviewer:reviewed:") {
-            if github.remove_issue_label(owner, repo, pr_number, &label).await.is_ok() {
+            if github
+                .remove_issue_label(owner, repo, pr_number, &label)
+                .await
+                .is_ok()
+            {
                 removed_labels += 1;
             }
         }
@@ -836,9 +857,32 @@ async fn run_review_clean(
 
     println!(
         "clean_result repo={}/{} pr={} removed_issue_comments={} removed_review_comments={} deleted_pending_reviews={} dismissed_reviews={} removed_labels={}",
-        owner, repo, pr_number, removed_issue_comments, removed_review_comments, deleted_pending_reviews, dismissed_reviews, removed_labels
+        owner,
+        repo,
+        pr_number,
+        removed_issue_comments,
+        removed_review_comments,
+        deleted_pending_reviews,
+        dismissed_reviews,
+        removed_labels
     );
     Ok(())
+}
+
+fn github_client_for_action(
+    auth_manager: &AuthManager<'_>,
+    max_concurrent_api: usize,
+    action: &str,
+) -> Result<OctocrabGitHubRepository> {
+    let token = auth_manager
+        .resolve_token()?
+        .map(|r| r.token)
+        .with_context(|| {
+            format!(
+                "token required for {action}; run `prismflow auth login <token>` or configure gh/GITHUB_TOKEN"
+            )
+        })?;
+    OctocrabGitHubRepository::new(token, max_concurrent_api)
 }
 
 #[derive(Debug, Serialize)]
@@ -972,7 +1016,9 @@ fn resolve_engine_specs(
     let command = engine_command
         .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty())
-        .ok_or_else(|| anyhow::anyhow!("missing engine command: set --engine-command or --engine"))?;
+        .ok_or_else(|| {
+            anyhow::anyhow!("missing engine command: set --engine-command or --engine")
+        })?;
     Ok(vec![EngineSpec {
         fingerprint: engine_fingerprint.to_string(),
         command,
@@ -1023,7 +1069,10 @@ async fn ui_index(
     let cfg = match state.config_repo.load_config() {
         Ok(v) => v,
         Err(err) => {
-            return (StatusCode::INTERNAL_SERVER_ERROR, format!("config load failed: {err:#}"))
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("config load failed: {err:#}"),
+            )
                 .into_response();
         }
     };
@@ -1032,7 +1081,10 @@ async fn ui_index(
     let token_hidden = if token.is_empty() {
         String::new()
     } else {
-        format!("<input type=\"hidden\" name=\"token\" value=\"{}\" />", html_escape(&token))
+        format!(
+            "<input type=\"hidden\" name=\"token\" value=\"{}\" />",
+            html_escape(&token)
+        )
     };
 
     let repos_html = if cfg.repos.is_empty() {
@@ -1207,7 +1259,9 @@ async fn ui_agent_remove(
     }
     if let (Some(repo), Some(agent)) = (form.repo, form.agent) {
         if !repo.trim().is_empty() && !agent.trim().is_empty() {
-            let _ = state.command_tx.send(UiCommand::AgentRemove { repo, agent });
+            let _ = state
+                .command_tx
+                .send(UiCommand::AgentRemove { repo, agent });
             state.notify.notify_one();
         }
     }

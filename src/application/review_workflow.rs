@@ -1,8 +1,11 @@
 use std::{
     fs,
-    process::Command,
     path::PathBuf,
-    sync::{Arc, atomic::{AtomicBool, AtomicUsize, Ordering}},
+    process::Command,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, AtomicUsize, Ordering},
+    },
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
@@ -212,15 +215,7 @@ impl<'a> ReviewWorkflow<'a> {
         let filter = ReviewFilterConfig::default();
         let agents = self.options.cli_agents.clone();
         let outcome = self
-            .review_single_pr(
-                owner,
-                repo,
-                &stats.repo,
-                &filter,
-                &agents,
-                pr,
-                true,
-            )
+            .review_single_pr(owner, repo, &stats.repo, &filter, &agents, pr, true)
             .await;
         match outcome {
             PrReviewOutcome::Processed {
@@ -306,7 +301,7 @@ impl<'a> ReviewWorkflow<'a> {
                         pr,
                         false,
                     )
-                        .await
+                    .await
                 }
             })
             .buffer_unordered(pr_concurrency)
@@ -400,13 +395,11 @@ impl<'a> ReviewWorkflow<'a> {
         };
         let reviewed_label = reviewed_label_for_sha(&pr.head_sha);
         let large_skip_label = large_skipped_label_for_sha(&pr.head_sha);
-        let previous_reviewed_short_sha = labels
-            .iter()
-            .find_map(|l| {
-                l.strip_prefix("pr-reviewer:reviewed:")
-                    .filter(|short| *short != pr.head_sha.get(0..12).unwrap_or_default())
-                    .map(|v| v.to_string())
-            });
+        let previous_reviewed_short_sha = labels.iter().find_map(|l| {
+            l.strip_prefix("pr-reviewer:reviewed:")
+                .filter(|short| *short != pr.head_sha.get(0..12).unwrap_or_default())
+                .map(|v| v.to_string())
+        });
 
         if !force_run {
             if comments.iter().any(|body| body.contains(&completed_anchor))
@@ -482,7 +475,11 @@ impl<'a> ReviewWorkflow<'a> {
             };
         }
 
-        let files = match self.github.list_pull_request_files(owner, repo, pr.number).await {
+        let files = match self
+            .github
+            .list_pull_request_files(owner, repo, pr.number)
+            .await
+        {
             Ok(v) => v,
             Err(err) => {
                 return match classify_error(&err) {
@@ -505,7 +502,9 @@ impl<'a> ReviewWorkflow<'a> {
                 })
                 .await;
             if add_completed.is_err() {
-                return PrReviewOutcome::FailedRetryable("operation failed without detailed error context".to_string());
+                return PrReviewOutcome::FailedRetryable(
+                    "operation failed without detailed error context".to_string(),
+                );
             }
 
             if self
@@ -513,7 +512,9 @@ impl<'a> ReviewWorkflow<'a> {
                 .await
                 .is_err()
             {
-                return PrReviewOutcome::FailedRetryable("operation failed without detailed error context".to_string());
+                return PrReviewOutcome::FailedRetryable(
+                    "operation failed without detailed error context".to_string(),
+                );
             }
             return PrReviewOutcome::SkippedFiltered;
         }
@@ -542,7 +543,15 @@ impl<'a> ReviewWorkflow<'a> {
             }
         }
 
-        let effective_prompt = self.resolve_effective_prompt(agents);
+        let effective_prompt = match self.resolve_effective_prompt(agents) {
+            Ok(v) => v,
+            Err(err) => {
+                return match classify_error(&err) {
+                    ErrorClass::Retryable => PrReviewOutcome::FailedRetryable(err.to_string()),
+                    ErrorClass::Fatal => PrReviewOutcome::FailedFatal(err.to_string()),
+                };
+            }
+        };
         let analysis = match self.analyze_review(
             owner,
             repo,
@@ -563,11 +572,9 @@ impl<'a> ReviewWorkflow<'a> {
             }
         };
 
-        let outdated_notice = previous_reviewed_short_sha.as_ref().map(|old| {
-            format!(
-                "Previous review for `{old}` is outdated.\n\n"
-            )
-        });
+        let outdated_notice = previous_reviewed_short_sha
+            .as_ref()
+            .map(|old| format!("Previous review for `{old}` is outdated.\n\n"));
         let summary_with_outdated = match outdated_notice {
             Some(ref notice) => format!("{notice}{}", analysis.summary),
             None => analysis.summary.clone(),
@@ -612,8 +619,12 @@ impl<'a> ReviewWorkflow<'a> {
 
             if inline_submit.is_err() {
                 used_fallback = true;
-                let fallback =
-                    build_fallback_summary(&pr.head_sha, selected_engine_fingerprint, &analysis.inline_comments, &summary_with_outdated);
+                let fallback = build_fallback_summary(
+                    &pr.head_sha,
+                    selected_engine_fingerprint,
+                    &analysis.inline_comments,
+                    &summary_with_outdated,
+                );
                 if let Err(err) = self
                     .with_retry(|| {
                         self.github
@@ -631,8 +642,7 @@ impl<'a> ReviewWorkflow<'a> {
 
         let completed_body = format!(
             "{}\nPrismFlow completed review for `{}`.",
-            completed_anchor,
-            pr.head_sha
+            completed_anchor, pr.head_sha
         );
 
         if let Err(err) = self
@@ -706,9 +716,15 @@ impl<'a> ReviewWorkflow<'a> {
             .with_retry(|| self.github.list_issue_labels(owner, repo, issue_number))
             .await?;
         let prefix = "pr-reviewer:reviewed:";
-        for old in labels.iter().filter(|l| l.starts_with(prefix) && l.as_str() != target_label) {
+        for old in labels
+            .iter()
+            .filter(|l| l.starts_with(prefix) && l.as_str() != target_label)
+        {
             let _ = self
-                .with_retry(|| self.github.remove_issue_label(owner, repo, issue_number, old))
+                .with_retry(|| {
+                    self.github
+                        .remove_issue_label(owner, repo, issue_number, old)
+                })
                 .await;
         }
 
@@ -734,9 +750,15 @@ impl<'a> ReviewWorkflow<'a> {
             .with_retry(|| self.github.list_issue_labels(owner, repo, issue_number))
             .await?;
         let prefix = "pr-reviewer:skipped-large:";
-        for old in labels.iter().filter(|l| l.starts_with(prefix) && l.as_str() != target_label) {
+        for old in labels
+            .iter()
+            .filter(|l| l.starts_with(prefix) && l.as_str() != target_label)
+        {
             let _ = self
-                .with_retry(|| self.github.remove_issue_label(owner, repo, issue_number, old))
+                .with_retry(|| {
+                    self.github
+                        .remove_issue_label(owner, repo, issue_number, old)
+                })
                 .await;
         }
 
@@ -765,34 +787,26 @@ impl<'a> ReviewWorkflow<'a> {
             .unwrap_or(false)
     }
 
-    fn mark_stage(
-        &self,
-        stage: ReviewStage,
-        repo: &str,
-        pr_number: u64,
-    ) {
-        self.emit_status(format!(
-            "stage={:?} repo={} pr={}",
-            stage, repo, pr_number
-        ));
+    fn mark_stage(&self, stage: ReviewStage, repo: &str, pr_number: u64) {
+        self.emit_status(format!("stage={:?} repo={} pr={}", stage, repo, pr_number));
     }
 
-    fn resolve_effective_prompt(&self, agents: &[String]) -> Option<String> {
+    fn resolve_effective_prompt(&self, agents: &[String]) -> Result<Option<String>> {
         let mut sections: Vec<String> = Vec::new();
 
         if let Some(p) = &self.options.engine_prompt {
             sections.push(p.clone());
         }
 
-        let loaded = load_agent_prompts(agents, &self.options.agent_prompt_dirs);
+        let loaded = load_agent_prompts(agents, &self.options.agent_prompt_dirs)?;
         if !loaded.is_empty() {
             sections.push(loaded);
         }
 
         if sections.is_empty() {
-            None
+            Ok(None)
         } else {
-            Some(sections.join("\n\n"))
+            Ok(Some(sections.join("\n\n")))
         }
     }
 
@@ -1009,7 +1023,11 @@ fn classify_error(err: &anyhow::Error) -> ErrorClass {
     }
 }
 
-fn retry_backoff_ms(base_backoff_ms: u64, attempt_idx: usize, last_err: &Option<anyhow::Error>) -> u64 {
+fn retry_backoff_ms(
+    base_backoff_ms: u64,
+    attempt_idx: usize,
+    last_err: &Option<anyhow::Error>,
+) -> u64 {
     let multiplier = (attempt_idx as u64) + 1;
     let mut backoff = base_backoff_ms.saturating_mul(multiplier);
 
@@ -1094,7 +1112,11 @@ fn processing_anchor_prefix(key: &str) -> String {
 }
 
 fn processing_anchor(key: &str) -> String {
-    format!("<!-- prismflow:processing:{}:ts={} -->", key, now_unix_secs())
+    format!(
+        "<!-- prismflow:processing:{}:ts={} -->",
+        key,
+        now_unix_secs()
+    )
 }
 
 fn completed_anchor(key: &str) -> String {
@@ -1129,7 +1151,12 @@ struct ReviewAnalysis {
     inline_comments: Vec<ReviewComment>,
 }
 
-fn build_fallback_summary(head_sha: &str, engine: &str, comments: &[ReviewComment], summary: &str) -> String {
+fn build_fallback_summary(
+    head_sha: &str,
+    engine: &str,
+    comments: &[ReviewComment],
+    summary: &str,
+) -> String {
     let mut out = String::new();
     out.push_str("PrismFlow fallback summary (Inline review unavailable)\n\n");
     out.push_str(&format!("- SHA: `{}`\n", head_sha));
@@ -1263,9 +1290,14 @@ fn likely_unusable_shell_output(output: &str) -> bool {
     bad_hints.iter().any(|h| lower.contains(h))
 }
 
-fn load_agent_prompts(agents: &[String], extra_dirs: &[String]) -> String {
+pub fn ensure_agent_prompts_available(agents: &[String], extra_dirs: &[String]) -> Result<()> {
+    let _ = load_agent_prompts(agents, extra_dirs)?;
+    Ok(())
+}
+
+fn load_agent_prompts(agents: &[String], extra_dirs: &[String]) -> Result<String> {
     if agents.is_empty() {
-        return String::new();
+        return Ok(String::new());
     }
 
     let mut bases: Vec<PathBuf> = extra_dirs
@@ -1295,9 +1327,9 @@ fn load_agent_prompts(agents: &[String], extra_dirs: &[String]) -> String {
             let path = base.join(&file_name);
             checked.push(path.clone());
             if path.exists() {
-                let content = fs::read_to_string(&path).unwrap_or_else(|e| {
-                    panic!("failed to read agent prompt file {}: {}", path.display(), e)
-                });
+                let content = fs::read_to_string(&path).map_err(|e| {
+                    anyhow!("failed to read agent prompt file {}: {}", path.display(), e)
+                })?;
                 loaded = Some(content);
                 break;
             }
@@ -1310,12 +1342,15 @@ fn load_agent_prompts(agents: &[String], extra_dirs: &[String]) -> String {
                     .map(|p| p.display().to_string())
                     .collect::<Vec<_>>()
                     .join(" ; ");
-                panic!("agent prompt file missing: checked {}", checked_str);
+                return Err(anyhow!(
+                    "agent prompt file missing: checked {}",
+                    checked_str
+                ));
             }
         }
     }
 
-    sections.join("\n\n")
+    Ok(sections.join("\n\n"))
 }
 
 fn apply_repo_file_filter(
@@ -1353,7 +1388,11 @@ fn should_review_file(path: &str, has_patch: bool, filter: &ReviewFilterConfig) 
         return false;
     }
 
-    let ext = p.rsplit('.').next().unwrap_or_default().to_ascii_lowercase();
+    let ext = p
+        .rsplit('.')
+        .next()
+        .unwrap_or_default()
+        .to_ascii_lowercase();
     if !filter.include_extensions.is_empty()
         && !filter
             .include_extensions
@@ -1509,7 +1548,11 @@ mod tests {
             Ok("mock-user".to_string())
         }
 
-        async fn list_open_pull_requests(&self, _owner: &str, _repo: &str) -> Result<Vec<PullRequestSummary>> {
+        async fn list_open_pull_requests(
+            &self,
+            _owner: &str,
+            _repo: &str,
+        ) -> Result<Vec<PullRequestSummary>> {
             if let Some(msg) = &self.list_pr_fail_msg {
                 return Err(anyhow!(msg.clone()));
             }

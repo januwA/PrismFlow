@@ -2,10 +2,7 @@ use std::{env, fs, path::PathBuf};
 
 use anyhow::{Context, Result};
 
-use crate::{
-    domain::ports::TokenProvider,
-    infrastructure::shell_adapter::ShellAdapter,
-};
+use crate::{domain::ports::TokenProvider, infrastructure::shell_adapter::ShellAdapter};
 
 pub struct GhCliTokenProvider<'a> {
     shell: &'a dyn ShellAdapter,
@@ -40,7 +37,9 @@ impl TokenProvider for EnvTokenProvider {
     }
 
     fn token(&self) -> Result<Option<String>> {
-        Ok(env::var("GITHUB_TOKEN").ok().filter(|v| !v.trim().is_empty()))
+        Ok(env::var("GITHUB_TOKEN")
+            .ok()
+            .filter(|v| !v.trim().is_empty()))
     }
 }
 
