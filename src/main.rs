@@ -214,6 +214,8 @@ async fn main() -> Result<()> {
             ScanSubcommand::Once {
                 engine_fingerprint,
                 max_concurrent_api,
+                repos,
+                exclude_repos,
             } => {
                 if repo_manager.list_repos()?.is_empty() {
                     println!("no repositories configured");
@@ -226,7 +228,11 @@ async fn main() -> Result<()> {
                     &github,
                     None,
                     engine_fingerprint,
-                    ReviewWorkflowOptions::default(),
+                    ReviewWorkflowOptions {
+                        include_repos: repos,
+                        exclude_repos,
+                        ..ReviewWorkflowOptions::default()
+                    },
                 );
                 let reports = workflow.scan_once().await?;
                 if reports.is_empty() {
@@ -262,6 +268,8 @@ async fn main() -> Result<()> {
                 max_concurrent_api,
                 large_pr_max_files,
                 large_pr_max_lines,
+                repos,
+                exclude_repos,
             } => {
                 let resolved_prompt = resolve_engine_prompt(engine_prompt, engine_prompt_file)?;
                 let resolved_engines =
@@ -279,6 +287,8 @@ async fn main() -> Result<()> {
                     keep_diff_files,
                     max_concurrent_repos,
                     max_concurrent_prs,
+                    include_repos: repos,
+                    exclude_repos,
                     ..ReviewWorkflowOptions::default()
                 };
                 run_review_once(
@@ -312,6 +322,8 @@ async fn main() -> Result<()> {
                 max_concurrent_api,
                 large_pr_max_files,
                 large_pr_max_lines,
+                repos,
+                exclude_repos,
             } => {
                 let resolved_prompt = resolve_engine_prompt(engine_prompt, engine_prompt_file)?;
                 let resolved_engines =
@@ -329,6 +341,8 @@ async fn main() -> Result<()> {
                     keep_diff_files,
                     max_concurrent_repos,
                     max_concurrent_prs,
+                    include_repos: repos,
+                    exclude_repos,
                     ..ReviewWorkflowOptions::default()
                 };
                 let (status_tx, mut status_rx) = broadcast::channel::<String>(256);

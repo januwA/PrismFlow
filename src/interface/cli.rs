@@ -112,6 +112,20 @@ pub enum ScanSubcommand {
         engine_fingerprint: String,
         #[arg(long, default_value_t = 8, help = "全局 API 并发阈值")]
         max_concurrent_api: usize,
+        #[arg(
+            long = "repo",
+            num_args = 1..,
+            action = ArgAction::Append,
+            help = "仅处理指定仓库（owner/repo 或 github URL，可重复）"
+        )]
+        repos: Vec<String>,
+        #[arg(
+            long = "exclude-repo",
+            num_args = 1..,
+            action = ArgAction::Append,
+            help = "排除指定仓库（owner/repo 或 github URL，可重复）"
+        )]
+        exclude_repos: Vec<String>,
     },
 }
 
@@ -198,6 +212,20 @@ pub enum ReviewSubcommand {
             help = "大改动跳过阈值：新增+删除行数达到该值则直接打标签跳过"
         )]
         large_pr_max_lines: u64,
+        #[arg(
+            long = "repo",
+            num_args = 1..,
+            action = ArgAction::Append,
+            help = "仅处理指定仓库（owner/repo 或 github URL，可重复）"
+        )]
+        repos: Vec<String>,
+        #[arg(
+            long = "exclude-repo",
+            num_args = 1..,
+            action = ArgAction::Append,
+            help = "排除指定仓库（owner/repo 或 github URL，可重复）"
+        )]
+        exclude_repos: Vec<String>,
     },
     #[command(about = "守护模式持续审查（按间隔轮询执行）")]
     Daemon {
@@ -283,6 +311,20 @@ pub enum ReviewSubcommand {
             help = "大改动跳过阈值：新增+删除行数达到该值则直接打标签跳过"
         )]
         large_pr_max_lines: u64,
+        #[arg(
+            long = "repo",
+            num_args = 1..,
+            action = ArgAction::Append,
+            help = "仅处理指定仓库（owner/repo 或 github URL，可重复）"
+        )]
+        repos: Vec<String>,
+        #[arg(
+            long = "exclude-repo",
+            num_args = 1..,
+            action = ArgAction::Append,
+            help = "排除指定仓库（owner/repo 或 github URL，可重复）"
+        )]
+        exclude_repos: Vec<String>,
     },
     #[command(about = "即时审查单个 PR URL（无需预先加入 repo 列表）")]
     AdHoc {

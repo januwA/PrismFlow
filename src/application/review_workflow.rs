@@ -1,4 +1,5 @@
 use std::{
+    collections::HashSet,
     fs,
     path::PathBuf,
     process::Command,
@@ -79,6 +80,8 @@ pub struct ReviewWorkflowOptions {
     pub large_pr_max_files: u64,
     pub large_pr_max_changed_lines: u64,
     pub cli_agents: Vec<String>,
+    pub include_repos: Vec<String>,
+    pub exclude_repos: Vec<String>,
     pub status_tx: Option<broadcast::Sender<String>>,
     pub skip_flag: Option<Arc<AtomicBool>>,
 }
@@ -100,6 +103,8 @@ impl Default for ReviewWorkflowOptions {
             large_pr_max_files: DEFAULT_LARGE_PR_MAX_FILES,
             large_pr_max_changed_lines: DEFAULT_LARGE_PR_MAX_CHANGED_LINES,
             cli_agents: vec![],
+            include_repos: vec![],
+            exclude_repos: vec![],
             status_tx: None,
             skip_flag: None,
         }
@@ -142,8 +147,12 @@ impl<'a> ReviewWorkflow<'a> {
     pub async fn scan_once(&self) -> Result<Vec<ScanReport>> {
         let cfg = self.config_repo.load_config()?;
         let mut reports = Vec::new();
+        let selector = RepoSelector::from_options(&self.options);
 
         for monitored in cfg.repos {
+            if !selector.matches(&monitored.full_name) {
+                continue;
+            }
             let (owner, repo) = split_repo(&monitored.full_name)?;
             let prs = self.github.list_open_pull_requests(owner, repo).await?;
 
@@ -173,10 +182,17 @@ impl<'a> ReviewWorkflow<'a> {
 
     pub async fn review_once(&self) -> Result<Vec<RepoReviewStats>> {
         let mut cfg: AppConfig = self.config_repo.load_config()?;
-        let repos = cfg.repos.clone();
+        let selector = RepoSelector::from_options(&self.options);
+        let repos = cfg
+            .repos
+            .iter()
+            .enumerate()
+            .filter(|(_, repo)| selector.matches(&repo.full_name))
+            .map(|(idx, repo)| (idx, repo.clone()))
+            .collect::<Vec<_>>();
         let repo_concurrency = self.options.max_concurrent_repos.max(1);
 
-        let mut results = stream::iter(repos.into_iter().enumerate())
+        let mut results = stream::iter(repos.into_iter())
             .map(|(idx, monitored)| async move {
                 let report = self.review_repo(monitored).await;
                 (idx, report)
@@ -892,6 +908,77 @@ impl<'a> ReviewWorkflow<'a> {
         let pick = idx % self.options.engine_specs.len();
         Ok(self.options.engine_specs[pick].clone())
     }
+}
+
+#[derive(Debug, Clone)]
+struct RepoSelector {
+    includes: HashSet<String>,
+    excludes: HashSet<String>,
+}
+
+impl RepoSelector {
+    fn from_options(options: &ReviewWorkflowOptions) -> Self {
+        Self {
+            includes: options
+                .include_repos
+                .iter()
+                .map(|v| normalize_repo_selector(v))
+                .filter(|v| !v.is_empty())
+                .collect(),
+            excludes: options
+                .exclude_repos
+                .iter()
+                .map(|v| normalize_repo_selector(v))
+                .filter(|v| !v.is_empty())
+                .collect(),
+        }
+    }
+
+    fn matches(&self, full_name: &str) -> bool {
+        let key = normalize_repo_selector(full_name);
+        if !self.includes.is_empty() && !self.includes.contains(&key) {
+            return false;
+        }
+        !self.excludes.contains(&key)
+    }
+}
+
+fn normalize_repo_selector(input: &str) -> String {
+    let trimmed = input.trim().trim_end_matches('/');
+    if trimmed.is_empty() {
+        return String::new();
+    }
+    if let Some(repo) = parse_github_repo_like_url(trimmed) {
+        return repo.to_ascii_lowercase();
+    }
+    trimmed.to_ascii_lowercase()
+}
+
+fn parse_github_repo_like_url(input: &str) -> Option<String> {
+    let tail = if let Some(v) = input.strip_prefix("https://github.com/") {
+        v
+    } else if let Some(v) = input.strip_prefix("http://github.com/") {
+        v
+    } else if let Some(v) = input.strip_prefix("github.com/") {
+        v
+    } else {
+        return None;
+    };
+
+    let parts = tail
+        .split('/')
+        .filter(|s| !s.trim().is_empty())
+        .collect::<Vec<_>>();
+    if parts.len() < 2 {
+        return None;
+    }
+
+    let owner = parts[0].trim();
+    let repo = parts[1].trim().trim_end_matches(".git");
+    if owner.is_empty() || repo.is_empty() {
+        return None;
+    }
+    Some(format!("{owner}/{repo}"))
 }
 
 fn prepare_repo_checkout(
@@ -1822,6 +1909,22 @@ mod tests {
         }
     }
 
+    fn config_with_repos(names: &[&str]) -> AppConfig {
+        AppConfig {
+            agent_prompt_dirs: vec![],
+            repos: names
+                .iter()
+                .map(|name| MonitoredRepo {
+                    full_name: (*name).to_string(),
+                    added_at: "2026-01-01T00:00:00Z".to_string(),
+                    last_sha: None,
+                    review_filter: ReviewFilterConfig::default(),
+                    agents: vec![],
+                })
+                .collect(),
+        }
+    }
+
     #[derive(Default)]
     struct MockShell;
 
@@ -2132,5 +2235,69 @@ mod tests {
             .unwrap_or_default();
         let merged = comments.join("\n\n");
         assert!(merged.contains("Previous review for `111111111111` is outdated."));
+    }
+
+    #[tokio::test]
+    async fn review_once_filters_with_include_repos() {
+        let github = MockGitHub {
+            prs: vec![PullRequestSummary {
+                number: 1,
+                title: "t".to_string(),
+                head_sha: "abc123".to_string(),
+                html_url: None,
+            }],
+            files: HashMap::from([(
+                1,
+                vec![PullRequestFilePatch {
+                    path: "src/lib.rs".to_string(),
+                    patch: Some("@@ -1,1 +1,2 @@\n line\n+let x = 1;".to_string()),
+                }],
+            )]),
+            ..Default::default()
+        };
+        let config = InMemoryConfigRepo::new(config_with_repos(&["owner/repo-a", "owner/repo-b"]));
+        let opts = ReviewWorkflowOptions {
+            include_repos: vec!["owner/repo-b".to_string()],
+            ..ReviewWorkflowOptions::default()
+        };
+
+        let stats = workflow(&config, &github, opts)
+            .review_once()
+            .await
+            .expect("review_once");
+        assert_eq!(stats.len(), 1);
+        assert_eq!(stats[0].repo, "owner/repo-b");
+    }
+
+    #[tokio::test]
+    async fn review_once_filters_with_exclude_repos() {
+        let github = MockGitHub {
+            prs: vec![PullRequestSummary {
+                number: 1,
+                title: "t".to_string(),
+                head_sha: "abc123".to_string(),
+                html_url: None,
+            }],
+            files: HashMap::from([(
+                1,
+                vec![PullRequestFilePatch {
+                    path: "src/lib.rs".to_string(),
+                    patch: Some("@@ -1,1 +1,2 @@\n line\n+let x = 1;".to_string()),
+                }],
+            )]),
+            ..Default::default()
+        };
+        let config = InMemoryConfigRepo::new(config_with_repos(&["owner/repo-a", "owner/repo-b"]));
+        let opts = ReviewWorkflowOptions {
+            exclude_repos: vec!["owner/repo-a".to_string()],
+            ..ReviewWorkflowOptions::default()
+        };
+
+        let stats = workflow(&config, &github, opts)
+            .review_once()
+            .await
+            .expect("review_once");
+        assert_eq!(stats.len(), 1);
+        assert_eq!(stats[0].repo, "owner/repo-b");
     }
 }
