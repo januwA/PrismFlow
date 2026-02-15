@@ -6,7 +6,7 @@ use clap::{ArgAction, Args, Parser, Subcommand};
     version,
     about = "异步 PR 审查编排器",
     long_about = "PrismFlow：用于扫描并自动审查 GitHub Pull Request 的命令行工具。",
-    after_long_help = "顶层 COMMAND 可选：\n  repo    仓库管理\n  auth    认证管理\n  scan    扫描模式（只读）\n  review  审查模式（会写评论）\n\n配置文件位置：\n  repos.json 位于系统配置目录下的 pr-reviewer/repos.json\n  Windows 示例：C:\\Users\\<用户名>\\AppData\\Roaming\\pr-reviewer\\repos.json\n  token 文件：同目录下 auth_token\n\n示例：\n  cargo run -- repo list\n  cargo run -- scan once\n  cargo run -- review daemon --interval-secs 30"
+    after_long_help = "顶层 COMMAND 可选：\n  repo    仓库管理\n  auth    认证管理\n  scan    扫描模式（只读）\n  ci      CI 失败分析并回写建议\n  review  审查模式（会写评论）\n\n配置文件位置：\n  repos.json 位于系统配置目录下的 pr-reviewer/repos.json\n  Windows 示例：C:\\Users\\<用户名>\\AppData\\Roaming\\pr-reviewer\\repos.json\n  token 文件：同目录下 auth_token\n\n示例：\n  cargo run -- repo list\n  cargo run -- scan once\n  cargo run -- ci once --engine-command \"...\"\n  cargo run -- review daemon --interval-secs 30"
 )]
 pub struct Cli {
     #[arg(
@@ -27,6 +27,8 @@ pub enum Commands {
     Auth(AuthCommand),
     #[command(about = "扫描模式（只读取 PR，不提交评论）")]
     Scan(ScanCommand),
+    #[command(about = "CI 分析模式（读取失败 CI 并输出修复建议评论）")]
+    Ci(CiCommand),
     #[command(about = "审查模式（会提交评论，可单次或守护运行）")]
     Review(ReviewCommand),
 }
@@ -99,23 +101,70 @@ pub enum AuthSubcommand {
 
 #[derive(Debug, Args)]
 #[command(
-    after_long_help = "scan COMMAND 可选：\n  once [--engine-fingerprint <值>] [--max-concurrent-api <值>]\n\n说明：\n  scan 只读取 PR 信息和幂等键，不会提交评论。\n\n示例：\n  cargo run -- scan once\n  cargo run -- scan once --engine-fingerprint qwen-v1 --max-concurrent-api 12"
+    after_long_help = "scan COMMAND 可选：\n  once [--max-concurrent-api <值>] [--repo <owner/repo>] [--exclude-repo <owner/repo>]\n\n说明：\n  scan 只读取 PR 信息和幂等键，不会提交评论，也不依赖引擎参数。\n\n示例：\n  cargo run -- scan once\n  cargo run -- scan once --repo owner/repo --max-concurrent-api 12"
 )]
 pub struct ScanCommand {
     #[command(subcommand)]
     pub command: ScanSubcommand,
 }
 
+#[derive(Debug, Args)]
+#[command(
+    after_long_help = "ci COMMAND 可选：\n  once [--engine <指纹> <命令>] [--clone-repo] [--clone-workspace-dir <目录>] [--clone-depth <值>] [--engine-prompt <提示词>] [--engine-prompt-file <文件>] [--max-concurrent-api <值>] [--repo <owner/repo>] [--exclude-repo <owner/repo>]\n\n说明：\n  ci 会读取 PR 的失败 CI 状态并调用引擎生成修复建议，随后写入 PR 评论。\n  命令支持 {ci_file}、{repo_dir}、{repo_head_sha}、{repo_head_ref} 占位符。\n\n示例：\n  cargo run -- ci once --engine gemini-cli \"gemini -y -p \\\"$(cat {ci_file})\\\"\"\n  cargo run -- ci once --clone-repo --engine gemini-cli \"cd \\\"{repo_dir}\\\" && gemini -y -p \\\"$(cat {ci_file})\\\"\" --repo owner/repo"
+)]
+pub struct CiCommand {
+    #[command(subcommand)]
+    pub command: CiSubcommand,
+}
+
+#[derive(Debug, Subcommand)]
+pub enum CiSubcommand {
+    #[command(about = "执行一次 CI 失败分析并写评论")]
+    Once {
+        #[arg(
+            long = "engine",
+            num_args = 2,
+            action = ArgAction::Append,
+            value_names = ["FINGERPRINT", "COMMAND"],
+            required = true,
+            help = "可重复指定：<指纹> <命令>，按 PR 轮询使用"
+        )]
+        engines: Vec<String>,
+        #[arg(long, help = "追加到 ci payload 顶部的自定义提示词")]
+        engine_prompt: Option<String>,
+        #[arg(long, help = "提示词文件路径，读取内容并追加到 ci payload 顶部")]
+        engine_prompt_file: Option<String>,
+        #[arg(long, default_value_t = false, help = "启用仓库 clone 上下文模式")]
+        clone_repo: bool,
+        #[arg(long, default_value = ".prismflow/repo-cache", help = "clone 缓存目录")]
+        clone_workspace_dir: String,
+        #[arg(long, default_value_t = 1, help = "clone/fetch 深度（最小为 1）")]
+        clone_depth: usize,
+        #[arg(long, default_value_t = 2, help = "仓库并发数")]
+        max_concurrent_repos: usize,
+        #[arg(long, default_value_t = 8, help = "全局 API 并发阈值")]
+        max_concurrent_api: usize,
+        #[arg(
+            long = "repo",
+            num_args = 1..,
+            action = ArgAction::Append,
+            help = "仅处理指定仓库（owner/repo 或 github URL，可重复）"
+        )]
+        repos: Vec<String>,
+        #[arg(
+            long = "exclude-repo",
+            num_args = 1..,
+            action = ArgAction::Append,
+            help = "排除指定仓库（owner/repo 或 github URL，可重复）"
+        )]
+        exclude_repos: Vec<String>,
+    },
+}
+
 #[derive(Debug, Subcommand)]
 pub enum ScanSubcommand {
     #[command(about = "执行一次扫描（只输出待审查信息与锚点键，不写评论）")]
     Once {
-        #[arg(
-            long,
-            default_value = "default-engine",
-            help = "审查引擎指纹，用于幂等去重键计算"
-        )]
-        engine_fingerprint: String,
         #[arg(long, default_value_t = 8, help = "全局 API 并发阈值")]
         max_concurrent_api: usize,
         #[arg(
@@ -137,7 +186,7 @@ pub enum ScanSubcommand {
 
 #[derive(Debug, Args)]
 #[command(
-    after_long_help = "review COMMAND 可选：\n  once [--engine-fingerprint <值>] [--engine-command <命令>] [--engine <指纹> <命令>] [--clone-repo] [--clone-workspace-dir <目录>] [--clone-depth <值>] [--engine-prompt <提示词>] [--engine-prompt-file <文件>] [--agent <名称>] [--keep-diff-files] [--max-concurrent-repos <值>] [--max-concurrent-prs <值>] [--max-concurrent-api <值>]\n  daemon [--interval-secs <秒>] [--ui] [--ui-bind <地址>] [--ui-token <口令>] [--engine-fingerprint <值>] [--engine-command <命令>] [--engine <指纹> <命令>] [--clone-repo] [--clone-workspace-dir <目录>] [--clone-depth <值>] [--engine-prompt <提示词>] [--engine-prompt-file <文件>] [--agent <名称>] [--keep-diff-files] [--max-concurrent-repos <值>] [--max-concurrent-prs <值>] [--max-concurrent-api <值>]\n  ad-hoc <pr_url> [--engine-fingerprint <值>] [--engine-command <命令>] [--engine <指纹> <命令>] [--clone-repo] [--clone-workspace-dir <目录>] [--clone-depth <值>] [--engine-prompt <提示词>] [--engine-prompt-file <文件>] [--agent <名称>] [--keep-diff-files] [--max-concurrent-api <值>]\n\n说明：\n  review 会向 GitHub 提交评论。\n  review 固定使用 shell 模式，本地命令支持 {patch_file}、{agents_file} 与 {changed_files_file} 占位符。\n  启用 --clone-repo 后，可额外使用 {repo_dir}、{repo_head_sha}、{repo_head_ref} 占位符。\n  --clone-depth 控制 clone/fetch 深度，默认 1；设置为 2 可获取最近两个提交用于对比。\n  {patch_file} 仅包含 diff 内容；{agents_file} 包含 --engine-prompt/--engine-prompt-file 与 Agent 汇总内容；{changed_files_file} 仅包含变更文件名列表。\n  --engine-prompt 和 --engine-prompt-file 不能同时使用。\n  --engine 可重复传入，每次必须给两个参数：<fingerprint> <command>，按 PR 轮询使用。\n  --engine 与 --engine-command 不能同时使用。\n  --agent 会先按全局 agent 目录配置查找；再回退到 当前目录/.prismflow/prompts 与系统配置目录 pr-reviewer/prompts。\n  --ui 启动本地 HTTP 管理页面；若开放局域网访问，建议同时设置 --ui-token。\n  默认会自动删除生成的 diff 文件；加 --keep-diff-files 可保留到 .prismflow/tmp-diffs。\n\n示例：\n  cargo run -- review once --clone-repo --clone-depth 2 --engine qwen-v1 \"qwen -y \\\"diff={patch_file} agents={agents_file} files={changed_files_file} repo={repo_dir} sha={repo_head_sha}\\\"\" --engine-prompt-file prompts/bug-only.txt --agent logic\n  cargo run -- review ad-hoc https://github.com/owner/repo/pull/123 --engine ollama:qwen2.5:1.5b \"cat {patch_file} {agents_file} {changed_files_file} | ollama run qwen2.5:1.5b\" --engine-prompt-file prompts/bug-only.txt --agent security\n  cargo run -- review daemon --ui --ui-bind 0.0.0.0:8787 --ui-token mysecret --interval-secs 30 --clone-repo --clone-depth 2 --engine qwen-v1 \"qwen -y \\\"diff: {patch_file} agents: {agents_file} files: {changed_files_file}\\\"\" --max-concurrent-repos 3 --max-concurrent-prs 6 --max-concurrent-api 12"
+    after_long_help = "review COMMAND 可选：\n  once [--engine <指纹> <命令>] [--clone-repo] [--clone-workspace-dir <目录>] [--clone-depth <值>] [--engine-prompt <提示词>] [--engine-prompt-file <文件>] [--agent <名称>] [--keep-diff-files] [--max-concurrent-repos <值>] [--max-concurrent-prs <值>] [--max-concurrent-api <值>]\n  daemon [--interval-secs <秒>] [--ui] [--ui-bind <地址>] [--ui-token <口令>] [--engine <指纹> <命令>] [--clone-repo] [--clone-workspace-dir <目录>] [--clone-depth <值>] [--engine-prompt <提示词>] [--engine-prompt-file <文件>] [--agent <名称>] [--keep-diff-files] [--max-concurrent-repos <值>] [--max-concurrent-prs <值>] [--max-concurrent-api <值>]\n  ad-hoc <pr_url> [--engine <指纹> <命令>] [--clone-repo] [--clone-workspace-dir <目录>] [--clone-depth <值>] [--engine-prompt <提示词>] [--engine-prompt-file <文件>] [--agent <名称>] [--keep-diff-files] [--max-concurrent-api <值>]\n\n说明：\n  review 会向 GitHub 提交评论。\n  review 固定使用 shell 模式，本地命令支持 {patch_file}、{agents_file} 与 {changed_files_file} 占位符。\n  启用 --clone-repo 后，可额外使用 {repo_dir}、{repo_head_sha}、{repo_head_ref} 占位符。\n  --clone-depth 控制 clone/fetch 深度，默认 1；设置为 2 可获取最近两个提交用于对比。\n  {patch_file} 仅包含 diff 内容；{agents_file} 包含 --engine-prompt/--engine-prompt-file 与 Agent 汇总内容；{changed_files_file} 仅包含变更文件名列表。\n  --engine-prompt 和 --engine-prompt-file 不能同时使用。\n  --engine 可重复传入，每次必须给两个参数：<fingerprint> <command>，按 PR 轮询使用。\n  --agent 会先按全局 agent 目录配置查找；再回退到 当前目录/.prismflow/prompts 与系统配置目录 pr-reviewer/prompts。\n  --ui 启动本地 HTTP 管理页面；若开放局域网访问，建议同时设置 --ui-token。\n  默认会自动删除生成的 diff 文件；加 --keep-diff-files 可保留到 .prismflow/tmp-diffs。\n\n示例：\n  cargo run -- review once --clone-repo --clone-depth 2 --engine qwen-v1 \"qwen -y \\\"diff={patch_file} agents={agents_file} files={changed_files_file} repo={repo_dir} sha={repo_head_sha}\\\"\" --engine-prompt-file prompts/bug-only.txt --agent logic\n  cargo run -- review ad-hoc https://github.com/owner/repo/pull/123 --engine ollama:qwen2.5:1.5b \"cat {patch_file} {agents_file} {changed_files_file} | ollama run qwen2.5:1.5b\" --engine-prompt-file prompts/bug-only.txt --agent security\n  cargo run -- review daemon --ui --ui-bind 0.0.0.0:8787 --ui-token mysecret --interval-secs 30 --clone-repo --clone-depth 2 --engine qwen-v1 \"qwen -y \\\"diff: {patch_file} agents: {agents_file} files: {changed_files_file}\\\"\" --max-concurrent-repos 3 --max-concurrent-prs 6 --max-concurrent-api 12"
 )]
 pub struct ReviewCommand {
     #[command(subcommand)]
@@ -149,22 +198,12 @@ pub enum ReviewSubcommand {
     #[command(about = "执行一次审查（会尝试提交 inline 评论或降级总结评论）")]
     Once {
         #[arg(
-            long,
-            default_value = "default-engine",
-            help = "审查引擎指纹，用于幂等去重键计算"
-        )]
-        engine_fingerprint: String,
-        #[arg(
-            long,
-            help = "shell 模式命令，例如：qwen --review --input {patch_file} --agents {agents_file} --files {changed_files_file}（支持 {patch_file}/{agents_file}/{changed_files_file} 占位符）"
-        )]
-        engine_command: Option<String>,
-        #[arg(
             long = "engine",
             num_args = 2,
             action = ArgAction::Append,
             value_names = ["FINGERPRINT", "COMMAND"],
-            help = "可重复指定：<指纹> <命令>，按 PR 轮询使用（与 --engine-command 互斥）"
+            required = true,
+            help = "可重复指定：<指纹> <命令>，按 PR 轮询使用"
         )]
         engines: Vec<String>,
         #[arg(
@@ -248,22 +287,12 @@ pub enum ReviewSubcommand {
         #[arg(long, help = "UI 访问口令（建议在局域网访问时设置）")]
         ui_token: Option<String>,
         #[arg(
-            long,
-            default_value = "default-engine",
-            help = "审查引擎指纹，用于幂等去重键计算"
-        )]
-        engine_fingerprint: String,
-        #[arg(
-            long,
-            help = "shell 模式命令，例如：qwen --review --input {patch_file} --agents {agents_file} --files {changed_files_file}（支持 {patch_file}/{agents_file}/{changed_files_file} 占位符）"
-        )]
-        engine_command: Option<String>,
-        #[arg(
             long = "engine",
             num_args = 2,
             action = ArgAction::Append,
             value_names = ["FINGERPRINT", "COMMAND"],
-            help = "可重复指定：<指纹> <命令>，按 PR 轮询使用（与 --engine-command 互斥）"
+            required = true,
+            help = "可重复指定：<指纹> <命令>，按 PR 轮询使用"
         )]
         engines: Vec<String>,
         #[arg(
@@ -337,22 +366,12 @@ pub enum ReviewSubcommand {
         #[arg(help = "GitHub PR 链接，例如 https://github.com/owner/repo/pull/123")]
         pr_url: String,
         #[arg(
-            long,
-            default_value = "default-engine",
-            help = "审查引擎指纹，用于幂等去重键计算"
-        )]
-        engine_fingerprint: String,
-        #[arg(
-            long,
-            help = "shell 模式命令，例如：qwen --review --input {patch_file} --agents {agents_file} --files {changed_files_file}（支持 {patch_file}/{agents_file}/{changed_files_file} 占位符）"
-        )]
-        engine_command: Option<String>,
-        #[arg(
             long = "engine",
             num_args = 2,
             action = ArgAction::Append,
             value_names = ["FINGERPRINT", "COMMAND"],
-            help = "可重复指定：<指纹> <命令>，按 PR 轮询使用（与 --engine-command 互斥）"
+            required = true,
+            help = "可重复指定：<指纹> <命令>，按 PR 轮询使用"
         )]
         engines: Vec<String>,
         #[arg(

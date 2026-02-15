@@ -131,14 +131,14 @@ impl<'a> ReviewWorkflow<'a> {
         config_repo: &'a dyn ConfigRepository,
         github: &'a dyn GitHubRepository,
         shell: Option<&'a dyn ShellAdapter>,
-        engine_fingerprint: String,
         options: ReviewWorkflowOptions,
     ) -> Self {
+        let workflow_fp = workflow_engine_fingerprint(&options.engine_specs);
         Self {
             config_repo,
             github,
             shell,
-            engine_fingerprint,
+            engine_fingerprint: workflow_fp,
             options,
             next_engine_idx: AtomicUsize::new(0),
         }
@@ -162,12 +162,7 @@ impl<'a> ReviewWorkflow<'a> {
                     number: pr.number,
                     title: pr.title,
                     url: pr.html_url,
-                    anchor_key: dedupe_key(
-                        &monitored.full_name,
-                        pr.number,
-                        &pr.head_sha,
-                        &self.engine_fingerprint,
-                    ),
+                    anchor_key: dedupe_key(&monitored.full_name, pr.number, &pr.head_sha, "scan"),
                 })
                 .collect::<Vec<_>>();
 
@@ -1184,6 +1179,23 @@ fn dedupe_key(repo: &str, pr: u64, head_sha: &str, engine_fingerprint: &str) -> 
     hex::encode(digest)
 }
 
+fn workflow_engine_fingerprint(engine_specs: &[EngineSpec]) -> String {
+    if engine_specs.is_empty() {
+        return "default-engine".to_string();
+    }
+    if engine_specs.len() == 1 {
+        return engine_specs[0].fingerprint.clone();
+    }
+    let mut hasher = Sha256::new();
+    for spec in engine_specs {
+        hasher.update(spec.fingerprint.as_bytes());
+        hasher.update(b";");
+    }
+    let digest = hasher.finalize();
+    let hex = hex::encode(digest);
+    format!("multi-{}", &hex[..12])
+}
+
 fn reviewed_label_for_sha(head_sha: &str) -> String {
     let short = &head_sha[..head_sha.len().min(12)];
     format!("pr-reviewer:reviewed:{short}")
@@ -1708,6 +1720,24 @@ mod tests {
             })
         }
 
+        async fn get_pull_request_ci_snapshot(
+            &self,
+            _owner: &str,
+            _repo: &str,
+            pull_number: u64,
+        ) -> Result<crate::domain::entities::PullRequestCiSnapshot> {
+            let sha = self
+                .prs
+                .iter()
+                .find(|p| p.number == pull_number)
+                .map(|p| p.head_sha.clone())
+                .unwrap_or_else(|| "unknown".to_string());
+            Ok(crate::domain::entities::PullRequestCiSnapshot {
+                head_sha: sha,
+                failures: vec![],
+            })
+        }
+
         async fn list_pull_request_files(
             &self,
             _owner: &str,
@@ -1936,6 +1966,14 @@ mod tests {
         fn run_command_line(&self, _command_line: &str) -> Result<String> {
             Ok("src/main.rs:1: mock finding".to_string())
         }
+
+        fn run_command_line_in_dir(
+            &self,
+            _command_line: &str,
+            _workdir: Option<&str>,
+        ) -> Result<String> {
+            Ok("src/main.rs:1: mock finding".to_string())
+        }
     }
 
     static MOCK_SHELL: MockShell = MockShell;
@@ -1955,13 +1993,7 @@ mod tests {
         gh: &'a MockGitHub,
         opts: ReviewWorkflowOptions,
     ) -> ReviewWorkflow<'a> {
-        ReviewWorkflow::new(
-            cfg,
-            gh,
-            Some(&MOCK_SHELL),
-            "engine".to_string(),
-            normalize_test_opts(opts),
-        )
+        ReviewWorkflow::new(cfg, gh, Some(&MOCK_SHELL), normalize_test_opts(opts))
     }
 
     #[tokio::test]

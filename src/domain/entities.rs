@@ -85,6 +85,22 @@ pub struct PullRequestMetrics {
 }
 
 #[derive(Debug, Clone)]
+pub struct CiFailure {
+    pub source: String,
+    pub name: String,
+    pub conclusion: String,
+    pub details_url: Option<String>,
+    pub summary: Option<String>,
+    pub text: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+pub struct PullRequestCiSnapshot {
+    pub head_sha: String,
+    pub failures: Vec<CiFailure>,
+}
+
+#[derive(Debug, Clone)]
 pub struct PullRequestGitContext {
     pub head_sha: String,
     pub head_ref: String,

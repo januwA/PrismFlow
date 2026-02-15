@@ -5,6 +5,7 @@ use std::process::Command;
 pub trait ShellAdapter: Send + Sync {
     fn run_capture(&self, program: &str, args: &[&str]) -> Result<String>;
     fn run_command_line(&self, command_line: &str) -> Result<String>;
+    fn run_command_line_in_dir(&self, command_line: &str, workdir: Option<&str>) -> Result<String>;
 }
 
 #[derive(Debug, Clone, Default)]
@@ -98,20 +99,42 @@ impl ShellAdapter for CommandShellAdapter {
     }
 
     fn run_command_line(&self, command_line: &str) -> Result<String> {
+        self.run_command_line_in_dir(command_line, None)
+    }
+
+    fn run_command_line_in_dir(&self, command_line: &str, workdir: Option<&str>) -> Result<String> {
         let shell_program = self.resolve_shell_program();
         let output = match shell_kind(&shell_program) {
-            ShellKind::Cmd => Command::new(&shell_program)
-                .args(["/C", command_line])
-                .output()
-                .with_context(|| format!("failed to execute command line via {}", shell_program))?,
-            ShellKind::PowerShell => Command::new(&shell_program)
-                .args(["-NoProfile", "-Command", command_line])
-                .output()
-                .with_context(|| format!("failed to execute command line via {}", shell_program))?,
-            ShellKind::Posix => Command::new(&shell_program)
-                .args(["-lc", command_line])
-                .output()
-                .with_context(|| format!("failed to execute command line via {}", shell_program))?,
+            ShellKind::Cmd => {
+                let mut cmd = Command::new(&shell_program);
+                cmd.args(["/C", command_line]);
+                if let Some(dir) = workdir {
+                    cmd.current_dir(dir);
+                }
+                cmd.output().with_context(|| {
+                    format!("failed to execute command line via {}", shell_program)
+                })?
+            }
+            ShellKind::PowerShell => {
+                let mut cmd = Command::new(&shell_program);
+                cmd.args(["-NoProfile", "-Command", command_line]);
+                if let Some(dir) = workdir {
+                    cmd.current_dir(dir);
+                }
+                cmd.output().with_context(|| {
+                    format!("failed to execute command line via {}", shell_program)
+                })?
+            }
+            ShellKind::Posix => {
+                let mut cmd = Command::new(&shell_program);
+                cmd.args(["-lc", command_line]);
+                if let Some(dir) = workdir {
+                    cmd.current_dir(dir);
+                }
+                cmd.output().with_context(|| {
+                    format!("failed to execute command line via {}", shell_program)
+                })?
+            }
         };
 
         if !output.status.success() {

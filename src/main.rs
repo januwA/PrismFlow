@@ -15,6 +15,7 @@ use anyhow::{Context, Result};
 use application::{
     agent_preflight::{panic_if_cli_agents_missing, panic_if_required_agents_missing},
     auth_manager::AuthManager,
+    ci_workflow::{CiWorkflow, CiWorkflowOptions},
     repo_manager::RepoManager,
     review_workflow::{EngineSpec, ReviewWorkflow, ReviewWorkflowOptions},
 };
@@ -34,8 +35,8 @@ use infrastructure::{
     token_providers::{EnvTokenProvider, GhCliTokenProvider, StoredTokenProvider},
 };
 use interface::cli::{
-    AuthSubcommand, Cli, Commands, RepoAgentSubcommand, RepoSubcommand, ReviewSubcommand,
-    ScanSubcommand,
+    AuthSubcommand, CiSubcommand, Cli, Commands, RepoAgentSubcommand, RepoSubcommand,
+    ReviewSubcommand, ScanSubcommand,
 };
 use serde::Deserialize;
 use serde::Serialize;
@@ -240,7 +241,6 @@ async fn main() -> Result<()> {
         },
         Commands::Scan(scan) => match scan.command {
             ScanSubcommand::Once {
-                engine_fingerprint,
                 max_concurrent_api,
                 repos,
                 exclude_repos,
@@ -255,7 +255,6 @@ async fn main() -> Result<()> {
                     config_repo.as_ref(),
                     &github,
                     None,
-                    engine_fingerprint,
                     ReviewWorkflowOptions {
                         include_repos: repos,
                         exclude_repos,
@@ -279,10 +278,60 @@ async fn main() -> Result<()> {
                 }
             }
         },
+        Commands::Ci(ci) => match ci.command {
+            CiSubcommand::Once {
+                engines,
+                engine_prompt,
+                engine_prompt_file,
+                clone_repo,
+                clone_workspace_dir,
+                clone_depth,
+                max_concurrent_repos,
+                max_concurrent_api,
+                repos,
+                exclude_repos,
+            } => {
+                if repo_manager.list_repos()?.is_empty() {
+                    println!("no repositories configured");
+                    return Ok(());
+                }
+                let resolved_prompt = resolve_engine_prompt(engine_prompt, engine_prompt_file)?;
+                let resolved_engines = resolve_engine_specs(engines)?;
+                let github = github_client_for_action(&auth_manager, max_concurrent_api, "ci")?;
+                let workflow = CiWorkflow::new(
+                    config_repo.as_ref(),
+                    &github,
+                    &shell,
+                    CiWorkflowOptions {
+                        max_concurrent_repos,
+                        engine_specs: resolved_engines,
+                        engine_prompt: resolved_prompt,
+                        clone_repo_enabled: clone_repo,
+                        clone_workspace_dir,
+                        clone_depth,
+                        include_repos: repos,
+                        exclude_repos,
+                    },
+                );
+                let stats = run_with_heartbeat("ci-once", workflow.run_once()).await?;
+                if stats.is_empty() {
+                    println!("no repositories matched current filters");
+                } else {
+                    for item in stats {
+                        println!(
+                            "repo={} analyzed={} skipped_no_failures={} skipped_completed={} failed={}",
+                            item.repo,
+                            item.analyzed,
+                            item.skipped_no_failures,
+                            item.skipped_completed,
+                            item.failed
+                        );
+                    }
+                }
+            }
+        },
         Commands::Review(review) => match review.command {
             ReviewSubcommand::Once {
-                engine_fingerprint,
-                engine_command,
                 engines,
                 engine_prompt,
                 engine_prompt_file,
@@ -300,8 +349,7 @@ async fn main() -> Result<()> {
                 exclude_repos,
             } => {
                 let resolved_prompt = resolve_engine_prompt(engine_prompt, engine_prompt_file)?;
-                let resolved_engines =
-                    resolve_engine_specs(&engine_fingerprint, engine_command, engines)?;
+                let resolved_engines = resolve_engine_specs(engines)?;
                 let options = ReviewWorkflowOptions {
                     engine_specs: resolved_engines,
                     engine_prompt: resolved_prompt,
@@ -323,7 +371,6 @@ async fn main() -> Result<()> {
                     &auth_manager,
                     config_repo.as_ref(),
                     &shell,
-                    engine_fingerprint,
                     max_concurrent_api,
                     options,
                     None,
@@ -335,8 +382,6 @@ async fn main() -> Result<()> {
                 ui,
                 ui_bind,
                 ui_token,
-                engine_fingerprint,
-                engine_command,
                 engines,
                 engine_prompt,
                 engine_prompt_file,
@@ -354,8 +399,7 @@ async fn main() -> Result<()> {
                 exclude_repos,
             } => {
                 let resolved_prompt = resolve_engine_prompt(engine_prompt, engine_prompt_file)?;
-                let resolved_engines =
-                    resolve_engine_specs(&engine_fingerprint, engine_command, engines)?;
+                let resolved_engines = resolve_engine_specs(engines)?;
                 let mut options = ReviewWorkflowOptions {
                     engine_specs: resolved_engines,
                     engine_prompt: resolved_prompt,
@@ -452,7 +496,6 @@ async fn main() -> Result<()> {
                                             owner,
                                             repo,
                                             pr_number,
-                                            engine_fingerprint.clone(),
                                             max_concurrent_api,
                                             adhoc_opts,
                                         )
@@ -554,7 +597,6 @@ async fn main() -> Result<()> {
                             &auth_manager,
                             config_repo.as_ref(),
                             &shell,
-                            engine_fingerprint.clone(),
                             max_concurrent_api,
                             ReviewWorkflowOptions {
                                 status_tx: Some(status_tx.clone()),
@@ -603,8 +645,6 @@ async fn main() -> Result<()> {
             }
             ReviewSubcommand::AdHoc {
                 pr_url,
-                engine_fingerprint,
-                engine_command,
                 engines,
                 engine_prompt,
                 engine_prompt_file,
@@ -620,8 +660,7 @@ async fn main() -> Result<()> {
                 let (owner, repo, pr_number) = parse_github_pr_url(&pr_url)
                     .with_context(|| format!("invalid GitHub PR URL: {pr_url}"))?;
                 let resolved_prompt = resolve_engine_prompt(engine_prompt, engine_prompt_file)?;
-                let resolved_engines =
-                    resolve_engine_specs(&engine_fingerprint, engine_command, engines)?;
+                let resolved_engines = resolve_engine_specs(engines)?;
                 let options = ReviewWorkflowOptions {
                     engine_specs: resolved_engines,
                     engine_prompt: resolved_prompt,
@@ -642,7 +681,6 @@ async fn main() -> Result<()> {
                     owner,
                     repo,
                     pr_number,
-                    engine_fingerprint,
                     max_concurrent_api,
                     options,
                 )
@@ -691,7 +729,6 @@ async fn run_review_once(
     auth_manager: &AuthManager<'_>,
     config_repo: &LocalConfigAdapter,
     shell: &CommandShellAdapter,
-    engine_fingerprint: String,
     max_concurrent_api: usize,
     options: ReviewWorkflowOptions,
     status_tx: Option<&broadcast::Sender<String>>,
@@ -704,13 +741,7 @@ async fn run_review_once(
     panic_if_required_agents_missing(&config, &options, "review-once");
 
     let github = github_client_for_action(auth_manager, max_concurrent_api, "review")?;
-    let workflow = ReviewWorkflow::new(
-        config_repo,
-        &github,
-        Some(shell),
-        engine_fingerprint,
-        options,
-    );
+    let workflow = ReviewWorkflow::new(config_repo, &github, Some(shell), options);
     let stats = run_with_heartbeat("review-once", workflow.review_once()).await?;
 
     if stats.is_empty() {
@@ -762,19 +793,12 @@ async fn run_review_ad_hoc(
     owner: &str,
     repo: &str,
     pr_number: u64,
-    engine_fingerprint: String,
     max_concurrent_api: usize,
     options: ReviewWorkflowOptions,
 ) -> Result<()> {
     panic_if_cli_agents_missing(&options, "review-ad-hoc");
     let github = github_client_for_action(auth_manager, max_concurrent_api, "ad-hoc review")?;
-    let workflow = ReviewWorkflow::new(
-        config_repo,
-        &github,
-        Some(shell),
-        engine_fingerprint,
-        options,
-    );
+    let workflow = ReviewWorkflow::new(config_repo, &github, Some(shell), options);
     let stats = run_with_heartbeat(
         "review-ad-hoc",
         workflow.review_ad_hoc(owner, repo, pr_number),
@@ -1066,44 +1090,26 @@ fn resolve_engine_prompt(
     Ok(engine_prompt)
 }
 
-fn resolve_engine_specs(
-    engine_fingerprint: &str,
-    engine_command: Option<String>,
-    engines: Vec<String>,
-) -> Result<Vec<EngineSpec>> {
-    if engine_command.is_some() && !engines.is_empty() {
-        anyhow::bail!("--engine-command and --engine cannot be used together");
+fn resolve_engine_specs(engines: Vec<String>) -> Result<Vec<EngineSpec>> {
+    if engines.is_empty() {
+        anyhow::bail!("missing engine command: set --engine <fingerprint> <command>");
     }
-
-    if !engines.is_empty() {
-        if engines.len() % 2 != 0 {
-            anyhow::bail!("--engine requires pairs: <fingerprint> <command>");
-        }
-        let mut out = Vec::new();
-        for pair in engines.chunks_exact(2) {
-            let fingerprint = pair[0].trim();
-            let command = pair[1].trim();
-            if fingerprint.is_empty() || command.is_empty() {
-                anyhow::bail!("--engine values cannot be empty");
-            }
-            out.push(EngineSpec {
-                fingerprint: fingerprint.to_string(),
-                command: command.to_string(),
-            });
-        }
-        return Ok(out);
+    if engines.len() % 2 != 0 {
+        anyhow::bail!("--engine requires pairs: <fingerprint> <command>");
     }
-
-    let command = engine_command
-        .map(|s| s.trim().to_string())
-        .filter(|s| !s.is_empty())
-        .ok_or_else(|| {
-            anyhow::anyhow!("missing engine command: set --engine-command or --engine")
-        })?;
-    Ok(vec![EngineSpec {
-        fingerprint: engine_fingerprint.to_string(),
-        command,
-    }])
+    let mut out = Vec::new();
+    for pair in engines.chunks_exact(2) {
+        let fingerprint = pair[0].trim();
+        let command = pair[1].trim();
+        if fingerprint.is_empty() || command.is_empty() {
+            anyhow::bail!("--engine values cannot be empty");
+        }
+        out.push(EngineSpec {
+            fingerprint: fingerprint.to_string(),
+            command: command.to_string(),
+        });
+    }
+    Ok(out)
 }
 
 #[derive(Debug, Deserialize, Default)]

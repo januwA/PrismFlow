@@ -9,8 +9,8 @@ use tokio::sync::Semaphore;
 
 use crate::domain::{
     entities::{
-        PullRequestFilePatch, PullRequestGitContext, PullRequestMetrics, PullRequestSummary,
-        ReviewComment, SimpleComment, SimplePullReview,
+        CiFailure, PullRequestCiSnapshot, PullRequestFilePatch, PullRequestGitContext,
+        PullRequestMetrics, PullRequestSummary, ReviewComment, SimpleComment, SimplePullReview,
     },
     ports::GitHubRepository,
 };
@@ -155,6 +155,102 @@ impl GitHubRepository for OctocrabGitHubRepository {
             additions: pr.additions.unwrap_or(0),
             deletions: pr.deletions.unwrap_or(0),
         })
+    }
+
+    async fn get_pull_request_ci_snapshot(
+        &self,
+        owner: &str,
+        repo: &str,
+        pull_number: u64,
+    ) -> Result<PullRequestCiSnapshot> {
+        #[derive(Debug, Deserialize)]
+        struct PullDto {
+            head: HeadDto,
+        }
+        #[derive(Debug, Deserialize)]
+        struct HeadDto {
+            sha: String,
+        }
+        #[derive(Debug, Deserialize)]
+        struct CheckRunsResp {
+            check_runs: Vec<CheckRunDto>,
+        }
+        #[derive(Debug, Deserialize)]
+        struct CheckRunDto {
+            name: String,
+            status: Option<String>,
+            conclusion: Option<String>,
+            details_url: Option<String>,
+            output: Option<CheckOutputDto>,
+        }
+        #[derive(Debug, Deserialize)]
+        struct CheckOutputDto {
+            summary: Option<String>,
+            text: Option<String>,
+        }
+        #[derive(Debug, Deserialize)]
+        struct CommitStatusResp {
+            statuses: Vec<CommitStatusDto>,
+        }
+        #[derive(Debug, Deserialize)]
+        struct CommitStatusDto {
+            context: Option<String>,
+            state: Option<String>,
+            target_url: Option<String>,
+            description: Option<String>,
+        }
+
+        let _permit = self.acquire_api_permit().await?;
+        let pr_route = format!("/repos/{owner}/{repo}/pulls/{pull_number}");
+        let pr: PullDto = self.client.get(pr_route, None::<&()>).await?;
+        let head_sha = pr.head.sha;
+
+        let checks_route = format!("/repos/{owner}/{repo}/commits/{head_sha}/check-runs");
+        let checks: CheckRunsResp = self.client.get(checks_route, None::<&()>).await?;
+        let status_route = format!("/repos/{owner}/{repo}/commits/{head_sha}/status");
+        let statuses: CommitStatusResp = self.client.get(status_route, None::<&()>).await?;
+
+        let mut failures = Vec::<CiFailure>::new();
+        for check in checks.check_runs {
+            let conclusion = check
+                .conclusion
+                .clone()
+                .or(check.status.clone())
+                .unwrap_or_else(|| "unknown".to_string());
+            let lower = conclusion.to_ascii_lowercase();
+            if !matches!(
+                lower.as_str(),
+                "failure" | "failed" | "timed_out" | "cancelled" | "action_required" | "stale"
+            ) {
+                continue;
+            }
+            failures.push(CiFailure {
+                source: "check-run".to_string(),
+                name: check.name,
+                conclusion,
+                details_url: check.details_url,
+                summary: check.output.as_ref().and_then(|o| o.summary.clone()),
+                text: check.output.as_ref().and_then(|o| o.text.clone()),
+            });
+        }
+
+        for status in statuses.statuses {
+            let state = status.state.unwrap_or_else(|| "unknown".to_string());
+            let lower = state.to_ascii_lowercase();
+            if !matches!(lower.as_str(), "failure" | "error") {
+                continue;
+            }
+            failures.push(CiFailure {
+                source: "commit-status".to_string(),
+                name: status.context.unwrap_or_else(|| "(no context)".to_string()),
+                conclusion: state,
+                details_url: status.target_url,
+                summary: status.description,
+                text: None,
+            });
+        }
+
+        Ok(PullRequestCiSnapshot { head_sha, failures })
     }
 
     async fn list_pull_request_files(

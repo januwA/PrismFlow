@@ -4,8 +4,8 @@ use anyhow::Result;
 use async_trait::async_trait;
 
 use crate::domain::entities::{
-    AppConfig, PullRequestFilePatch, PullRequestGitContext, PullRequestMetrics, PullRequestSummary,
-    ReviewComment, SimpleComment, SimplePullReview,
+    AppConfig, PullRequestCiSnapshot, PullRequestFilePatch, PullRequestGitContext,
+    PullRequestMetrics, PullRequestSummary, ReviewComment, SimpleComment, SimplePullReview,
 };
 
 pub trait ConfigRepository: Send + Sync {
@@ -45,6 +45,12 @@ pub trait GitHubRepository: Send + Sync {
         repo: &str,
         pull_number: u64,
     ) -> Result<PullRequestMetrics>;
+    async fn get_pull_request_ci_snapshot(
+        &self,
+        owner: &str,
+        repo: &str,
+        pull_number: u64,
+    ) -> Result<PullRequestCiSnapshot>;
     async fn list_pull_request_files(
         &self,
         owner: &str,
