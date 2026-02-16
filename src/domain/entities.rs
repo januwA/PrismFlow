@@ -44,11 +44,12 @@ impl Default for ReviewFilterConfig {
             include_files: vec![
                 ".github/workflows/ci.yml".to_string(),
                 ".github/workflows/release.yml".to_string(),
+            ],
+            exclude_files: vec![
                 "package-lock.json".to_string(),
                 "pnpm-lock.yaml".to_string(),
                 "yarn.lock".to_string(),
             ],
-            exclude_files: vec![],
             include_extensions: vec![],
             exclude_extensions: vec![],
             skip_binary_without_patch: true,
