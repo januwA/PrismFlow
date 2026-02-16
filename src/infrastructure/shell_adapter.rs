@@ -196,15 +196,51 @@ fn command_fingerprint(command_line: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashMap;
+    use std::sync::Arc;
+
     use super::CommandShellAdapter;
-    use crate::application::context::TaskContext;
-    use crate::domain::ports::ShellAdapter;
+    use crate::domain::ports::{CommandContext, ShellAdapter};
+    use async_trait::async_trait;
     use std::time::{Duration, Instant};
+    use tokio::sync::Mutex;
+    use tokio_util::sync::CancellationToken;
+
+    #[derive(Default)]
+    struct MockCommandContext {
+        cancel: CancellationToken,
+        children: Mutex<HashMap<u32, String>>,
+    }
+
+    impl MockCommandContext {
+        fn cancel(&self) {
+            self.cancel.cancel();
+        }
+    }
+
+    #[async_trait]
+    impl CommandContext for MockCommandContext {
+        fn is_cancelled(&self) -> bool {
+            self.cancel.is_cancelled()
+        }
+
+        async fn cancelled(&self) {
+            self.cancel.cancelled().await;
+        }
+
+        async fn register_child(&self, pid: u32, label: String) {
+            self.children.lock().await.insert(pid, label);
+        }
+
+        async fn unregister_child(&self, pid: u32) {
+            self.children.lock().await.remove(&pid);
+        }
+    }
 
     #[tokio::test]
     async fn command_line_cancelled_by_context_quickly() {
         let adapter = CommandShellAdapter::default();
-        let ctx = TaskContext::new("shell-cancel-test");
+        let ctx = Arc::new(MockCommandContext::default());
         #[cfg(target_os = "windows")]
         let command = "Start-Sleep -Seconds 8; Write-Output done";
         #[cfg(not(target_os = "windows"))]
@@ -216,7 +252,7 @@ mod tests {
                 tokio::time::sleep(Duration::from_millis(300)).await;
                 ctx.cancel();
             },
-            async { adapter.run_command_line(command, Some(&ctx)).await }
+            async { adapter.run_command_line(command, Some(ctx.as_ref())).await }
         );
         let elapsed = started.elapsed();
 

@@ -11,6 +11,7 @@ use application::{
     auth_manager::AuthManager, repo_manager::RepoManager, review_workflow::EngineSpec,
 };
 use clap::Parser;
+use domain::ports::ConfigRepository;
 use infrastructure::{
     local_config_adapter::LocalConfigAdapter,
     process_manager::OsProcessManager,
@@ -26,10 +27,11 @@ async fn main() -> Result<()> {
 
     let cli = Cli::parse();
     let shell_override = cli.shell.clone();
-    let config_repo = Arc::new(LocalConfigAdapter::new()?);
+    let local_config_repo = Arc::new(LocalConfigAdapter::new()?);
+    let config_repo: Arc<dyn ConfigRepository> = local_config_repo.clone();
     let shell = CommandShellAdapter::new(shell_override);
     let process_manager = OsProcessManager;
-    let stored_provider = StoredTokenProvider::new(config_repo.auth_token_path());
+    let stored_provider = StoredTokenProvider::new(local_config_repo.auth_token_path());
     let gh_provider = GhCliTokenProvider::new(&shell);
     let env_provider = EnvTokenProvider;
 

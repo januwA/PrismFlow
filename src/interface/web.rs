@@ -13,7 +13,6 @@ use serde::Deserialize;
 use tokio::sync::{Mutex, Notify, mpsc};
 
 use crate::domain::ports::ConfigRepository;
-use crate::infrastructure::local_config_adapter::LocalConfigAdapter;
 
 #[derive(Debug, Clone)]
 pub enum UiCommand {
@@ -34,7 +33,7 @@ pub struct UiState {
     pub status_log: Arc<Mutex<Vec<String>>>,
     pub command_tx: mpsc::UnboundedSender<UiCommand>,
     pub notify: Arc<Notify>,
-    pub config_repo: Arc<LocalConfigAdapter>,
+    pub config_repo: Arc<dyn ConfigRepository>,
 }
 
 #[derive(Debug, Deserialize, Default)]

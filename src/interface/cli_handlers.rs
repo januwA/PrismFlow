@@ -18,8 +18,7 @@ use crate::application::{
 };
 use crate::domain::ports::{ConfigRepository, ProcessManager};
 use crate::infrastructure::{
-    github_adapter::OctocrabGitHubRepository, local_config_adapter::LocalConfigAdapter,
-    shell_adapter::CommandShellAdapter,
+    github_adapter::OctocrabGitHubRepository, shell_adapter::CommandShellAdapter,
 };
 use crate::interface::cli::{
     AuthSubcommand, CiSubcommand, Commands, RepoAgentSubcommand, RepoSubcommand, ReviewSubcommand,
@@ -37,7 +36,7 @@ pub async fn dispatch(
     command: Commands,
     auth_manager: &AuthManager<'_>,
     repo_manager: &RepoManager<'_>,
-    config_repo: Arc<LocalConfigAdapter>,
+    config_repo: Arc<dyn ConfigRepository>,
     shell: &CommandShellAdapter,
     process_manager: &dyn ProcessManager,
 ) -> Result<()> {
