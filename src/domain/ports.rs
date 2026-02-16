@@ -51,6 +51,11 @@ pub trait ProcessManager: Send + Sync {
     fn kill_process_tree(&self, pid: u32) -> bool;
 }
 
+pub trait GitHubRepositoryFactory: Send + Sync {
+    fn create(&self, token: String, max_concurrent_api: usize)
+    -> Result<Box<dyn GitHubRepository>>;
+}
+
 #[async_trait]
 pub trait GitHubRepository: Send + Sync {
     async fn current_user_login(&self) -> Result<String>;

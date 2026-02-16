@@ -1,3 +1,4 @@
+use std::fs;
 use std::net::SocketAddr;
 use std::sync::{
     Arc,
@@ -13,22 +14,17 @@ use crate::application::{
     ci_workflow::CiWorkflowOptions,
     context::TaskContext,
     repo_manager::RepoManager,
-    review_workflow::{ReviewWorkflow, ReviewWorkflowOptions},
+    review_workflow::{EngineSpec, ReviewWorkflow, ReviewWorkflowOptions},
     usecases::{run_ci_once, run_review_ad_hoc, run_review_clean, run_review_once},
 };
-use crate::domain::ports::{ConfigRepository, ProcessManager};
-use crate::infrastructure::{
-    github_adapter::OctocrabGitHubRepository, shell_adapter::CommandShellAdapter,
+use crate::domain::ports::{
+    ConfigRepository, GitHubRepository, GitHubRepositoryFactory, ProcessManager, ShellAdapter,
 };
 use crate::interface::cli::{
     AuthSubcommand, CiSubcommand, Commands, RepoAgentSubcommand, RepoSubcommand, ReviewSubcommand,
     ScanSubcommand,
 };
 use crate::interface::web::{UiCommand, UiState, run_ui_server};
-use crate::{
-    parse_github_pr_url, parse_repo_agent_args, resolve_engine_prompt, resolve_engine_specs,
-    select_repo_interactively, short_key,
-};
 
 const SHUTDOWN_GRACE_SECS: u64 = 8;
 
@@ -37,8 +33,9 @@ pub async fn dispatch(
     auth_manager: &AuthManager<'_>,
     repo_manager: &RepoManager<'_>,
     config_repo: Arc<dyn ConfigRepository>,
-    shell: &CommandShellAdapter,
+    shell: &dyn ShellAdapter,
     process_manager: &dyn ProcessManager,
+    github_factory: &dyn GitHubRepositoryFactory,
 ) -> Result<()> {
     match command {
         Commands::Repo(repo) => match repo.command {
@@ -206,10 +203,15 @@ pub async fn dispatch(
                     return Ok(());
                 }
 
-                let github = github_client_for_action(&auth_manager, max_concurrent_api, "scan")?;
+                let github = github_client_for_action(
+                    auth_manager,
+                    github_factory,
+                    max_concurrent_api,
+                    "scan",
+                )?;
                 let workflow = ReviewWorkflow::new(
                     config_repo.as_ref(),
-                    &github,
+                    github.as_ref(),
                     None,
                     ReviewWorkflowOptions {
                         include_repos: repos,
@@ -250,10 +252,15 @@ pub async fn dispatch(
                 let resolved_prompt = resolve_engine_prompt(engine_prompt, engine_prompt_file)?;
                 let resolved_engines = resolve_engine_specs(engines)?;
                 let once_ctx = Arc::new(TaskContext::new("ci-once"));
-                let github = github_client_for_action(auth_manager, max_concurrent_api, "ci")?;
+                let github = github_client_for_action(
+                    auth_manager,
+                    github_factory,
+                    max_concurrent_api,
+                    "ci",
+                )?;
                 run_ci_once(
                     config_repo.as_ref(),
-                    &github,
+                    github.as_ref(),
                     shell,
                     CiWorkflowOptions {
                         max_concurrent_repos,
@@ -298,12 +305,17 @@ pub async fn dispatch(
                 println!("ci daemon started: interval={}s", interval_secs);
                 loop {
                     let cycle_ctx = Arc::new(TaskContext::new("ci-daemon-cycle"));
-                    let github = github_client_for_action(auth_manager, max_concurrent_api, "ci")?;
+                    let github = github_client_for_action(
+                        auth_manager,
+                        github_factory,
+                        max_concurrent_api,
+                        "ci",
+                    )?;
                     let mut stop_daemon = false;
                     tokio::select! {
                         r = run_ci_once(
                             config_repo.as_ref(),
-                            &github,
+                            github.as_ref(),
                             shell,
                             options.clone(),
                             cycle_ctx.clone(),
@@ -376,10 +388,15 @@ pub async fn dispatch(
                     exclude_repos,
                     ..ReviewWorkflowOptions::default()
                 };
-                let github = github_client_for_action(auth_manager, max_concurrent_api, "review")?;
+                let github = github_client_for_action(
+                    auth_manager,
+                    github_factory,
+                    max_concurrent_api,
+                    "review",
+                )?;
                 run_review_once(
                     config_repo.as_ref(),
-                    &github,
+                    github.as_ref(),
                     shell,
                     options,
                     once_ctx,
@@ -502,6 +519,7 @@ pub async fn dispatch(
                                         let adhoc_ctx = Arc::new(TaskContext::new("review-adhoc"));
                                         let github = github_client_for_action(
                                             auth_manager,
+                                            github_factory,
                                             max_concurrent_api,
                                             "ad-hoc review",
                                         );
@@ -515,7 +533,7 @@ pub async fn dispatch(
                                         };
                                         if let Err(err) = run_review_ad_hoc(
                                             config_repo.as_ref(),
-                                            &github,
+                                            github.as_ref(),
                                             shell,
                                             owner,
                                             repo,
@@ -617,13 +635,17 @@ pub async fn dispatch(
                     }
                     let _ = status_tx.send("cycle:start".to_string());
                     let cycle_ctx = Arc::new(TaskContext::new("review-daemon-cycle"));
-                    let github =
-                        github_client_for_action(auth_manager, max_concurrent_api, "review")?;
+                    let github = github_client_for_action(
+                        auth_manager,
+                        github_factory,
+                        max_concurrent_api,
+                        "review",
+                    )?;
                     let mut stop_daemon = false;
                     tokio::select! {
                         r = run_review_once(
                             config_repo.as_ref(),
-                            &github,
+                            github.as_ref(),
                             shell,
                             ReviewWorkflowOptions {
                                 status_tx: Some(status_tx.clone()),
@@ -714,11 +736,15 @@ pub async fn dispatch(
                     keep_diff_files,
                     ..ReviewWorkflowOptions::default()
                 };
-                let github =
-                    github_client_for_action(auth_manager, max_concurrent_api, "ad-hoc review")?;
+                let github = github_client_for_action(
+                    auth_manager,
+                    github_factory,
+                    max_concurrent_api,
+                    "ad-hoc review",
+                )?;
                 run_review_ad_hoc(
                     config_repo.as_ref(),
-                    &github,
+                    github.as_ref(),
                     shell,
                     owner,
                     repo,
@@ -739,8 +765,12 @@ pub async fn dispatch(
                     {
                         Ok((owner, repo, pr_number)) => {
                             let clean_ctx = Arc::new(TaskContext::new("review-clean"));
-                            let github =
-                                github_client_for_action(auth_manager, max_concurrent_api, "clean");
+                            let github = github_client_for_action(
+                                auth_manager,
+                                github_factory,
+                                max_concurrent_api,
+                                "clean",
+                            );
                             let github = match github {
                                 Ok(client) => client,
                                 Err(err) => {
@@ -750,7 +780,8 @@ pub async fn dispatch(
                                 }
                             };
                             if let Err(err) =
-                                run_review_clean(&github, owner, repo, pr_number, clean_ctx).await
+                                run_review_clean(github.as_ref(), owner, repo, pr_number, clean_ctx)
+                                    .await
                             {
                                 failed += 1;
                                 eprintln!("clean_failed url={} error={err:#}", pr_url);
@@ -772,11 +803,116 @@ pub async fn dispatch(
     Ok(())
 }
 
+fn select_repo_interactively(
+    repo_manager: &RepoManager<'_>,
+    prompt: &str,
+) -> Result<Option<String>> {
+    let repos = repo_manager.list_repos()?;
+    if repos.is_empty() {
+        return Ok(None);
+    }
+
+    println!("{prompt}");
+    for (idx, item) in repos.iter().enumerate() {
+        println!("  {}. {}", idx + 1, item.full_name);
+    }
+    print!("enter number: ");
+    {
+        use std::io::Write as _;
+        std::io::stdout().flush()?;
+    }
+    let mut input = String::new();
+    std::io::stdin().read_line(&mut input)?;
+    let selected = input
+        .trim()
+        .parse::<usize>()
+        .with_context(|| "invalid selection: expected a number")?;
+    if selected == 0 || selected > repos.len() {
+        anyhow::bail!("invalid selection: out of range");
+    }
+    Ok(Some(repos[selected - 1].full_name.clone()))
+}
+
+fn parse_repo_agent_args(args: Vec<String>) -> Result<(Option<String>, String)> {
+    match args.len() {
+        1 => Ok((None, args[0].clone())),
+        2 => Ok((Some(args[0].clone()), args[1].clone())),
+        _ => anyhow::bail!("agent command expects: [owner/repo] <agent>"),
+    }
+}
+
+fn parse_github_pr_url(url: &str) -> Result<(&str, &str, u64)> {
+    let normalized = url.trim().trim_end_matches('/');
+    let needle = "github.com/";
+    let idx = normalized
+        .find(needle)
+        .ok_or_else(|| anyhow::anyhow!("not a github.com URL"))?;
+    let tail = &normalized[(idx + needle.len())..];
+    let parts = tail.split('/').collect::<Vec<_>>();
+    if parts.len() < 4 {
+        anyhow::bail!("URL format must be github.com/<owner>/<repo>/pull/<number>");
+    }
+    let owner = parts[0];
+    let repo = parts[1];
+    let pull_literal = parts[2];
+    let num_str = parts[3];
+    if pull_literal != "pull" {
+        anyhow::bail!("URL path segment must contain /pull/");
+    }
+    let pr_number = num_str.parse::<u64>()?;
+    Ok((owner, repo, pr_number))
+}
+
+fn resolve_engine_prompt(
+    engine_prompt: Option<String>,
+    engine_prompt_file: Option<String>,
+) -> Result<Option<String>> {
+    if engine_prompt.is_some() && engine_prompt_file.is_some() {
+        anyhow::bail!("--engine-prompt and --engine-prompt-file cannot be used together");
+    }
+
+    if let Some(file) = engine_prompt_file {
+        let content = fs::read_to_string(&file)
+            .with_context(|| format!("failed to read engine prompt file: {file}"))?;
+        return Ok(Some(content));
+    }
+
+    Ok(engine_prompt)
+}
+
+fn resolve_engine_specs(engines: Vec<String>) -> Result<Vec<EngineSpec>> {
+    if engines.is_empty() {
+        anyhow::bail!("missing engine command: set --engine <fingerprint> <command>");
+    }
+    if engines.len() % 2 != 0 {
+        anyhow::bail!("--engine requires pairs: <fingerprint> <command>");
+    }
+    let mut out = Vec::new();
+    for pair in engines.chunks_exact(2) {
+        let fingerprint = pair[0].trim();
+        let command = pair[1].trim();
+        if fingerprint.is_empty() || command.is_empty() {
+            anyhow::bail!("--engine values cannot be empty");
+        }
+        out.push(EngineSpec {
+            fingerprint: fingerprint.to_string(),
+            command: command.to_string(),
+        });
+    }
+    Ok(out)
+}
+
+fn short_key(full: &str) -> &str {
+    let end = full.len().min(12);
+    &full[..end]
+}
+
 fn github_client_for_action(
     auth_manager: &AuthManager<'_>,
+    github_factory: &dyn GitHubRepositoryFactory,
     max_concurrent_api: usize,
     action: &str,
-) -> Result<OctocrabGitHubRepository> {
+) -> Result<Box<dyn GitHubRepository>> {
     let token = auth_manager
         .resolve_token()?
         .map(|r| r.token)
@@ -785,7 +921,7 @@ fn github_client_for_action(
                 "token required for {action}; run `prismflow auth login <token>` or configure gh/GITHUB_TOKEN"
             )
         })?;
-    OctocrabGitHubRepository::new(token, max_concurrent_api)
+    github_factory.create(token, max_concurrent_api)
 }
 
 async fn shutdown_cycle(

@@ -1,4 +1,5 @@
 pub mod github_adapter;
+pub mod github_factory;
 pub mod local_config_adapter;
 pub mod process_manager;
 pub mod shell_adapter;
