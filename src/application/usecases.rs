@@ -3,29 +3,23 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
-use anyhow::{Context, Result, anyhow};
+use anyhow::{Result, anyhow};
 use serde::Serialize;
 use tokio::sync::broadcast;
 
 use crate::application::{
     agent_preflight::{panic_if_cli_agents_missing, panic_if_required_agents_missing},
-    auth_manager::AuthManager,
     ci_workflow::{CiWorkflow, CiWorkflowOptions},
     context::TaskContext,
     review_workflow::{RepoReviewStats, ReviewWorkflow, ReviewWorkflowOptions},
 };
-use crate::domain::ports::{ConfigRepository, GitHubRepository};
 use crate::domain::errors::DomainError;
-use crate::infrastructure::{
-    github_adapter::OctocrabGitHubRepository, local_config_adapter::LocalConfigAdapter,
-    shell_adapter::CommandShellAdapter,
-};
+use crate::domain::ports::{ConfigRepository, GitHubRepository, ShellAdapter};
 
 pub async fn run_review_once(
-    auth_manager: &AuthManager<'_>,
-    config_repo: &LocalConfigAdapter,
-    shell: &CommandShellAdapter,
-    max_concurrent_api: usize,
+    config_repo: &dyn ConfigRepository,
+    github: &dyn GitHubRepository,
+    shell: &dyn ShellAdapter,
     mut options: ReviewWorkflowOptions,
     ctx: Arc<TaskContext>,
     status_tx: Option<&broadcast::Sender<String>>,
@@ -41,8 +35,7 @@ pub async fn run_review_once(
     panic_if_required_agents_missing(&config, &options, "review-once");
     options.task_context = Some(ctx.clone());
 
-    let github = github_client_for_action(auth_manager, max_concurrent_api, "review")?;
-    let workflow = ReviewWorkflow::new(config_repo, &github, Some(shell), options);
+    let workflow = ReviewWorkflow::new(config_repo, github, Some(shell), options);
     let stats = run_with_heartbeat("review-once", workflow.review_once(), &ctx).await?;
 
     if stats.is_empty() {
@@ -89,10 +82,9 @@ pub async fn run_review_once(
 }
 
 pub async fn run_ci_once(
-    auth_manager: &AuthManager<'_>,
-    config_repo: &LocalConfigAdapter,
-    shell: &CommandShellAdapter,
-    max_concurrent_api: usize,
+    config_repo: &dyn ConfigRepository,
+    github: &dyn GitHubRepository,
+    shell: &dyn ShellAdapter,
     mut options: CiWorkflowOptions,
     ctx: Arc<TaskContext>,
 ) -> Result<()> {
@@ -105,8 +97,7 @@ pub async fn run_ci_once(
     }
     options.task_context = Some(ctx.clone());
 
-    let github = github_client_for_action(auth_manager, max_concurrent_api, "ci")?;
-    let workflow = CiWorkflow::new(config_repo, &github, shell, options);
+    let workflow = CiWorkflow::new(config_repo, github, shell, options);
     let stats = run_with_heartbeat("ci-once", workflow.run_once(), &ctx).await?;
     if stats.is_empty() {
         println!("no repositories matched current filters");
@@ -126,13 +117,12 @@ pub async fn run_ci_once(
 }
 
 pub async fn run_review_ad_hoc(
-    auth_manager: &AuthManager<'_>,
-    config_repo: &LocalConfigAdapter,
-    shell: &CommandShellAdapter,
+    config_repo: &dyn ConfigRepository,
+    github: &dyn GitHubRepository,
+    shell: &dyn ShellAdapter,
     owner: &str,
     repo: &str,
     pr_number: u64,
-    max_concurrent_api: usize,
     mut options: ReviewWorkflowOptions,
     ctx: Arc<TaskContext>,
 ) -> Result<()> {
@@ -141,8 +131,7 @@ pub async fn run_review_ad_hoc(
     }
     panic_if_cli_agents_missing(&options, "review-ad-hoc");
     options.task_context = Some(ctx.clone());
-    let github = github_client_for_action(auth_manager, max_concurrent_api, "ad-hoc review")?;
-    let workflow = ReviewWorkflow::new(config_repo, &github, Some(shell), options);
+    let workflow = ReviewWorkflow::new(config_repo, github, Some(shell), options);
     let stats = run_with_heartbeat(
         "review-ad-hoc",
         workflow.review_ad_hoc(owner, repo, pr_number),
@@ -172,17 +161,15 @@ pub async fn run_review_ad_hoc(
 }
 
 pub async fn run_review_clean(
-    auth_manager: &AuthManager<'_>,
+    github: &dyn GitHubRepository,
     owner: &str,
     repo: &str,
     pr_number: u64,
-    max_concurrent_api: usize,
     ctx: Arc<TaskContext>,
 ) -> Result<()> {
     if ctx.is_cancelled() {
         return Err(anyhow!(DomainError::CancelledBySignal));
     }
-    let github = github_client_for_action(auth_manager, max_concurrent_api, "clean")?;
     let me = github.current_user_login().await.ok();
     let issue_comments = github.list_issue_comments(owner, repo, pr_number).await?;
     let mut removed_issue_comments = 0usize;
@@ -283,22 +270,6 @@ pub async fn run_review_clean(
         removed_labels
     );
     Ok(())
-}
-
-pub fn github_client_for_action(
-    auth_manager: &AuthManager<'_>,
-    max_concurrent_api: usize,
-    action: &str,
-) -> Result<OctocrabGitHubRepository> {
-    let token = auth_manager
-        .resolve_token()?
-        .map(|r| r.token)
-        .with_context(|| {
-            format!(
-                "token required for {action}; run `prismflow auth login <token>` or configure gh/GITHUB_TOKEN"
-            )
-        })?;
-    OctocrabGitHubRepository::new(token, max_concurrent_api)
 }
 
 #[derive(Debug, Serialize)]

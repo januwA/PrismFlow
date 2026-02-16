@@ -1,29 +1,13 @@
-use crate::application::context::TaskContext;
 use crate::domain::errors::DomainError;
-use async_trait::async_trait;
+use crate::domain::ports::{CommandContext, ShellAdapter};
 use anyhow::{Context, Result};
+use async_trait::async_trait;
 use sha2::{Digest, Sha256};
 use std::path::Path;
 use std::process::Command;
 use std::process::Stdio;
 use tokio::io::AsyncReadExt;
 use tokio::process::Command as TokioCommand;
-
-#[async_trait]
-pub trait ShellAdapter: Send + Sync {
-    fn run_capture(&self, program: &str, args: &[&str]) -> Result<String>;
-    async fn run_command_line(
-        &self,
-        command_line: &str,
-        ctx: Option<&TaskContext>,
-    ) -> Result<String>;
-    async fn run_command_line_in_dir(
-        &self,
-        command_line: &str,
-        workdir: Option<&str>,
-        ctx: Option<&TaskContext>,
-    ) -> Result<String>;
-}
 
 #[derive(Debug, Clone, Default)]
 pub struct CommandShellAdapter {
@@ -119,7 +103,7 @@ impl ShellAdapter for CommandShellAdapter {
     async fn run_command_line(
         &self,
         command_line: &str,
-        ctx: Option<&TaskContext>,
+        ctx: Option<&dyn CommandContext>,
     ) -> Result<String> {
         self.run_command_line_in_dir(command_line, None, ctx).await
     }
@@ -128,7 +112,7 @@ impl ShellAdapter for CommandShellAdapter {
         &self,
         command_line: &str,
         workdir: Option<&str>,
-        ctx: Option<&TaskContext>,
+        ctx: Option<&dyn CommandContext>,
     ) -> Result<String> {
         let shell_program = self.resolve_shell_program();
         let mut cmd = TokioCommand::new(&shell_program);
@@ -147,9 +131,9 @@ impl ShellAdapter for CommandShellAdapter {
             cmd.current_dir(dir);
         }
         cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
-        let mut child = cmd.spawn().with_context(|| {
-            format!("failed to execute command line via {}", shell_program)
-        })?;
+        let mut child = cmd
+            .spawn()
+            .with_context(|| format!("failed to execute command line via {}", shell_program))?;
         let pid = child.id();
         let mut stdout = child.stdout.take();
         let mut stderr = child.stderr.take();
@@ -212,8 +196,9 @@ fn command_fingerprint(command_line: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{CommandShellAdapter, ShellAdapter};
+    use super::CommandShellAdapter;
     use crate::application::context::TaskContext;
+    use crate::domain::ports::ShellAdapter;
     use std::time::{Duration, Instant};
 
     #[tokio::test]

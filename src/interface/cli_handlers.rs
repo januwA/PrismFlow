@@ -14,14 +14,12 @@ use crate::application::{
     context::TaskContext,
     repo_manager::RepoManager,
     review_workflow::{ReviewWorkflow, ReviewWorkflowOptions},
-    usecases::{
-        github_client_for_action, run_ci_once, run_review_ad_hoc, run_review_clean,
-        run_review_once,
-    },
+    usecases::{run_ci_once, run_review_ad_hoc, run_review_clean, run_review_once},
 };
-use crate::domain::ports::ConfigRepository;
+use crate::domain::ports::{ConfigRepository, ProcessManager};
 use crate::infrastructure::{
-    local_config_adapter::LocalConfigAdapter, shell_adapter::CommandShellAdapter,
+    github_adapter::OctocrabGitHubRepository, local_config_adapter::LocalConfigAdapter,
+    shell_adapter::CommandShellAdapter,
 };
 use crate::interface::cli::{
     AuthSubcommand, CiSubcommand, Commands, RepoAgentSubcommand, RepoSubcommand, ReviewSubcommand,
@@ -41,6 +39,7 @@ pub async fn dispatch(
     repo_manager: &RepoManager<'_>,
     config_repo: Arc<LocalConfigAdapter>,
     shell: &CommandShellAdapter,
+    process_manager: &dyn ProcessManager,
 ) -> Result<()> {
     match command {
         Commands::Repo(repo) => match repo.command {
@@ -252,11 +251,11 @@ pub async fn dispatch(
                 let resolved_prompt = resolve_engine_prompt(engine_prompt, engine_prompt_file)?;
                 let resolved_engines = resolve_engine_specs(engines)?;
                 let once_ctx = Arc::new(TaskContext::new("ci-once"));
+                let github = github_client_for_action(auth_manager, max_concurrent_api, "ci")?;
                 run_ci_once(
-                    &auth_manager,
                     config_repo.as_ref(),
-                    &shell,
-                    max_concurrent_api,
+                    &github,
+                    shell,
                     CiWorkflowOptions {
                         max_concurrent_repos,
                         engine_specs: resolved_engines,
@@ -300,13 +299,13 @@ pub async fn dispatch(
                 println!("ci daemon started: interval={}s", interval_secs);
                 loop {
                     let cycle_ctx = Arc::new(TaskContext::new("ci-daemon-cycle"));
+                    let github = github_client_for_action(auth_manager, max_concurrent_api, "ci")?;
                     let mut stop_daemon = false;
                     tokio::select! {
                         r = run_ci_once(
-                            &auth_manager,
                             config_repo.as_ref(),
-                            &shell,
-                            max_concurrent_api,
+                            &github,
+                            shell,
                             options.clone(),
                             cycle_ctx.clone(),
                         ) => {
@@ -316,7 +315,14 @@ pub async fn dispatch(
                         }
                         _ = tokio::signal::ctrl_c() => {
                             stop_daemon = true;
-                            shutdown_cycle("ci", &cycle_ctx, SHUTDOWN_GRACE_SECS, None).await;
+                            shutdown_cycle(
+                                "ci",
+                                &cycle_ctx,
+                                SHUTDOWN_GRACE_SECS,
+                                process_manager,
+                                None,
+                            )
+                            .await;
                         }
                     }
                     if stop_daemon {
@@ -371,11 +377,11 @@ pub async fn dispatch(
                     exclude_repos,
                     ..ReviewWorkflowOptions::default()
                 };
+                let github = github_client_for_action(auth_manager, max_concurrent_api, "review")?;
                 run_review_once(
-                    &auth_manager,
                     config_repo.as_ref(),
-                    &shell,
-                    max_concurrent_api,
+                    &github,
+                    shell,
                     options,
                     once_ctx,
                     None,
@@ -495,14 +501,26 @@ pub async fn dispatch(
                                         let mut adhoc_opts = options.clone();
                                         adhoc_opts.status_tx = Some(status_tx.clone());
                                         let adhoc_ctx = Arc::new(TaskContext::new("review-adhoc"));
+                                        let github = github_client_for_action(
+                                            auth_manager,
+                                            max_concurrent_api,
+                                            "ad-hoc review",
+                                        );
+                                        let github = match github {
+                                            Ok(client) => client,
+                                            Err(err) => {
+                                                let _ = status_tx
+                                                    .send(format!("ui:adhoc failed error={err:#}"));
+                                                continue;
+                                            }
+                                        };
                                         if let Err(err) = run_review_ad_hoc(
-                                            &auth_manager,
                                             config_repo.as_ref(),
-                                            &shell,
+                                            &github,
+                                            shell,
                                             owner,
                                             repo,
                                             pr_number,
-                                            max_concurrent_api,
                                             adhoc_opts,
                                             adhoc_ctx,
                                         )
@@ -600,13 +618,14 @@ pub async fn dispatch(
                     }
                     let _ = status_tx.send("cycle:start".to_string());
                     let cycle_ctx = Arc::new(TaskContext::new("review-daemon-cycle"));
+                    let github =
+                        github_client_for_action(auth_manager, max_concurrent_api, "review")?;
                     let mut stop_daemon = false;
                     tokio::select! {
                         r = run_review_once(
-                            &auth_manager,
                             config_repo.as_ref(),
-                            &shell,
-                            max_concurrent_api,
+                            &github,
+                            shell,
                             ReviewWorkflowOptions {
                                 status_tx: Some(status_tx.clone()),
                                 skip_flag: Some(skip_flag.clone()),
@@ -628,6 +647,7 @@ pub async fn dispatch(
                                 "review",
                                 &cycle_ctx,
                                 SHUTDOWN_GRACE_SECS,
+                                process_manager,
                                 Some(&status_tx),
                             )
                             .await;
@@ -695,14 +715,15 @@ pub async fn dispatch(
                     keep_diff_files,
                     ..ReviewWorkflowOptions::default()
                 };
+                let github =
+                    github_client_for_action(auth_manager, max_concurrent_api, "ad-hoc review")?;
                 run_review_ad_hoc(
-                    &auth_manager,
                     config_repo.as_ref(),
-                    &shell,
+                    &github,
+                    shell,
                     owner,
                     repo,
                     pr_number,
-                    max_concurrent_api,
                     options,
                     adhoc_ctx,
                 )
@@ -719,15 +740,18 @@ pub async fn dispatch(
                     {
                         Ok((owner, repo, pr_number)) => {
                             let clean_ctx = Arc::new(TaskContext::new("review-clean"));
-                            if let Err(err) = run_review_clean(
-                                &auth_manager,
-                                owner,
-                                repo,
-                                pr_number,
-                                max_concurrent_api,
-                                clean_ctx,
-                            )
-                            .await
+                            let github =
+                                github_client_for_action(auth_manager, max_concurrent_api, "clean");
+                            let github = match github {
+                                Ok(client) => client,
+                                Err(err) => {
+                                    failed += 1;
+                                    eprintln!("clean_failed url={} error={err:#}", pr_url);
+                                    continue;
+                                }
+                            };
+                            if let Err(err) =
+                                run_review_clean(&github, owner, repo, pr_number, clean_ctx).await
                             {
                                 failed += 1;
                                 eprintln!("clean_failed url={} error={err:#}", pr_url);
@@ -749,10 +773,27 @@ pub async fn dispatch(
     Ok(())
 }
 
+fn github_client_for_action(
+    auth_manager: &AuthManager<'_>,
+    max_concurrent_api: usize,
+    action: &str,
+) -> Result<OctocrabGitHubRepository> {
+    let token = auth_manager
+        .resolve_token()?
+        .map(|r| r.token)
+        .with_context(|| {
+            format!(
+                "token required for {action}; run `prismflow auth login <token>` or configure gh/GITHUB_TOKEN"
+            )
+        })?;
+    OctocrabGitHubRepository::new(token, max_concurrent_api)
+}
+
 async fn shutdown_cycle(
     kind: &str,
     ctx: &Arc<TaskContext>,
     grace_secs: u64,
+    process_manager: &dyn ProcessManager,
     status_tx: Option<&broadcast::Sender<String>>,
 ) {
     ctx.cancel();
@@ -833,8 +874,11 @@ async fn shutdown_cycle(
             ctx.run_id()
         ));
     }
-    let killed = ctx.kill_all_children().await;
-    println!("shutdown:{} force_kill_end killed_children={}", kind, killed);
+    let killed = ctx.kill_all_children(process_manager).await;
+    println!(
+        "shutdown:{} force_kill_end killed_children={}",
+        kind, killed
+    );
     if let Some(tx) = status_tx {
         let _ = tx.send(format!(
             "cycle:force_kill_end kind={} run_id={} killed_children={}",

@@ -20,6 +20,34 @@ pub trait TokenProvider: Send + Sync {
 }
 
 #[async_trait]
+pub trait CommandContext: Send + Sync {
+    fn is_cancelled(&self) -> bool;
+    async fn cancelled(&self);
+    async fn register_child(&self, pid: u32, label: String);
+    async fn unregister_child(&self, pid: u32);
+}
+
+#[async_trait]
+pub trait ShellAdapter: Send + Sync {
+    fn run_capture(&self, program: &str, args: &[&str]) -> Result<String>;
+    async fn run_command_line(
+        &self,
+        command_line: &str,
+        ctx: Option<&dyn CommandContext>,
+    ) -> Result<String>;
+    async fn run_command_line_in_dir(
+        &self,
+        command_line: &str,
+        workdir: Option<&str>,
+        ctx: Option<&dyn CommandContext>,
+    ) -> Result<String>;
+}
+
+pub trait ProcessManager: Send + Sync {
+    fn kill_process_tree(&self, pid: u32) -> bool;
+}
+
+#[async_trait]
 pub trait GitHubRepository: Send + Sync {
     async fn current_user_login(&self) -> Result<String>;
     async fn list_open_pull_requests(

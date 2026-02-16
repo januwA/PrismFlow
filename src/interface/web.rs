@@ -70,7 +70,10 @@ pub async fn run_ui_server(addr: SocketAddr, state: UiState) -> Result<()> {
     Ok(())
 }
 
-async fn ui_index(State(state): State<UiState>, Query(q): Query<UiTokenQuery>) -> impl IntoResponse {
+async fn ui_index(
+    State(state): State<UiState>,
+    Query(q): Query<UiTokenQuery>,
+) -> impl IntoResponse {
     if !authorized(&state.token, q.token.as_deref()) {
         return (StatusCode::UNAUTHORIZED, "unauthorized").into_response();
     }
@@ -189,7 +192,10 @@ async fn ui_trigger_review(
     ui_redirect(&state.token, form.token.as_deref()).into_response()
 }
 
-async fn ui_skip(State(state): State<UiState>, Form(form): Form<UiActionForm>) -> impl IntoResponse {
+async fn ui_skip(
+    State(state): State<UiState>,
+    Form(form): Form<UiActionForm>,
+) -> impl IntoResponse {
     if !authorized(&state.token, form.token.as_deref()) {
         return StatusCode::UNAUTHORIZED.into_response();
     }
@@ -198,7 +204,10 @@ async fn ui_skip(State(state): State<UiState>, Form(form): Form<UiActionForm>) -
     ui_redirect(&state.token, form.token.as_deref()).into_response()
 }
 
-async fn ui_adhoc(State(state): State<UiState>, Form(form): Form<UiActionForm>) -> impl IntoResponse {
+async fn ui_adhoc(
+    State(state): State<UiState>,
+    Form(form): Form<UiActionForm>,
+) -> impl IntoResponse {
     if !authorized(&state.token, form.token.as_deref()) {
         return StatusCode::UNAUTHORIZED.into_response();
     }
@@ -262,14 +271,19 @@ async fn ui_agent_remove(
     }
     if let (Some(repo), Some(agent)) = (form.repo, form.agent) {
         if !repo.trim().is_empty() && !agent.trim().is_empty() {
-            let _ = state.command_tx.send(UiCommand::AgentRemove { repo, agent });
+            let _ = state
+                .command_tx
+                .send(UiCommand::AgentRemove { repo, agent });
             state.notify.notify_one();
         }
     }
     ui_redirect(&state.token, form.token.as_deref()).into_response()
 }
 
-async fn ui_dir_add(State(state): State<UiState>, Form(form): Form<UiActionForm>) -> impl IntoResponse {
+async fn ui_dir_add(
+    State(state): State<UiState>,
+    Form(form): Form<UiActionForm>,
+) -> impl IntoResponse {
     if !authorized(&state.token, form.token.as_deref()) {
         return StatusCode::UNAUTHORIZED.into_response();
     }

@@ -1,9 +1,11 @@
 use std::collections::HashMap;
-use std::process::Command;
 use std::time::SystemTime;
 
+use async_trait::async_trait;
 use tokio::sync::Mutex;
 use tokio_util::sync::CancellationToken;
+
+use crate::domain::ports::{CommandContext, ProcessManager};
 
 #[allow(dead_code)]
 #[derive(Debug)]
@@ -74,10 +76,13 @@ impl TaskContext {
 
     pub async fn list_children(&self) -> Vec<(u32, String)> {
         let guard = self.children.lock().await;
-        guard.iter().map(|(pid, label)| (*pid, label.clone())).collect()
+        guard
+            .iter()
+            .map(|(pid, label)| (*pid, label.clone()))
+            .collect()
     }
 
-    pub async fn kill_all_children(&self) -> usize {
+    pub async fn kill_all_children(&self, process_manager: &dyn ProcessManager) -> usize {
         let pids = {
             let guard = self.children.lock().await;
             guard.keys().copied().collect::<Vec<_>>()
@@ -85,7 +90,7 @@ impl TaskContext {
 
         let mut killed = 0usize;
         for pid in pids {
-            let ok = terminate_process(pid);
+            let ok = process_manager.kill_process_tree(pid);
             if ok {
                 killed += 1;
                 self.unregister_child(pid).await;
@@ -95,31 +100,32 @@ impl TaskContext {
     }
 }
 
-#[allow(dead_code)]
-fn terminate_process(pid: u32) -> bool {
-    #[cfg(target_os = "windows")]
-    {
-        Command::new("taskkill")
-            .args(["/PID", &pid.to_string(), "/T", "/F"])
-            .status()
-            .map(|s| s.success())
-            .unwrap_or(false)
+#[async_trait]
+impl CommandContext for TaskContext {
+    fn is_cancelled(&self) -> bool {
+        self.cancel.is_cancelled()
     }
-    #[cfg(not(target_os = "windows"))]
-    {
-        Command::new("kill")
-            .args(["-9", &pid.to_string()])
-            .status()
-            .map(|s| s.success())
-            .unwrap_or(false)
+
+    async fn cancelled(&self) {
+        self.cancel.cancelled().await;
+    }
+
+    async fn register_child(&self, pid: u32, label: String) {
+        let mut guard = self.children.lock().await;
+        guard.insert(pid, label);
+    }
+
+    async fn unregister_child(&self, pid: u32) {
+        let mut guard = self.children.lock().await;
+        guard.remove(&pid);
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::TaskContext;
-    use std::process::Command;
-    use std::time::Duration;
+    use crate::domain::ports::ProcessManager;
+    use std::sync::Mutex;
 
     #[tokio::test]
     async fn cancel_flag_works() {
@@ -139,34 +145,32 @@ mod tests {
         assert_eq!(ctx.child_count().await, 1);
     }
 
-    #[tokio::test]
-    async fn kill_all_children_terminates_registered_processes() {
-        let ctx = TaskContext::new("kill-children-test");
-        #[cfg(target_os = "windows")]
-        let mut child = Command::new("powershell")
-            .args(["-NoProfile", "-Command", "Start-Sleep -Seconds 20"])
-            .spawn()
-            .expect("spawn child");
-        #[cfg(not(target_os = "windows"))]
-        let mut child = Command::new("sh")
-            .args(["-lc", "sleep 20"])
-            .spawn()
-            .expect("spawn child");
+    #[derive(Default)]
+    struct MockProcessManager {
+        calls: Mutex<Vec<u32>>,
+    }
 
-        let pid = child.id();
-        ctx.register_child(pid, "test-sleep").await;
-        assert_eq!(ctx.child_count().await, 1);
-
-        let killed = ctx.kill_all_children().await;
-        assert!(killed >= 1);
-        assert_eq!(ctx.child_count().await, 0);
-
-        for _ in 0..20 {
-            if child.try_wait().expect("try_wait").is_some() {
-                return;
-            }
-            tokio::time::sleep(Duration::from_millis(100)).await;
+    impl ProcessManager for MockProcessManager {
+        fn kill_process_tree(&self, pid: u32) -> bool {
+            self.calls.lock().expect("lock calls").push(pid);
+            true
         }
-        panic!("child process did not exit after kill_all_children");
+    }
+
+    #[tokio::test]
+    async fn kill_all_children_uses_process_manager_and_cleans_registry() {
+        let ctx = TaskContext::new("kill-children-test");
+        let pm = MockProcessManager::default();
+        ctx.register_child(2001, "a").await;
+        ctx.register_child(2002, "b").await;
+        assert_eq!(ctx.child_count().await, 2);
+
+        let killed = ctx.kill_all_children(&pm).await;
+        assert_eq!(killed, 2);
+        assert_eq!(ctx.child_count().await, 0);
+        let calls = pm.calls.lock().expect("lock calls").clone();
+        assert_eq!(calls.len(), 2);
+        assert!(calls.contains(&2001));
+        assert!(calls.contains(&2002));
     }
 }

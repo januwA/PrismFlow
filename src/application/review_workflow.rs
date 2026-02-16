@@ -19,14 +19,13 @@ use tokio::time::sleep;
 
 use crate::application::context::TaskContext;
 use crate::domain::{
-    errors::DomainError,
     entities::{
         AppConfig, MonitoredRepo, PullRequestFilePatch, PullRequestSummary, ReviewComment,
         ReviewFilterConfig,
     },
-    ports::{ConfigRepository, GitHubRepository},
+    errors::DomainError,
+    ports::{CommandContext, ConfigRepository, GitHubRepository, ShellAdapter},
 };
-use crate::infrastructure::shell_adapter::ShellAdapter;
 
 const MAX_INLINE_COMMENTS: usize = 20;
 const DEFAULT_RETRY_ATTEMPTS: usize = 3;
@@ -581,17 +580,17 @@ impl<'a> ReviewWorkflow<'a> {
         };
         let analysis = match self
             .analyze_review(
-            owner,
-            repo,
-            pr.number,
-            &pr.head_sha,
-            &files,
-            effective_prompt.as_deref(),
-            &selected_engine,
-            repo_dir_for_shell.as_deref(),
-            &repo_head_ref_for_shell,
-        )
-        .await
+                owner,
+                repo,
+                pr.number,
+                &pr.head_sha,
+                &files,
+                effective_prompt.as_deref(),
+                &selected_engine,
+                repo_dir_for_shell.as_deref(),
+                &repo_head_ref_for_shell,
+            )
+            .await
         {
             Ok(v) => v,
             Err(err) => {
@@ -885,7 +884,13 @@ impl<'a> ReviewWorkflow<'a> {
         command = command.replace("{repo_head_ref}", repo_head_ref);
         let command_line = command;
         let output = match shell
-            .run_command_line(&command_line, self.options.task_context.as_deref())
+            .run_command_line(
+                &command_line,
+                self.options
+                    .task_context
+                    .as_deref()
+                    .map(|ctx| ctx as &dyn CommandContext),
+            )
             .await
         {
             Ok(v) => {
@@ -2064,7 +2069,7 @@ mod tests {
         async fn run_command_line(
             &self,
             _command_line: &str,
-            _ctx: Option<&TaskContext>,
+            _ctx: Option<&dyn CommandContext>,
         ) -> Result<String> {
             Ok("src/main.rs:1: mock finding".to_string())
         }
@@ -2073,7 +2078,7 @@ mod tests {
             &self,
             _command_line: &str,
             _workdir: Option<&str>,
-            _ctx: Option<&TaskContext>,
+            _ctx: Option<&dyn CommandContext>,
         ) -> Result<String> {
             Ok("src/main.rs:1: mock finding".to_string())
         }
@@ -2119,7 +2124,7 @@ mod tests {
         async fn run_command_line(
             &self,
             _command_line: &str,
-            ctx: Option<&TaskContext>,
+            ctx: Option<&dyn CommandContext>,
         ) -> Result<String> {
             if let Some(ctx) = ctx {
                 ctx.cancelled().await;
@@ -2133,7 +2138,7 @@ mod tests {
             &self,
             _command_line: &str,
             _workdir: Option<&str>,
-            ctx: Option<&TaskContext>,
+            ctx: Option<&dyn CommandContext>,
         ) -> Result<String> {
             self.run_command_line("", ctx).await
         }

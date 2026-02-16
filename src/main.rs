@@ -8,13 +8,12 @@ use std::sync::Arc;
 
 use anyhow::{Context, Result};
 use application::{
-    auth_manager::AuthManager,
-    repo_manager::RepoManager,
-    review_workflow::EngineSpec,
+    auth_manager::AuthManager, repo_manager::RepoManager, review_workflow::EngineSpec,
 };
 use clap::Parser;
 use infrastructure::{
     local_config_adapter::LocalConfigAdapter,
+    process_manager::OsProcessManager,
     shell_adapter::CommandShellAdapter,
     token_providers::{EnvTokenProvider, GhCliTokenProvider, StoredTokenProvider},
 };
@@ -29,6 +28,7 @@ async fn main() -> Result<()> {
     let shell_override = cli.shell.clone();
     let config_repo = Arc::new(LocalConfigAdapter::new()?);
     let shell = CommandShellAdapter::new(shell_override);
+    let process_manager = OsProcessManager;
     let stored_provider = StoredTokenProvider::new(config_repo.auth_token_path());
     let gh_provider = GhCliTokenProvider::new(&shell);
     let env_provider = EnvTokenProvider;
@@ -45,6 +45,7 @@ async fn main() -> Result<()> {
         &repo_manager,
         config_repo.clone(),
         &shell,
+        &process_manager,
     )
     .await?;
 

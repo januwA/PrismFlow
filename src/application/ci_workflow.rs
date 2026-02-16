@@ -17,11 +17,10 @@ use tokio::process::Command;
 use crate::{
     application::context::TaskContext,
     domain::{
-        errors::DomainError,
         entities::{AppConfig, CiFailure, MonitoredRepo},
-        ports::{ConfigRepository, GitHubRepository},
+        errors::DomainError,
+        ports::{CommandContext, ConfigRepository, GitHubRepository, ShellAdapter},
     },
-    infrastructure::shell_adapter::ShellAdapter,
 };
 
 use super::review_workflow::EngineSpec;
@@ -245,7 +244,10 @@ impl<'a> CiWorkflow<'a> {
                 .run_command_line_in_dir(
                     &command,
                     repo_dir_for_shell.as_deref(),
-                    self.options.task_context.as_deref(),
+                    self.options
+                        .task_context
+                        .as_deref()
+                        .map(|ctx| ctx as &dyn CommandContext),
                 )
                 .await;
             let _ = fs::remove_file(&payload_file);
@@ -545,11 +547,10 @@ mod tests {
     use super::{CiWorkflow, CiWorkflowOptions, EngineSpec, run_git_command};
     use crate::application::context::TaskContext;
     use crate::domain::entities::{
-        AppConfig, MonitoredRepo, PullRequestCiSnapshot, PullRequestFilePatch, PullRequestGitContext,
-        PullRequestMetrics, PullRequestSummary, ReviewFilterConfig,
+        AppConfig, MonitoredRepo, PullRequestCiSnapshot, PullRequestFilePatch,
+        PullRequestGitContext, PullRequestMetrics, PullRequestSummary, ReviewFilterConfig,
     };
-    use crate::domain::ports::{ConfigRepository, GitHubRepository};
-    use crate::infrastructure::shell_adapter::ShellAdapter;
+    use crate::domain::ports::{CommandContext, ConfigRepository, GitHubRepository, ShellAdapter};
     use std::sync::Arc;
     use std::time::Duration;
 
@@ -569,10 +570,7 @@ mod tests {
             "alias.wait=!sleep 8".to_string(),
             "wait".to_string(),
         ];
-        let args = args_owned
-            .iter()
-            .map(|s| s.as_str())
-            .collect::<Vec<&str>>();
+        let args = args_owned.iter().map(|s| s.as_str()).collect::<Vec<&str>>();
 
         let ((), result) = tokio::join!(
             async {
@@ -816,7 +814,7 @@ mod tests {
         async fn run_command_line(
             &self,
             _command_line: &str,
-            _ctx: Option<&TaskContext>,
+            _ctx: Option<&dyn CommandContext>,
         ) -> Result<String> {
             Ok(String::new())
         }
@@ -825,7 +823,7 @@ mod tests {
             &self,
             _command_line: &str,
             _workdir: Option<&str>,
-            _ctx: Option<&TaskContext>,
+            _ctx: Option<&dyn CommandContext>,
         ) -> Result<String> {
             Ok(String::new())
         }

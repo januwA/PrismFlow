@@ -2,7 +2,7 @@ use std::{env, fs, path::PathBuf};
 
 use anyhow::{Context, Result};
 
-use crate::{domain::ports::TokenProvider, infrastructure::shell_adapter::ShellAdapter};
+use crate::domain::ports::{ShellAdapter, TokenProvider};
 
 pub struct GhCliTokenProvider<'a> {
     shell: &'a dyn ShellAdapter,
