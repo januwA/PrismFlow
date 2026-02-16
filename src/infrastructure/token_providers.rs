@@ -2,7 +2,7 @@ use std::{env, fs, path::PathBuf};
 
 use anyhow::{Context, Result};
 
-use crate::domain::ports::{ShellAdapter, TokenProvider};
+use crate::domain::ports::{ShellAdapter, TokenProvider, TokenWriter};
 
 pub struct GhCliTokenProvider<'a> {
     shell: &'a dyn ShellAdapter,
@@ -56,6 +56,12 @@ impl StoredTokenProvider {
     pub fn save_token(&self, token: &str) -> Result<()> {
         fs::write(&self.path, token.trim())
             .with_context(|| format!("failed to save token to {}", self.path.display()))
+    }
+}
+
+impl TokenWriter for StoredTokenProvider {
+    fn save_token(&self, token: &str) -> Result<()> {
+        StoredTokenProvider::save_token(self, token)
     }
 }
 

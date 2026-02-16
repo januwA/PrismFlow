@@ -1,6 +1,6 @@
 use anyhow::{Result, bail};
 
-use crate::{domain::ports::TokenProvider, infrastructure::token_providers::StoredTokenProvider};
+use crate::domain::ports::{TokenProvider, TokenWriter};
 
 #[derive(Debug, Clone)]
 pub struct TokenResolution {
@@ -10,11 +10,11 @@ pub struct TokenResolution {
 
 pub struct AuthManager<'a> {
     providers: Vec<&'a dyn TokenProvider>,
-    stored: &'a StoredTokenProvider,
+    stored: &'a dyn TokenWriter,
 }
 
 impl<'a> AuthManager<'a> {
-    pub fn new(providers: Vec<&'a dyn TokenProvider>, stored: &'a StoredTokenProvider) -> Self {
+    pub fn new(providers: Vec<&'a dyn TokenProvider>, stored: &'a dyn TokenWriter) -> Self {
         Self { providers, stored }
     }
 

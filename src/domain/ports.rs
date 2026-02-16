@@ -19,6 +19,10 @@ pub trait TokenProvider: Send + Sync {
     fn token(&self) -> Result<Option<String>>;
 }
 
+pub trait TokenWriter: Send + Sync {
+    fn save_token(&self, token: &str) -> Result<()>;
+}
+
 #[async_trait]
 pub trait CommandContext: Send + Sync {
     fn is_cancelled(&self) -> bool;
