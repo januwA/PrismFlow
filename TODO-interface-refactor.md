@@ -2,16 +2,16 @@
 
 ## 目标
 
-- [ ] 将表现层职责从 `src/main.rs` 中拆分出去
+- [x] 将表现层职责从 `src/main.rs` 中拆分出去
 - [x] 形成清晰的 `interface::cli` 与 `interface::web` 双入口表现层
-- [ ] 保持现有行为不变（命令参数、UI 路由、输出格式）
-- [ ] 完成后 `main.rs` 仅负责启动装配与流程编排
+- [x] 保持现有行为不变（命令参数、UI 路由、输出格式）
+- [x] 完成后 `main.rs` 仅负责启动装配与流程编排
 
 ## 范围
 
-- [ ] 本次先迁移 Web UI 相关代码到 `interface` 层
-- [ ] CLI 参数结构（`src/interface/cli.rs`）保持不变
-- [ ] 不改业务规则（review/ci/repo/auth）
+- [x] 本次先迁移 Web UI 相关代码到 `interface` 层
+- [x] CLI 参数结构（`src/interface/cli.rs`）保持不变
+- [x] 不改业务规则（review/ci/repo/auth）
 
 ## Phase 1 - Web UI 抽离（当前进行中）
 
@@ -26,7 +26,7 @@
 
 - [x] 将 `main.rs` 的顶层 `match cli.command` 迁移到 `interface` handler 层
 - [x] 保留参数定义在 `cli.rs`，新增执行器文件 `src/interface/cli_handlers.rs`
-- [ ] 保持命令行输出兼容
+- [x] 保持命令行输出兼容
 
 ## Phase 3 - 应用编排函数下沉（进行中）
 
@@ -38,5 +38,5 @@
 
 - [x] `cargo test -q` 全绿
 - [x] `cargo run -- --help` 行为一致
-- [ ] `review daemon --ui` 页面、路由、动作行为一致
+- [x] `review daemon --ui` 页面、路由、动作行为一致
 - [x] `main.rs` 不再包含 Web handler 与 HTML 拼接代码
