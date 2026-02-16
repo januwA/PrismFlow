@@ -2,7 +2,6 @@ use std::{
     collections::HashSet,
     fs,
     path::PathBuf,
-    process::Command,
     sync::{
         Arc,
         atomic::{AtomicBool, AtomicUsize, Ordering},
@@ -14,10 +13,13 @@ use anyhow::{Result, anyhow};
 use futures::stream::{self, StreamExt};
 use serde::Serialize;
 use sha2::{Digest, Sha256};
+use tokio::process::Command;
 use tokio::sync::broadcast;
 use tokio::time::sleep;
 
+use crate::application::context::TaskContext;
 use crate::domain::{
+    errors::DomainError,
     entities::{
         AppConfig, MonitoredRepo, PullRequestFilePatch, PullRequestSummary, ReviewComment,
         ReviewFilterConfig,
@@ -84,6 +86,7 @@ pub struct ReviewWorkflowOptions {
     pub exclude_repos: Vec<String>,
     pub status_tx: Option<broadcast::Sender<String>>,
     pub skip_flag: Option<Arc<AtomicBool>>,
+    pub task_context: Option<Arc<TaskContext>>,
 }
 
 impl Default for ReviewWorkflowOptions {
@@ -107,6 +110,7 @@ impl Default for ReviewWorkflowOptions {
             exclude_repos: vec![],
             status_tx: None,
             skip_flag: None,
+            task_context: None,
         }
     }
 }
@@ -367,6 +371,15 @@ impl<'a> ReviewWorkflow<'a> {
         pr: PullRequestSummary,
         force_run: bool,
     ) -> PrReviewOutcome {
+        if self
+            .options
+            .task_context
+            .as_ref()
+            .map(|ctx| ctx.is_cancelled())
+            .unwrap_or(false)
+        {
+            return PrReviewOutcome::FailedRetryable("task cancelled".to_string());
+        }
         if self.consume_skip_by_operator() {
             self.mark_stage(ReviewStage::Skipped, full_repo_name, pr.number);
             return PrReviewOutcome::SkippedByOperator;
@@ -539,6 +552,7 @@ impl<'a> ReviewWorkflow<'a> {
                 .await
             {
                 if let Ok(repo_dir) = prepare_repo_checkout(
+                    self.options.task_context.as_deref(),
                     &ctx.head_clone_url,
                     &ctx.head_sha,
                     &ctx.head_ref,
@@ -547,7 +561,9 @@ impl<'a> ReviewWorkflow<'a> {
                     pr.number,
                     &self.options.clone_workspace_dir,
                     self.options.clone_depth,
-                ) {
+                )
+                .await
+                {
                     repo_dir_for_shell = Some(repo_dir.to_string_lossy().to_string());
                     repo_head_ref_for_shell = ctx.head_ref;
                 }
@@ -563,7 +579,8 @@ impl<'a> ReviewWorkflow<'a> {
                 };
             }
         };
-        let analysis = match self.analyze_review(
+        let analysis = match self
+            .analyze_review(
             owner,
             repo,
             pr.number,
@@ -573,7 +590,9 @@ impl<'a> ReviewWorkflow<'a> {
             &selected_engine,
             repo_dir_for_shell.as_deref(),
             &repo_head_ref_for_shell,
-        ) {
+        )
+        .await
+        {
             Ok(v) => v,
             Err(err) => {
                 return match classify_error(&err) {
@@ -799,7 +818,16 @@ impl<'a> ReviewWorkflow<'a> {
     }
 
     fn mark_stage(&self, stage: ReviewStage, repo: &str, pr_number: u64) {
-        self.emit_status(format!("stage={:?} repo={} pr={}", stage, repo, pr_number));
+        let run_id = self
+            .options
+            .task_context
+            .as_ref()
+            .map(|ctx| ctx.run_id().to_string())
+            .unwrap_or_else(|| "n/a".to_string());
+        self.emit_status(format!(
+            "run_id={} stage={:?} repo={} pr={}",
+            run_id, stage, repo, pr_number
+        ));
     }
 
     fn resolve_effective_prompt(&self, agents: &[String]) -> Result<Option<String>> {
@@ -821,7 +849,7 @@ impl<'a> ReviewWorkflow<'a> {
         }
     }
 
-    fn analyze_review(
+    async fn analyze_review(
         &self,
         owner: &str,
         repo: &str,
@@ -856,7 +884,10 @@ impl<'a> ReviewWorkflow<'a> {
         command = command.replace("{repo_dir}", repo_dir.unwrap_or(""));
         command = command.replace("{repo_head_ref}", repo_head_ref);
         let command_line = command;
-        let output = match shell.run_command_line(&command_line) {
+        let output = match shell
+            .run_command_line(&command_line, self.options.task_context.as_deref())
+            .await
+        {
             Ok(v) => {
                 if !self.options.keep_diff_files {
                     let _ = fs::remove_file(&patch_file);
@@ -976,7 +1007,8 @@ fn parse_github_repo_like_url(input: &str) -> Option<String> {
     Some(format!("{owner}/{repo}"))
 }
 
-fn prepare_repo_checkout(
+async fn prepare_repo_checkout(
+    task_ctx: Option<&TaskContext>,
     clone_url: &str,
     head_sha: &str,
     head_ref: &str,
@@ -1000,15 +1032,20 @@ fn prepare_repo_checkout(
     let target_str = target.to_string_lossy().to_string();
     let depth_str = clone_depth.max(1).to_string();
     if !target.join(".git").exists() {
-        let status = Command::new("git")
-            .args(["clone", "--no-checkout", clone_url, &target_str])
-            .status()?;
+        let status = run_git_command(
+            task_ctx,
+            &["clone", "--no-checkout", clone_url, &target_str],
+            None,
+            "git clone",
+        )
+        .await?;
         if !status.success() {
             anyhow::bail!("git clone failed for {}", clone_url);
         }
     }
-    let fetch_status = Command::new("git")
-        .args([
+    let fetch_status = run_git_command(
+        task_ctx,
+        &[
             "-C",
             &target_str,
             "fetch",
@@ -1016,12 +1053,16 @@ fn prepare_repo_checkout(
             &depth_str,
             "origin",
             head_sha,
-        ])
-        .status()?;
+        ],
+        None,
+        "git fetch by sha",
+    )
+    .await?;
     if !fetch_status.success() {
         let refspec = format!("refs/heads/{head_ref}");
-        let fetch_ref_status = Command::new("git")
-            .args([
+        let fetch_ref_status = run_git_command(
+            task_ctx,
+            &[
                 "-C",
                 &target_str,
                 "fetch",
@@ -1029,19 +1070,71 @@ fn prepare_repo_checkout(
                 &depth_str,
                 "origin",
                 &refspec,
-            ])
-            .status()?;
+            ],
+            None,
+            "git fetch by ref",
+        )
+        .await?;
         if !fetch_ref_status.success() {
             anyhow::bail!("git fetch failed for sha={} ref={}", head_sha, head_ref);
         }
     }
-    let checkout_status = Command::new("git")
-        .args(["-C", &target_str, "checkout", "--force", head_sha])
-        .status()?;
+    let checkout_status = run_git_command(
+        task_ctx,
+        &["-C", &target_str, "checkout", "--force", head_sha],
+        None,
+        "git checkout",
+    )
+    .await?;
     if !checkout_status.success() {
         anyhow::bail!("git checkout failed for sha={}", head_sha);
     }
     Ok(target)
+}
+
+async fn run_git_command(
+    task_ctx: Option<&TaskContext>,
+    args: &[&str],
+    workdir: Option<&str>,
+    label: &str,
+) -> Result<std::process::ExitStatus> {
+    let mut cmd = Command::new("git");
+    cmd.args(args);
+    if let Some(dir) = workdir {
+        cmd.current_dir(dir);
+    }
+    let mut child = cmd.spawn()?;
+    let pid = child.id();
+    if let (Some(ctx), Some(pid)) = (task_ctx, pid) {
+        let fp = command_fingerprint(args);
+        ctx.register_child(pid, format!("command_fingerprint={} {}", fp, label))
+            .await;
+    }
+    let status = if let Some(ctx) = task_ctx {
+        tokio::select! {
+            s = child.wait() => s?,
+            _ = ctx.cancelled() => {
+                let _ = child.kill().await;
+                if let (Some(ctx), Some(pid)) = (task_ctx, pid) {
+                    ctx.unregister_child(pid).await;
+                }
+                anyhow::bail!(DomainError::CancelledBySignal);
+            }
+        }
+    } else {
+        child.wait().await?
+    };
+    if let (Some(ctx), Some(pid)) = (task_ctx, pid) {
+        ctx.unregister_child(pid).await;
+    }
+    Ok(status)
+}
+
+fn command_fingerprint(args: &[&str]) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(args.join(" ").as_bytes());
+    let hex = hex::encode(hasher.finalize());
+    hex.chars().take(12).collect()
 }
 
 #[derive(Debug)]
@@ -1596,7 +1689,11 @@ fn detect_risky_pattern(content: &str) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
-    use std::{collections::HashMap, sync::Mutex};
+    use std::{
+        collections::HashMap,
+        sync::{Arc, Mutex},
+        time::Duration,
+    };
 
     use anyhow::anyhow;
     use async_trait::async_trait;
@@ -1958,19 +2055,25 @@ mod tests {
     #[derive(Default)]
     struct MockShell;
 
+    #[async_trait::async_trait]
     impl ShellAdapter for MockShell {
         fn run_capture(&self, _program: &str, _args: &[&str]) -> Result<String> {
             Ok(String::new())
         }
 
-        fn run_command_line(&self, _command_line: &str) -> Result<String> {
+        async fn run_command_line(
+            &self,
+            _command_line: &str,
+            _ctx: Option<&TaskContext>,
+        ) -> Result<String> {
             Ok("src/main.rs:1: mock finding".to_string())
         }
 
-        fn run_command_line_in_dir(
+        async fn run_command_line_in_dir(
             &self,
             _command_line: &str,
             _workdir: Option<&str>,
+            _ctx: Option<&TaskContext>,
         ) -> Result<String> {
             Ok("src/main.rs:1: mock finding".to_string())
         }
@@ -1994,6 +2097,46 @@ mod tests {
         opts: ReviewWorkflowOptions,
     ) -> ReviewWorkflow<'a> {
         ReviewWorkflow::new(cfg, gh, Some(&MOCK_SHELL), normalize_test_opts(opts))
+    }
+
+    fn workflow_with_shell<'a>(
+        cfg: &'a InMemoryConfigRepo,
+        gh: &'a MockGitHub,
+        shell: &'a dyn ShellAdapter,
+        opts: ReviewWorkflowOptions,
+    ) -> ReviewWorkflow<'a> {
+        ReviewWorkflow::new(cfg, gh, Some(shell), normalize_test_opts(opts))
+    }
+
+    struct CancelAwareShell;
+
+    #[async_trait::async_trait]
+    impl ShellAdapter for CancelAwareShell {
+        fn run_capture(&self, _program: &str, _args: &[&str]) -> Result<String> {
+            Ok(String::new())
+        }
+
+        async fn run_command_line(
+            &self,
+            _command_line: &str,
+            ctx: Option<&TaskContext>,
+        ) -> Result<String> {
+            if let Some(ctx) = ctx {
+                ctx.cancelled().await;
+                return Err(anyhow!(DomainError::CancelledBySignal));
+            }
+            tokio::time::sleep(Duration::from_secs(8)).await;
+            Ok(String::new())
+        }
+
+        async fn run_command_line_in_dir(
+            &self,
+            _command_line: &str,
+            _workdir: Option<&str>,
+            ctx: Option<&TaskContext>,
+        ) -> Result<String> {
+            self.run_command_line("", ctx).await
+        }
     }
 
     #[tokio::test]
@@ -2331,5 +2474,86 @@ mod tests {
             .expect("review_once");
         assert_eq!(stats.len(), 1);
         assert_eq!(stats[0].repo, "owner/repo-b");
+    }
+
+    #[tokio::test]
+    async fn review_once_respects_cancelled_task_context() {
+        let github = MockGitHub {
+            prs: vec![PullRequestSummary {
+                number: 1,
+                title: "t".to_string(),
+                head_sha: "abc123".to_string(),
+                html_url: None,
+            }],
+            ..Default::default()
+        };
+        let config = InMemoryConfigRepo::new(config_with_repo());
+        let ctx = Arc::new(TaskContext::new("cancelled-review-once"));
+        ctx.cancel();
+        let opts = ReviewWorkflowOptions {
+            task_context: Some(ctx),
+            ..ReviewWorkflowOptions::default()
+        };
+
+        let stats = workflow(&config, &github, opts)
+            .review_once()
+            .await
+            .expect("review_once");
+        assert_eq!(stats[0].processed, 0);
+        assert_eq!(stats[0].failed_retryable, 1);
+    }
+
+    #[tokio::test]
+    async fn engine_stage_cancel_does_not_write_completed_comment() {
+        let github = MockGitHub {
+            prs: vec![PullRequestSummary {
+                number: 1,
+                title: "t".to_string(),
+                head_sha: "abc123".to_string(),
+                html_url: None,
+            }],
+            files: HashMap::from([(
+                1,
+                vec![PullRequestFilePatch {
+                    path: "src/lib.rs".to_string(),
+                    patch: Some("@@ -1,1 +1,2 @@\n line\n+let x = 1;".to_string()),
+                }],
+            )]),
+            ..Default::default()
+        };
+        let config = InMemoryConfigRepo::new(config_with_repo());
+        let ctx = Arc::new(TaskContext::new("engine-cancel-test"));
+        let opts = ReviewWorkflowOptions {
+            task_context: Some(ctx.clone()),
+            ..ReviewWorkflowOptions::default()
+        };
+        let shell = CancelAwareShell;
+
+        let ((), stats) = tokio::join!(
+            async {
+                tokio::time::sleep(Duration::from_millis(250)).await;
+                ctx.cancel();
+            },
+            async {
+                workflow_with_shell(&config, &github, &shell, opts)
+                    .review_once()
+                    .await
+                    .expect("review_once")
+            }
+        );
+
+        assert_eq!(stats[0].processed, 0);
+        assert_eq!(stats[0].failed_fatal + stats[0].failed_retryable, 1);
+
+        let comments = github
+            .issue_comments
+            .lock()
+            .expect("lock")
+            .get(&1)
+            .cloned()
+            .unwrap_or_default();
+        let merged = comments.join("\n");
+        assert!(merged.contains("prismflow:processing:"));
+        assert!(!merged.contains("prismflow:completed:"));
     }
 }

@@ -11,6 +11,7 @@ use tokio::time::{Duration, sleep};
 use crate::application::{
     auth_manager::AuthManager,
     ci_workflow::CiWorkflowOptions,
+    context::TaskContext,
     repo_manager::RepoManager,
     review_workflow::{ReviewWorkflow, ReviewWorkflowOptions},
     usecases::{
@@ -31,6 +32,8 @@ use crate::{
     parse_github_pr_url, parse_repo_agent_args, resolve_engine_prompt, resolve_engine_specs,
     select_repo_interactively, short_key,
 };
+
+const SHUTDOWN_GRACE_SECS: u64 = 8;
 
 pub async fn dispatch(
     command: Commands,
@@ -248,6 +251,7 @@ pub async fn dispatch(
             } => {
                 let resolved_prompt = resolve_engine_prompt(engine_prompt, engine_prompt_file)?;
                 let resolved_engines = resolve_engine_specs(engines)?;
+                let once_ctx = Arc::new(TaskContext::new("ci-once"));
                 run_ci_once(
                     &auth_manager,
                     config_repo.as_ref(),
@@ -262,7 +266,9 @@ pub async fn dispatch(
                         clone_depth,
                         include_repos: repos,
                         exclude_repos,
+                        task_context: None,
                     },
+                    once_ctx,
                 )
                 .await?;
             }
@@ -289,9 +295,12 @@ pub async fn dispatch(
                     clone_depth,
                     include_repos: repos,
                     exclude_repos,
+                    task_context: None,
                 };
                 println!("ci daemon started: interval={}s", interval_secs);
                 loop {
+                    let cycle_ctx = Arc::new(TaskContext::new("ci-daemon-cycle"));
+                    let mut stop_daemon = false;
                     tokio::select! {
                         r = run_ci_once(
                             &auth_manager,
@@ -299,15 +308,20 @@ pub async fn dispatch(
                             &shell,
                             max_concurrent_api,
                             options.clone(),
+                            cycle_ctx.clone(),
                         ) => {
                             if let Err(err) = r {
                                 eprintln!("ci cycle failed: {err:#}");
                             }
                         }
                         _ = tokio::signal::ctrl_c() => {
-                            println!("received Ctrl+C, exiting ci daemon");
-                            break;
+                            stop_daemon = true;
+                            shutdown_cycle("ci", &cycle_ctx, SHUTDOWN_GRACE_SECS, None).await;
                         }
+                    }
+                    if stop_daemon {
+                        println!("received Ctrl+C, exiting ci daemon");
+                        break;
                     }
                     tokio::select! {
                         _ = sleep(Duration::from_secs(interval_secs)) => {}
@@ -339,6 +353,7 @@ pub async fn dispatch(
             } => {
                 let resolved_prompt = resolve_engine_prompt(engine_prompt, engine_prompt_file)?;
                 let resolved_engines = resolve_engine_specs(engines)?;
+                let once_ctx = Arc::new(TaskContext::new("review-once"));
                 let options = ReviewWorkflowOptions {
                     engine_specs: resolved_engines,
                     engine_prompt: resolved_prompt,
@@ -362,6 +377,7 @@ pub async fn dispatch(
                     &shell,
                     max_concurrent_api,
                     options,
+                    once_ctx,
                     None,
                 )
                 .await?;
@@ -478,6 +494,7 @@ pub async fn dispatch(
                                     Ok((owner, repo, pr_number)) => {
                                         let mut adhoc_opts = options.clone();
                                         adhoc_opts.status_tx = Some(status_tx.clone());
+                                        let adhoc_ctx = Arc::new(TaskContext::new("review-adhoc"));
                                         if let Err(err) = run_review_ad_hoc(
                                             &auth_manager,
                                             config_repo.as_ref(),
@@ -487,6 +504,7 @@ pub async fn dispatch(
                                             pr_number,
                                             max_concurrent_api,
                                             adhoc_opts,
+                                            adhoc_ctx,
                                         )
                                         .await
                                         {
@@ -581,6 +599,8 @@ pub async fn dispatch(
                         }
                     }
                     let _ = status_tx.send("cycle:start".to_string());
+                    let cycle_ctx = Arc::new(TaskContext::new("review-daemon-cycle"));
+                    let mut stop_daemon = false;
                     tokio::select! {
                         r = run_review_once(
                             &auth_manager,
@@ -592,6 +612,7 @@ pub async fn dispatch(
                                 skip_flag: Some(skip_flag.clone()),
                                 ..options.clone()
                             },
+                            cycle_ctx.clone(),
                             Some(&status_tx),
                         ) => {
                             if let Err(err) = r {
@@ -602,9 +623,19 @@ pub async fn dispatch(
                             }
                         }
                         _ = tokio::signal::ctrl_c() => {
-                            println!("received Ctrl+C, exiting daemon");
-                            break;
+                            stop_daemon = true;
+                            shutdown_cycle(
+                                "review",
+                                &cycle_ctx,
+                                SHUTDOWN_GRACE_SECS,
+                                Some(&status_tx),
+                            )
+                            .await;
                         }
+                    }
+                    if stop_daemon {
+                        println!("received Ctrl+C, exiting daemon");
+                        break;
                     }
 
                     if run_now {
@@ -650,6 +681,7 @@ pub async fn dispatch(
                     .with_context(|| format!("invalid GitHub PR URL: {pr_url}"))?;
                 let resolved_prompt = resolve_engine_prompt(engine_prompt, engine_prompt_file)?;
                 let resolved_engines = resolve_engine_specs(engines)?;
+                let adhoc_ctx = Arc::new(TaskContext::new("review-adhoc"));
                 let options = ReviewWorkflowOptions {
                     engine_specs: resolved_engines,
                     engine_prompt: resolved_prompt,
@@ -672,6 +704,7 @@ pub async fn dispatch(
                     pr_number,
                     max_concurrent_api,
                     options,
+                    adhoc_ctx,
                 )
                 .await?;
             }
@@ -685,12 +718,14 @@ pub async fn dispatch(
                         .with_context(|| format!("invalid GitHub PR URL: {pr_url}"))
                     {
                         Ok((owner, repo, pr_number)) => {
+                            let clean_ctx = Arc::new(TaskContext::new("review-clean"));
                             if let Err(err) = run_review_clean(
                                 &auth_manager,
                                 owner,
                                 repo,
                                 pr_number,
                                 max_concurrent_api,
+                                clean_ctx,
                             )
                             .await
                             {
@@ -712,4 +747,100 @@ pub async fn dispatch(
     }
 
     Ok(())
+}
+
+async fn shutdown_cycle(
+    kind: &str,
+    ctx: &Arc<TaskContext>,
+    grace_secs: u64,
+    status_tx: Option<&broadcast::Sender<String>>,
+) {
+    ctx.cancel();
+    if let Some(tx) = status_tx {
+        let _ = tx.send(format!(
+            "cycle:cancel_requested kind={} run_id={} cancel_reason=signal",
+            kind,
+            ctx.run_id()
+        ));
+    }
+    let initial_children = ctx.child_count().await;
+    let child_snapshot = ctx.list_children().await;
+    println!(
+        "shutdown:{} graceful_begin run_id={} in_flight_children={} cancel_reason=signal",
+        kind,
+        ctx.run_id(),
+        initial_children
+    );
+    for (pid, label) in child_snapshot {
+        println!("shutdown:{} child_pid={} {}", kind, pid, label);
+    }
+    if let Some(tx) = status_tx {
+        let _ = tx.send(format!(
+            "cycle:graceful_shutdown_begin kind={} run_id={} in_flight_children={} cancel_reason=signal",
+            kind,
+            ctx.run_id(),
+            initial_children
+        ));
+    }
+    if initial_children == 0 {
+        println!("shutdown:{} graceful_end in_flight_children=0", kind);
+        if let Some(tx) = status_tx {
+            let _ = tx.send(format!(
+                "cycle:graceful_shutdown_end kind={} run_id={} in_flight_children=0",
+                kind,
+                ctx.run_id()
+            ));
+        }
+        return;
+    }
+
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(grace_secs);
+    loop {
+        let remaining_children = ctx.child_count().await;
+        if remaining_children == 0 {
+            println!("shutdown:{} graceful_end in_flight_children=0", kind);
+            if let Some(tx) = status_tx {
+                let _ = tx.send(format!(
+                    "cycle:graceful_shutdown_end kind={} run_id={} in_flight_children=0",
+                    kind,
+                    ctx.run_id()
+                ));
+            }
+            return;
+        }
+
+        if tokio::time::Instant::now() >= deadline {
+            break;
+        }
+
+        tokio::select! {
+            _ = sleep(Duration::from_millis(200)) => {}
+            _ = tokio::signal::ctrl_c() => {
+                println!(
+                    "shutdown:{} second_ctrl_c immediate_force_kill cancel_reason=signal_second",
+                    kind
+                );
+                break;
+            }
+        }
+    }
+
+    println!("shutdown:{} force_kill_begin", kind);
+    if let Some(tx) = status_tx {
+        let _ = tx.send(format!(
+            "cycle:force_kill_begin kind={} run_id={} cancel_reason=signal",
+            kind,
+            ctx.run_id()
+        ));
+    }
+    let killed = ctx.kill_all_children().await;
+    println!("shutdown:{} force_kill_end killed_children={}", kind, killed);
+    if let Some(tx) = status_tx {
+        let _ = tx.send(format!(
+            "cycle:force_kill_end kind={} run_id={} killed_children={}",
+            kind,
+            ctx.run_id(),
+            killed
+        ));
+    }
 }

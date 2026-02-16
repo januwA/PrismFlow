@@ -1,8 +1,9 @@
 use std::fs;
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::time::Duration;
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, anyhow};
 use serde::Serialize;
 use tokio::sync::broadcast;
 
@@ -10,9 +11,11 @@ use crate::application::{
     agent_preflight::{panic_if_cli_agents_missing, panic_if_required_agents_missing},
     auth_manager::AuthManager,
     ci_workflow::{CiWorkflow, CiWorkflowOptions},
+    context::TaskContext,
     review_workflow::{RepoReviewStats, ReviewWorkflow, ReviewWorkflowOptions},
 };
 use crate::domain::ports::{ConfigRepository, GitHubRepository};
+use crate::domain::errors::DomainError;
 use crate::infrastructure::{
     github_adapter::OctocrabGitHubRepository, local_config_adapter::LocalConfigAdapter,
     shell_adapter::CommandShellAdapter,
@@ -23,19 +26,24 @@ pub async fn run_review_once(
     config_repo: &LocalConfigAdapter,
     shell: &CommandShellAdapter,
     max_concurrent_api: usize,
-    options: ReviewWorkflowOptions,
+    mut options: ReviewWorkflowOptions,
+    ctx: Arc<TaskContext>,
     status_tx: Option<&broadcast::Sender<String>>,
 ) -> Result<()> {
+    if ctx.is_cancelled() {
+        return Err(anyhow!(DomainError::CancelledBySignal));
+    }
     let config = config_repo.load_config()?;
     if config.repos.is_empty() {
         println!("no repositories configured");
         return Ok(());
     }
     panic_if_required_agents_missing(&config, &options, "review-once");
+    options.task_context = Some(ctx.clone());
 
     let github = github_client_for_action(auth_manager, max_concurrent_api, "review")?;
     let workflow = ReviewWorkflow::new(config_repo, &github, Some(shell), options);
-    let stats = run_with_heartbeat("review-once", workflow.review_once()).await?;
+    let stats = run_with_heartbeat("review-once", workflow.review_once(), &ctx).await?;
 
     if stats.is_empty() {
         println!("no repositories configured");
@@ -45,7 +53,8 @@ pub async fn run_review_once(
         for item in stats {
             if let Some(tx) = status_tx {
                 let _ = tx.send(format!(
-                    "repo={} processed={} skip_completed={} skip_processing={} skip_filtered={} skip_by_operator={} retryable_fail={} fatal_fail={} retryable_error={:?} fatal_error={:?}",
+                    "run_id={} repo={} processed={} skip_completed={} skip_processing={} skip_filtered={} skip_by_operator={} retryable_fail={} fatal_fail={} retryable_error={:?} fatal_error={:?}",
+                    ctx.run_id(),
                     item.repo,
                     item.processed,
                     item.skipped_completed,
@@ -84,16 +93,21 @@ pub async fn run_ci_once(
     config_repo: &LocalConfigAdapter,
     shell: &CommandShellAdapter,
     max_concurrent_api: usize,
-    options: CiWorkflowOptions,
+    mut options: CiWorkflowOptions,
+    ctx: Arc<TaskContext>,
 ) -> Result<()> {
+    if ctx.is_cancelled() {
+        return Err(anyhow!(DomainError::CancelledBySignal));
+    }
     if config_repo.load_config()?.repos.is_empty() {
         println!("no repositories configured");
         return Ok(());
     }
+    options.task_context = Some(ctx.clone());
 
     let github = github_client_for_action(auth_manager, max_concurrent_api, "ci")?;
     let workflow = CiWorkflow::new(config_repo, &github, shell, options);
-    let stats = run_with_heartbeat("ci-once", workflow.run_once()).await?;
+    let stats = run_with_heartbeat("ci-once", workflow.run_once(), &ctx).await?;
     if stats.is_empty() {
         println!("no repositories matched current filters");
     } else {
@@ -119,14 +133,20 @@ pub async fn run_review_ad_hoc(
     repo: &str,
     pr_number: u64,
     max_concurrent_api: usize,
-    options: ReviewWorkflowOptions,
+    mut options: ReviewWorkflowOptions,
+    ctx: Arc<TaskContext>,
 ) -> Result<()> {
+    if ctx.is_cancelled() {
+        return Err(anyhow!(DomainError::CancelledBySignal));
+    }
     panic_if_cli_agents_missing(&options, "review-ad-hoc");
+    options.task_context = Some(ctx.clone());
     let github = github_client_for_action(auth_manager, max_concurrent_api, "ad-hoc review")?;
     let workflow = ReviewWorkflow::new(config_repo, &github, Some(shell), options);
     let stats = run_with_heartbeat(
         "review-ad-hoc",
         workflow.review_ad_hoc(owner, repo, pr_number),
+        &ctx,
     )
     .await?;
 
@@ -157,7 +177,11 @@ pub async fn run_review_clean(
     repo: &str,
     pr_number: u64,
     max_concurrent_api: usize,
+    ctx: Arc<TaskContext>,
 ) -> Result<()> {
+    if ctx.is_cancelled() {
+        return Err(anyhow!(DomainError::CancelledBySignal));
+    }
     let github = github_client_for_action(auth_manager, max_concurrent_api, "clean")?;
     let me = github.current_user_login().await.ok();
     let issue_comments = github.list_issue_comments(owner, repo, pr_number).await?;
@@ -314,7 +338,7 @@ fn write_review_report(mode: &str, stats: &[RepoReviewStats]) -> Result<PathBuf>
     Ok(timestamped)
 }
 
-async fn run_with_heartbeat<T, F>(tag: &str, fut: F) -> Result<T>
+async fn run_with_heartbeat<T, F>(tag: &str, fut: F, ctx: &TaskContext) -> Result<T>
 where
     F: std::future::Future<Output = Result<T>>,
 {
@@ -330,6 +354,9 @@ where
             _ = interval.tick() => {
                 let secs = started.elapsed().as_secs();
                 println!("[WORKING] {tag} is still running... elapsed={}s", secs);
+            }
+            _ = ctx.cancelled() => {
+                return Err(anyhow!(DomainError::CancelledBySignal).context(format!("{tag} cancelled")));
             }
         }
     }

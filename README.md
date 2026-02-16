@@ -67,6 +67,21 @@ cargo run -- ci daemon --interval-secs 60 --engine gemini-cli "gemini -y -p \"$(
 
 ---
 
+## 取消与优雅关闭
+
+- `review daemon` / `ci daemon` 收到 `Ctrl+C` 后会触发协作取消：
+- 当前 cycle 的任务上下文会被标记为 `cancelled`
+- 正在执行的外部命令（`git clone/fetch/checkout`、引擎命令）会尝试终止
+
+- 关停采用两阶段：
+- 首次 `Ctrl+C`：进入宽限期（当前实现默认约 8 秒），等待任务自然收敛
+- 宽限期超时：强制结束仍存活的子进程
+- 宽限期期间再次 `Ctrl+C`：立即跳过等待并执行强制结束
+
+- 状态流会输出关停事件（例如 `cycle:cancel_requested`、`cycle:graceful_shutdown_begin/end`、`cycle:force_kill_begin/end`）。
+
+---
+
 ## 关键参数与占位符
 
 - `--shell "<path>"`：指定命令执行 shell（例如 `D:\apps\Git\bin\bash.exe`）
