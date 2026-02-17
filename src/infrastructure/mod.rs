@@ -1,3 +1,5 @@
+pub mod filesystem_adapter;
+pub mod git_adapter;
 pub mod github_adapter;
 pub mod github_factory;
 pub mod local_config_adapter;

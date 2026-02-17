@@ -1,5 +1,5 @@
-use std::fs;
 use std::net::SocketAddr;
+use std::path::PathBuf;
 use std::sync::{
     Arc,
     atomic::{AtomicBool, Ordering},
@@ -18,7 +18,8 @@ use crate::application::{
     usecases::{run_ci_once, run_review_ad_hoc, run_review_clean, run_review_once},
 };
 use crate::domain::ports::{
-    ConfigRepository, GitHubRepository, GitHubRepositoryFactory, ProcessManager, ShellAdapter,
+    ConfigRepository, FileSystem, GitHubRepository, GitHubRepositoryFactory, GitService,
+    ProcessManager, ShellAdapter,
 };
 use crate::interface::cli::{
     AuthSubcommand, CiSubcommand, Commands, RepoAgentSubcommand, RepoSubcommand, ReviewSubcommand,
@@ -36,6 +37,8 @@ pub async fn dispatch(
     shell: &dyn ShellAdapter,
     process_manager: &dyn ProcessManager,
     github_factory: &dyn GitHubRepositoryFactory,
+    fs: &dyn FileSystem,
+    git: &dyn GitService,
 ) -> Result<()> {
     match command {
         Commands::Repo(repo) => match repo.command {
@@ -213,6 +216,8 @@ pub async fn dispatch(
                     config_repo.as_ref(),
                     github.as_ref(),
                     None,
+                    fs,
+                    git,
                     ReviewWorkflowOptions {
                         include_repos: repos,
                         exclude_repos,
@@ -249,7 +254,7 @@ pub async fn dispatch(
                 repos,
                 exclude_repos,
             } => {
-                let resolved_prompt = resolve_engine_prompt(engine_prompt, engine_prompt_file)?;
+                let resolved_prompt = resolve_engine_prompt(fs, engine_prompt, engine_prompt_file)?;
                 let resolved_engines = resolve_engine_specs(engines)?;
                 let once_ctx = Arc::new(TaskContext::new("ci-once"));
                 let github = github_client_for_action(
@@ -262,6 +267,8 @@ pub async fn dispatch(
                     config_repo.as_ref(),
                     github.as_ref(),
                     shell,
+                    fs,
+                    git,
                     CiWorkflowOptions {
                         max_concurrent_repos,
                         engine_specs: resolved_engines,
@@ -290,7 +297,7 @@ pub async fn dispatch(
                 repos,
                 exclude_repos,
             } => {
-                let resolved_prompt = resolve_engine_prompt(engine_prompt, engine_prompt_file)?;
+                let resolved_prompt = resolve_engine_prompt(fs, engine_prompt, engine_prompt_file)?;
                 let options = CiWorkflowOptions {
                     max_concurrent_repos,
                     engine_specs: resolve_engine_specs(engines)?,
@@ -317,6 +324,8 @@ pub async fn dispatch(
                             config_repo.as_ref(),
                             github.as_ref(),
                             shell,
+                            fs,
+                            git,
                             options.clone(),
                             cycle_ctx.clone(),
                         ) => {
@@ -368,7 +377,7 @@ pub async fn dispatch(
                 repos,
                 exclude_repos,
             } => {
-                let resolved_prompt = resolve_engine_prompt(engine_prompt, engine_prompt_file)?;
+                let resolved_prompt = resolve_engine_prompt(fs, engine_prompt, engine_prompt_file)?;
                 let resolved_engines = resolve_engine_specs(engines)?;
                 let once_ctx = Arc::new(TaskContext::new("review-once"));
                 let options = ReviewWorkflowOptions {
@@ -398,6 +407,8 @@ pub async fn dispatch(
                     config_repo.as_ref(),
                     github.as_ref(),
                     shell,
+                    fs,
+                    git,
                     options,
                     once_ctx,
                     None,
@@ -425,7 +436,7 @@ pub async fn dispatch(
                 repos,
                 exclude_repos,
             } => {
-                let resolved_prompt = resolve_engine_prompt(engine_prompt, engine_prompt_file)?;
+                let resolved_prompt = resolve_engine_prompt(fs, engine_prompt, engine_prompt_file)?;
                 let resolved_engines = resolve_engine_specs(engines)?;
                 let mut options = ReviewWorkflowOptions {
                     engine_specs: resolved_engines,
@@ -535,6 +546,8 @@ pub async fn dispatch(
                                             config_repo.as_ref(),
                                             github.as_ref(),
                                             shell,
+                                            fs,
+                                            git,
                                             owner,
                                             repo,
                                             pr_number,
@@ -647,6 +660,8 @@ pub async fn dispatch(
                             config_repo.as_ref(),
                             github.as_ref(),
                             shell,
+                            fs,
+                            git,
                             ReviewWorkflowOptions {
                                 status_tx: Some(status_tx.clone()),
                                 skip_flag: Some(skip_flag.clone()),
@@ -720,7 +735,7 @@ pub async fn dispatch(
             } => {
                 let (owner, repo, pr_number) = parse_github_pr_url(&pr_url)
                     .with_context(|| format!("invalid GitHub PR URL: {pr_url}"))?;
-                let resolved_prompt = resolve_engine_prompt(engine_prompt, engine_prompt_file)?;
+                let resolved_prompt = resolve_engine_prompt(fs, engine_prompt, engine_prompt_file)?;
                 let resolved_engines = resolve_engine_specs(engines)?;
                 let adhoc_ctx = Arc::new(TaskContext::new("review-adhoc"));
                 let options = ReviewWorkflowOptions {
@@ -746,6 +761,8 @@ pub async fn dispatch(
                     config_repo.as_ref(),
                     github.as_ref(),
                     shell,
+                    fs,
+                    git,
                     owner,
                     repo,
                     pr_number,
@@ -864,6 +881,7 @@ fn parse_github_pr_url(url: &str) -> Result<(&str, &str, u64)> {
 }
 
 fn resolve_engine_prompt(
+    fs: &dyn FileSystem,
     engine_prompt: Option<String>,
     engine_prompt_file: Option<String>,
 ) -> Result<Option<String>> {
@@ -872,7 +890,8 @@ fn resolve_engine_prompt(
     }
 
     if let Some(file) = engine_prompt_file {
-        let content = fs::read_to_string(&file)
+        let content = fs
+            .read_to_string(&PathBuf::from(&file))
             .with_context(|| format!("failed to read engine prompt file: {file}"))?;
         return Ok(Some(content));
     }

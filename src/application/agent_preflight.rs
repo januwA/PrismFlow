@@ -2,10 +2,11 @@ use std::collections::BTreeSet;
 
 use crate::{
     application::review_workflow::{ReviewWorkflowOptions, ensure_agent_prompts_available},
-    domain::entities::AppConfig,
+    domain::{entities::AppConfig, ports::FileSystem},
 };
 
 pub fn panic_if_required_agents_missing(
+    fs: &dyn FileSystem,
     config: &AppConfig,
     options: &ReviewWorkflowOptions,
     context: &str,
@@ -14,7 +15,7 @@ pub fn panic_if_required_agents_missing(
     if required.is_empty() {
         return;
     }
-    if let Err(err) = ensure_agent_prompts_available(&required, &options.agent_prompt_dirs) {
+    if let Err(err) = ensure_agent_prompts_available(fs, &required, &options.agent_prompt_dirs) {
         panic!(
             "{context}: missing required agent prompts for [{}]: {err:#}",
             required.join(", ")
@@ -22,12 +23,16 @@ pub fn panic_if_required_agents_missing(
     }
 }
 
-pub fn panic_if_cli_agents_missing(options: &ReviewWorkflowOptions, context: &str) {
+pub fn panic_if_cli_agents_missing(
+    fs: &dyn FileSystem,
+    options: &ReviewWorkflowOptions,
+    context: &str,
+) {
     let required = dedup_agents(&options.cli_agents);
     if required.is_empty() {
         return;
     }
-    if let Err(err) = ensure_agent_prompts_available(&required, &options.agent_prompt_dirs) {
+    if let Err(err) = ensure_agent_prompts_available(fs, &required, &options.agent_prompt_dirs) {
         panic!(
             "{context}: missing required agent prompts for [{}]: {err:#}",
             required.join(", ")

@@ -1,4 +1,4 @@
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use anyhow::Result;
 use async_trait::async_trait;
@@ -174,5 +174,39 @@ pub trait GitHubRepository: Send + Sync {
         pull_number: u64,
         review_id: u64,
         message: &str,
+    ) -> Result<()>;
+}
+
+pub trait FileSystem: Send + Sync {
+    fn create_dir_all(&self, path: &Path) -> Result<()>;
+    fn write(&self, path: &Path, content: &[u8]) -> Result<()>;
+    fn read_to_string(&self, path: &Path) -> Result<String>;
+    fn remove_file(&self, path: &Path) -> Result<()>;
+    fn current_dir(&self) -> Result<PathBuf>;
+    fn config_dir(&self) -> Option<PathBuf>;
+    fn exists(&self, path: &Path) -> bool;
+}
+
+#[async_trait]
+pub trait GitService: Send + Sync {
+    async fn clone_repo(
+        &self,
+        url: &str,
+        target_dir: &Path,
+        ctx: Option<&dyn CommandContext>,
+    ) -> Result<()>;
+    async fn fetch(
+        &self,
+        target_dir: &Path,
+        remote: &str,
+        refspec: &str,
+        depth: usize,
+        ctx: Option<&dyn CommandContext>,
+    ) -> Result<()>;
+    async fn checkout(
+        &self,
+        target_dir: &Path,
+        rev: &str,
+        ctx: Option<&dyn CommandContext>,
     ) -> Result<()>;
 }

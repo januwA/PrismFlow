@@ -1,6 +1,5 @@
 use std::{
     collections::HashSet,
-    fs,
     path::PathBuf,
     sync::{
         Arc,
@@ -9,11 +8,10 @@ use std::{
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
-use anyhow::{Result, anyhow};
+use anyhow::{Context, Result, anyhow};
 use futures::stream::{self, StreamExt};
 use serde::Serialize;
 use sha2::{Digest, Sha256};
-use tokio::process::Command;
 use tokio::sync::broadcast;
 use tokio::time::sleep;
 
@@ -24,7 +22,9 @@ use crate::domain::{
         ReviewFilterConfig,
     },
     errors::DomainError,
-    ports::{CommandContext, ConfigRepository, GitHubRepository, ShellAdapter},
+    ports::{
+        CommandContext, ConfigRepository, FileSystem, GitHubRepository, GitService, ShellAdapter,
+    },
 };
 
 const MAX_INLINE_COMMENTS: usize = 20;
@@ -124,6 +124,8 @@ pub struct ReviewWorkflow<'a> {
     config_repo: &'a dyn ConfigRepository,
     github: &'a dyn GitHubRepository,
     shell: Option<&'a dyn ShellAdapter>,
+    fs: &'a dyn FileSystem,
+    git: &'a dyn GitService,
     engine_fingerprint: String,
     options: ReviewWorkflowOptions,
     next_engine_idx: AtomicUsize,
@@ -134,6 +136,8 @@ impl<'a> ReviewWorkflow<'a> {
         config_repo: &'a dyn ConfigRepository,
         github: &'a dyn GitHubRepository,
         shell: Option<&'a dyn ShellAdapter>,
+        fs: &'a dyn FileSystem,
+        git: &'a dyn GitService,
         options: ReviewWorkflowOptions,
     ) -> Self {
         let workflow_fp = workflow_engine_fingerprint(&options.engine_specs);
@@ -141,6 +145,8 @@ impl<'a> ReviewWorkflow<'a> {
             config_repo,
             github,
             shell,
+            fs,
+            git,
             engine_fingerprint: workflow_fp,
             options,
             next_engine_idx: AtomicUsize::new(0),
@@ -550,18 +556,16 @@ impl<'a> ReviewWorkflow<'a> {
                 .get_pull_request_git_context(owner, repo, pr.number)
                 .await
             {
-                if let Ok(repo_dir) = prepare_repo_checkout(
-                    self.options.task_context.as_deref(),
-                    &ctx.head_clone_url,
-                    &ctx.head_sha,
-                    &ctx.head_ref,
-                    owner,
-                    repo,
-                    pr.number,
-                    &self.options.clone_workspace_dir,
-                    self.options.clone_depth,
-                )
-                .await
+                if let Ok(repo_dir) = self
+                    .prepare_repo_checkout(
+                        &ctx.head_clone_url,
+                        &ctx.head_sha,
+                        &ctx.head_ref,
+                        owner,
+                        repo,
+                        pr.number,
+                    )
+                    .await
                 {
                     repo_dir_for_shell = Some(repo_dir.to_string_lossy().to_string());
                     repo_head_ref_for_shell = ctx.head_ref;
@@ -705,6 +709,63 @@ impl<'a> ReviewWorkflow<'a> {
         }
     }
 
+    async fn prepare_repo_checkout(
+        &self,
+        clone_url: &str,
+        head_sha: &str,
+        head_ref: &str,
+        owner: &str,
+        repo: &str,
+        pr_number: u64,
+    ) -> Result<PathBuf> {
+        let cwd = self.fs.current_dir()?;
+        let root = cwd.join(&self.options.clone_workspace_dir);
+        self.fs.create_dir_all(&root)?;
+        let dir_name = format!(
+            "{}_{}_pr{}_{}",
+            owner.replace('/', "_"),
+            repo.replace('/', "_"),
+            pr_number,
+            &head_sha.chars().take(12).collect::<String>()
+        );
+        let target = root.join(dir_name);
+
+        // We use GitService here
+        let ctx = self
+            .options
+            .task_context
+            .as_deref()
+            .map(|c| c as &dyn CommandContext);
+
+        if !self.fs.exists(&target.join(".git")) {
+            self.git
+                .clone_repo(clone_url, &target, ctx)
+                .await
+                .context("git clone failed")?;
+        }
+
+        // Fetch by sha
+        if let Err(_) = self
+            .git
+            .fetch(&target, "origin", head_sha, self.options.clone_depth, ctx)
+            .await
+        {
+            // fallback fetch by ref
+            let refspec = format!("refs/heads/{head_ref}");
+            self.git
+                .fetch(&target, "origin", &refspec, self.options.clone_depth, ctx)
+                .await
+                .context("git fetch by ref failed")?;
+        }
+
+        self.git
+            .checkout(&target, head_sha, ctx)
+            .await
+            .context("git checkout failed")?;
+
+        Ok(target)
+    }
+
     async fn with_retry<T, F, Fut>(&self, mut op: F) -> Result<T>
     where
         F: FnMut() -> Fut,
@@ -836,7 +897,7 @@ impl<'a> ReviewWorkflow<'a> {
             sections.push(p.clone());
         }
 
-        let loaded = load_agent_prompts(agents, &self.options.agent_prompt_dirs)?;
+        let loaded = self.load_agent_prompts(agents, &self.options.agent_prompt_dirs)?;
         if !loaded.is_empty() {
             sections.push(loaded);
         }
@@ -846,6 +907,57 @@ impl<'a> ReviewWorkflow<'a> {
         } else {
             Ok(Some(sections.join("\n\n")))
         }
+    }
+
+    fn load_agent_prompts(&self, agents: &[String], extra_dirs: &[String]) -> Result<String> {
+        if agents.is_empty() {
+            return Ok(String::new());
+        }
+
+        let mut bases: Vec<PathBuf> = extra_dirs
+            .iter()
+            .map(|d| PathBuf::from(d.trim()))
+            .filter(|p| !p.as_os_str().is_empty())
+            .collect();
+        let cwd = self.fs.current_dir().unwrap_or_else(|_| PathBuf::from("."));
+        bases.push(cwd.join(".prismflow").join("prompts"));
+        if let Some(config_dir) = self.fs.config_dir() {
+            bases.push(config_dir.join("pr-reviewer").join("prompts"));
+        }
+
+        let mut sections = Vec::new();
+        for agent in agents {
+            let file_name = format!("{agent}.md");
+            let mut checked: Vec<PathBuf> = Vec::new();
+            let mut loaded = None;
+            for base in &bases {
+                let path = base.join(&file_name);
+                checked.push(path.clone());
+                if self.fs.exists(&path) {
+                    let content = self.fs.read_to_string(&path).map_err(|e| {
+                        anyhow!("failed to read agent prompt file {}: {}", path.display(), e)
+                    })?;
+                    loaded = Some(content);
+                    break;
+                }
+            }
+            match loaded {
+                Some(content) => sections.push(format!("# Agent: {agent}\n{content}")),
+                None => {
+                    let checked_str = checked
+                        .iter()
+                        .map(|p| p.display().to_string())
+                        .collect::<Vec<_>>()
+                        .join(" ; ");
+                    return Err(anyhow!(
+                        "agent prompt file missing: checked {}",
+                        checked_str
+                    ));
+                }
+            }
+        }
+
+        Ok(sections.join("\n\n"))
     }
 
     async fn analyze_review(
@@ -866,13 +978,14 @@ impl<'a> ReviewWorkflow<'a> {
         let mut command = selected_engine.command.clone();
 
         let patch = build_patch_dump(owner, repo, pr_number, head_sha, files);
-        let patch_file = write_temp_patch_file(&format!("{owner}/{repo}"), pr_number, &patch)?;
+        let patch_file =
+            self.write_temp_patch_file(&format!("{owner}/{repo}"), pr_number, &patch)?;
         let agents_payload = effective_prompt.unwrap_or_default();
         let agents_file =
-            write_temp_agents_file(&format!("{owner}/{repo}"), pr_number, agents_payload)?;
+            self.write_temp_agents_file(&format!("{owner}/{repo}"), pr_number, agents_payload)?;
         let files_payload = build_changed_files_list(owner, repo, pr_number, head_sha, files);
         let changed_files_file =
-            write_temp_files_file(&format!("{owner}/{repo}"), pr_number, &files_payload)?;
+            self.write_temp_files_file(&format!("{owner}/{repo}"), pr_number, &files_payload)?;
         let patch_file_str = patch_file.to_string_lossy().to_string();
         let agents_file_str = agents_file.to_string_lossy().to_string();
         let changed_files_file_str = changed_files_file.to_string_lossy().to_string();
@@ -895,17 +1008,17 @@ impl<'a> ReviewWorkflow<'a> {
         {
             Ok(v) => {
                 if !self.options.keep_diff_files {
-                    let _ = fs::remove_file(&patch_file);
-                    let _ = fs::remove_file(&agents_file);
-                    let _ = fs::remove_file(&changed_files_file);
+                    let _ = self.fs.remove_file(&patch_file);
+                    let _ = self.fs.remove_file(&agents_file);
+                    let _ = self.fs.remove_file(&changed_files_file);
                 }
                 v
             }
             Err(e) => {
                 if !self.options.keep_diff_files {
-                    let _ = fs::remove_file(&patch_file);
-                    let _ = fs::remove_file(&agents_file);
-                    let _ = fs::remove_file(&changed_files_file);
+                    let _ = self.fs.remove_file(&patch_file);
+                    let _ = self.fs.remove_file(&agents_file);
+                    let _ = self.fs.remove_file(&changed_files_file);
                 }
                 return Err(e);
             }
@@ -929,6 +1042,39 @@ impl<'a> ReviewWorkflow<'a> {
             summary,
             inline_comments,
         })
+    }
+
+    fn write_temp_patch_file(&self, repo: &str, pr_number: u64, content: &str) -> Result<PathBuf> {
+        let cwd = self.fs.current_dir().unwrap_or_else(|_| PathBuf::from("."));
+        let root = cwd.join(".prismflow").join("tmp-diffs");
+        self.fs.create_dir_all(&root)?;
+
+        let sanitized = repo.replace('/', "_");
+        let path = root.join(format!("prismflow_{}_{}_patch.diff", sanitized, pr_number));
+        self.fs.write(&path, content.as_bytes())?;
+        Ok(path)
+    }
+
+    fn write_temp_agents_file(&self, repo: &str, pr_number: u64, content: &str) -> Result<PathBuf> {
+        let cwd = self.fs.current_dir().unwrap_or_else(|_| PathBuf::from("."));
+        let root = cwd.join(".prismflow").join("tmp-diffs");
+        self.fs.create_dir_all(&root)?;
+
+        let sanitized = repo.replace('/', "_");
+        let path = root.join(format!("prismflow_{}_{}_agents.txt", sanitized, pr_number));
+        self.fs.write(&path, content.as_bytes())?;
+        Ok(path)
+    }
+
+    fn write_temp_files_file(&self, repo: &str, pr_number: u64, content: &str) -> Result<PathBuf> {
+        let cwd = self.fs.current_dir().unwrap_or_else(|_| PathBuf::from("."));
+        let root = cwd.join(".prismflow").join("tmp-diffs");
+        self.fs.create_dir_all(&root)?;
+
+        let sanitized = repo.replace('/', "_");
+        let path = root.join(format!("prismflow_{}_{}_files.txt", sanitized, pr_number));
+        self.fs.write(&path, content.as_bytes())?;
+        Ok(path)
     }
 
     fn pick_engine_for_pr(&self) -> Result<EngineSpec> {
@@ -1010,136 +1156,6 @@ fn parse_github_repo_like_url(input: &str) -> Option<String> {
         return None;
     }
     Some(format!("{owner}/{repo}"))
-}
-
-async fn prepare_repo_checkout(
-    task_ctx: Option<&TaskContext>,
-    clone_url: &str,
-    head_sha: &str,
-    head_ref: &str,
-    owner: &str,
-    repo: &str,
-    pr_number: u64,
-    workspace_dir: &str,
-    clone_depth: usize,
-) -> Result<PathBuf> {
-    let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
-    let root = cwd.join(workspace_dir);
-    fs::create_dir_all(&root)?;
-    let dir_name = format!(
-        "{}_{}_pr{}_{}",
-        owner.replace('/', "_"),
-        repo.replace('/', "_"),
-        pr_number,
-        &head_sha.chars().take(12).collect::<String>()
-    );
-    let target = root.join(dir_name);
-    let target_str = target.to_string_lossy().to_string();
-    let depth_str = clone_depth.max(1).to_string();
-    if !target.join(".git").exists() {
-        let status = run_git_command(
-            task_ctx,
-            &["clone", "--no-checkout", clone_url, &target_str],
-            None,
-            "git clone",
-        )
-        .await?;
-        if !status.success() {
-            anyhow::bail!("git clone failed for {}", clone_url);
-        }
-    }
-    let fetch_status = run_git_command(
-        task_ctx,
-        &[
-            "-C",
-            &target_str,
-            "fetch",
-            "--depth",
-            &depth_str,
-            "origin",
-            head_sha,
-        ],
-        None,
-        "git fetch by sha",
-    )
-    .await?;
-    if !fetch_status.success() {
-        let refspec = format!("refs/heads/{head_ref}");
-        let fetch_ref_status = run_git_command(
-            task_ctx,
-            &[
-                "-C",
-                &target_str,
-                "fetch",
-                "--depth",
-                &depth_str,
-                "origin",
-                &refspec,
-            ],
-            None,
-            "git fetch by ref",
-        )
-        .await?;
-        if !fetch_ref_status.success() {
-            anyhow::bail!("git fetch failed for sha={} ref={}", head_sha, head_ref);
-        }
-    }
-    let checkout_status = run_git_command(
-        task_ctx,
-        &["-C", &target_str, "checkout", "--force", head_sha],
-        None,
-        "git checkout",
-    )
-    .await?;
-    if !checkout_status.success() {
-        anyhow::bail!("git checkout failed for sha={}", head_sha);
-    }
-    Ok(target)
-}
-
-async fn run_git_command(
-    task_ctx: Option<&TaskContext>,
-    args: &[&str],
-    workdir: Option<&str>,
-    label: &str,
-) -> Result<std::process::ExitStatus> {
-    let mut cmd = Command::new("git");
-    cmd.args(args);
-    if let Some(dir) = workdir {
-        cmd.current_dir(dir);
-    }
-    let mut child = cmd.spawn()?;
-    let pid = child.id();
-    if let (Some(ctx), Some(pid)) = (task_ctx, pid) {
-        let fp = command_fingerprint(args);
-        ctx.register_child(pid, format!("command_fingerprint={} {}", fp, label))
-            .await;
-    }
-    let status = if let Some(ctx) = task_ctx {
-        tokio::select! {
-            s = child.wait() => s?,
-            _ = ctx.cancelled() => {
-                let _ = child.kill().await;
-                if let (Some(ctx), Some(pid)) = (task_ctx, pid) {
-                    ctx.unregister_child(pid).await;
-                }
-                anyhow::bail!(DomainError::CancelledBySignal);
-            }
-        }
-    } else {
-        child.wait().await?
-    };
-    if let (Some(ctx), Some(pid)) = (task_ctx, pid) {
-        ctx.unregister_child(pid).await;
-    }
-    Ok(status)
-}
-
-fn command_fingerprint(args: &[&str]) -> String {
-    let mut hasher = Sha256::new();
-    hasher.update(args.join(" ").as_bytes());
-    let hex = hex::encode(hasher.finalize());
-    hex.chars().take(12).collect()
 }
 
 #[derive(Debug)]
@@ -1401,28 +1417,6 @@ fn build_patch_dump(
     out
 }
 
-fn write_temp_patch_file(repo: &str, pr_number: u64, content: &str) -> Result<PathBuf> {
-    let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
-    let root = cwd.join(".prismflow").join("tmp-diffs");
-    fs::create_dir_all(&root)?;
-
-    let sanitized = repo.replace('/', "_");
-    let path = root.join(format!("prismflow_{}_{}_patch.diff", sanitized, pr_number));
-    fs::write(&path, content)?;
-    Ok(path)
-}
-
-fn write_temp_agents_file(repo: &str, pr_number: u64, content: &str) -> Result<PathBuf> {
-    let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
-    let root = cwd.join(".prismflow").join("tmp-diffs");
-    fs::create_dir_all(&root)?;
-
-    let sanitized = repo.replace('/', "_");
-    let path = root.join(format!("prismflow_{}_{}_agents.txt", sanitized, pr_number));
-    fs::write(&path, content)?;
-    Ok(path)
-}
-
 fn build_changed_files_list(
     owner: &str,
     repo: &str,
@@ -1440,17 +1434,6 @@ fn build_changed_files_list(
         out.push('\n');
     }
     out
-}
-
-fn write_temp_files_file(repo: &str, pr_number: u64, content: &str) -> Result<PathBuf> {
-    let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
-    let root = cwd.join(".prismflow").join("tmp-diffs");
-    fs::create_dir_all(&root)?;
-
-    let sanitized = repo.replace('/', "_");
-    let path = root.join(format!("prismflow_{}_{}_files.txt", sanitized, pr_number));
-    fs::write(&path, content)?;
-    Ok(path)
 }
 
 fn parse_shell_inline_comments(output: &str) -> Vec<ReviewComment> {
@@ -1487,12 +1470,20 @@ fn likely_unusable_shell_output(output: &str) -> bool {
     bad_hints.iter().any(|h| lower.contains(h))
 }
 
-pub fn ensure_agent_prompts_available(agents: &[String], extra_dirs: &[String]) -> Result<()> {
-    let _ = load_agent_prompts(agents, extra_dirs)?;
+pub fn ensure_agent_prompts_available(
+    fs: &dyn FileSystem,
+    agents: &[String],
+    extra_dirs: &[String],
+) -> Result<()> {
+    let _ = load_agent_prompts_shim(fs, agents, extra_dirs)?;
     Ok(())
 }
 
-fn load_agent_prompts(agents: &[String], extra_dirs: &[String]) -> Result<String> {
+fn load_agent_prompts_shim(
+    fs: &dyn FileSystem,
+    agents: &[String],
+    extra_dirs: &[String],
+) -> Result<String> {
     if agents.is_empty() {
         return Ok(String::new());
     }
@@ -1502,18 +1493,11 @@ fn load_agent_prompts(agents: &[String], extra_dirs: &[String]) -> Result<String
         .map(|d| PathBuf::from(d.trim()))
         .filter(|p| !p.as_os_str().is_empty())
         .collect();
-    bases.push(
-        std::env::current_dir()
-            .unwrap_or_else(|_| PathBuf::from("."))
-            .join(".prismflow")
-            .join("prompts"),
-    );
-    bases.push(
-        dirs::config_dir()
-            .unwrap_or_else(|| PathBuf::from("."))
-            .join("pr-reviewer")
-            .join("prompts"),
-    );
+    let cwd = fs.current_dir().unwrap_or_else(|_| PathBuf::from("."));
+    bases.push(cwd.join(".prismflow").join("prompts"));
+    if let Some(config_dir) = fs.config_dir() {
+        bases.push(config_dir.join("pr-reviewer").join("prompts"));
+    }
 
     let mut sections = Vec::new();
     for agent in agents {
@@ -1523,8 +1507,8 @@ fn load_agent_prompts(agents: &[String], extra_dirs: &[String]) -> Result<String
         for base in &bases {
             let path = base.join(&file_name);
             checked.push(path.clone());
-            if path.exists() {
-                let content = fs::read_to_string(&path).map_err(|e| {
+            if fs.exists(&path) {
+                let content = fs.read_to_string(&path).map_err(|e| {
                     anyhow!("failed to read agent prompt file {}: {}", path.display(), e)
                 })?;
                 loaded = Some(content);
@@ -2084,7 +2068,112 @@ mod tests {
         }
     }
 
+    struct MockFileSystem;
+    impl FileSystem for MockFileSystem {
+        fn create_dir_all(&self, _path: &std::path::Path) -> Result<()> {
+            Ok(())
+        }
+        fn write(&self, _path: &std::path::Path, _content: &[u8]) -> Result<()> {
+            Ok(())
+        }
+        fn read_to_string(&self, _path: &std::path::Path) -> Result<String> {
+            Ok(String::new())
+        }
+        fn remove_file(&self, _path: &std::path::Path) -> Result<()> {
+            Ok(())
+        }
+        fn current_dir(&self) -> Result<std::path::PathBuf> {
+            Ok(std::path::PathBuf::from("."))
+        }
+        fn config_dir(&self) -> Option<std::path::PathBuf> {
+            None
+        }
+        fn exists(&self, _path: &std::path::Path) -> bool {
+            false
+        }
+    }
+
+    struct MockGit;
+    #[async_trait::async_trait]
+    impl GitService for MockGit {
+        async fn clone_repo(
+            &self,
+            _url: &str,
+            _target_dir: &std::path::Path,
+            _ctx: Option<&dyn CommandContext>,
+        ) -> Result<()> {
+            Ok(())
+        }
+        async fn fetch(
+            &self,
+            _target_dir: &std::path::Path,
+            _remote: &str,
+            _refspec: &str,
+            _depth: usize,
+            _ctx: Option<&dyn CommandContext>,
+        ) -> Result<()> {
+            Ok(())
+        }
+        async fn checkout(
+            &self,
+            _target_dir: &std::path::Path,
+            _rev: &str,
+            _ctx: Option<&dyn CommandContext>,
+        ) -> Result<()> {
+            Ok(())
+        }
+    }
+
+    #[derive(Default)]
+    struct RecordingGit {
+        fetch_calls: Mutex<Vec<String>>,
+        checkout_calls: Mutex<Vec<String>>,
+    }
+
+    #[async_trait::async_trait]
+    impl GitService for RecordingGit {
+        async fn clone_repo(
+            &self,
+            _url: &str,
+            _target_dir: &std::path::Path,
+            _ctx: Option<&dyn CommandContext>,
+        ) -> Result<()> {
+            Ok(())
+        }
+
+        async fn fetch(
+            &self,
+            _target_dir: &std::path::Path,
+            _remote: &str,
+            refspec: &str,
+            _depth: usize,
+            _ctx: Option<&dyn CommandContext>,
+        ) -> Result<()> {
+            let mut calls = self.fetch_calls.lock().expect("lock fetch_calls");
+            calls.push(refspec.to_string());
+            if calls.len() == 1 {
+                return Err(anyhow!("fetch by sha failed"));
+            }
+            Ok(())
+        }
+
+        async fn checkout(
+            &self,
+            _target_dir: &std::path::Path,
+            rev: &str,
+            _ctx: Option<&dyn CommandContext>,
+        ) -> Result<()> {
+            self.checkout_calls
+                .lock()
+                .expect("lock checkout_calls")
+                .push(rev.to_string());
+            Ok(())
+        }
+    }
+
     static MOCK_SHELL: MockShell = MockShell;
+    static MOCK_FS: MockFileSystem = MockFileSystem;
+    static MOCK_GIT: MockGit = MockGit;
 
     fn normalize_test_opts(mut opts: ReviewWorkflowOptions) -> ReviewWorkflowOptions {
         if opts.engine_specs.is_empty() {
@@ -2101,7 +2190,14 @@ mod tests {
         gh: &'a MockGitHub,
         opts: ReviewWorkflowOptions,
     ) -> ReviewWorkflow<'a> {
-        ReviewWorkflow::new(cfg, gh, Some(&MOCK_SHELL), normalize_test_opts(opts))
+        ReviewWorkflow::new(
+            cfg,
+            gh,
+            Some(&MOCK_SHELL),
+            &MOCK_FS,
+            &MOCK_GIT,
+            normalize_test_opts(opts),
+        )
     }
 
     fn workflow_with_shell<'a>(
@@ -2110,7 +2206,14 @@ mod tests {
         shell: &'a dyn ShellAdapter,
         opts: ReviewWorkflowOptions,
     ) -> ReviewWorkflow<'a> {
-        ReviewWorkflow::new(cfg, gh, Some(shell), normalize_test_opts(opts))
+        ReviewWorkflow::new(
+            cfg,
+            gh,
+            Some(shell),
+            &MOCK_FS,
+            &MOCK_GIT,
+            normalize_test_opts(opts),
+        )
     }
 
     struct CancelAwareShell;
@@ -2142,6 +2245,50 @@ mod tests {
         ) -> Result<String> {
             self.run_command_line("", ctx).await
         }
+    }
+
+    #[tokio::test]
+    async fn prepare_repo_checkout_falls_back_to_ref_fetch_when_sha_fetch_fails() {
+        let github = MockGitHub::default();
+        let config = InMemoryConfigRepo::new(config_with_repo());
+        let git = RecordingGit::default();
+        let workflow = ReviewWorkflow::new(
+            &config,
+            &github,
+            Some(&MOCK_SHELL),
+            &MOCK_FS,
+            &git,
+            normalize_test_opts(ReviewWorkflowOptions {
+                clone_workspace_dir: ".prismflow/test-review-cache".to_string(),
+                clone_depth: 1,
+                ..ReviewWorkflowOptions::default()
+            }),
+        );
+
+        let repo_dir = workflow
+            .prepare_repo_checkout(
+                "https://github.com/owner/repo.git",
+                "abc123",
+                "main",
+                "owner",
+                "repo",
+                7,
+            )
+            .await
+            .expect("prepare_repo_checkout should succeed with fallback fetch");
+
+        let fetch_calls = git.fetch_calls.lock().expect("lock fetch_calls").clone();
+        assert_eq!(fetch_calls.len(), 2);
+        assert_eq!(fetch_calls[0], "abc123");
+        assert_eq!(fetch_calls[1], "refs/heads/main");
+
+        let checkout_calls = git
+            .checkout_calls
+            .lock()
+            .expect("lock checkout_calls")
+            .clone();
+        assert_eq!(checkout_calls, vec!["abc123".to_string()]);
+        assert!(repo_dir.to_string_lossy().contains("owner_repo_pr7_abc123"));
     }
 
     #[tokio::test]

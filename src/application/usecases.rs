@@ -1,4 +1,3 @@
-use std::fs;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
@@ -14,12 +13,16 @@ use crate::application::{
     review_workflow::{RepoReviewStats, ReviewWorkflow, ReviewWorkflowOptions},
 };
 use crate::domain::errors::DomainError;
-use crate::domain::ports::{ConfigRepository, GitHubRepository, ShellAdapter};
+use crate::domain::ports::{
+    ConfigRepository, FileSystem, GitHubRepository, GitService, ShellAdapter,
+};
 
 pub async fn run_review_once(
     config_repo: &dyn ConfigRepository,
     github: &dyn GitHubRepository,
     shell: &dyn ShellAdapter,
+    fs: &dyn FileSystem,
+    git: &dyn GitService,
     mut options: ReviewWorkflowOptions,
     ctx: Arc<TaskContext>,
     status_tx: Option<&broadcast::Sender<String>>,
@@ -32,16 +35,16 @@ pub async fn run_review_once(
         println!("no repositories configured");
         return Ok(());
     }
-    panic_if_required_agents_missing(&config, &options, "review-once");
+    panic_if_required_agents_missing(fs, &config, &options, "review-once");
     options.task_context = Some(ctx.clone());
 
-    let workflow = ReviewWorkflow::new(config_repo, github, Some(shell), options);
+    let workflow = ReviewWorkflow::new(config_repo, github, Some(shell), fs, git, options);
     let stats = run_with_heartbeat("review-once", workflow.review_once(), &ctx).await?;
 
     if stats.is_empty() {
         println!("no repositories configured");
     } else {
-        let report_path = write_review_report("review-once", &stats)?;
+        let report_path = write_review_report(fs, "review-once", &stats)?;
         println!("report_file={}", report_path.display());
         for item in stats {
             if let Some(tx) = status_tx {
@@ -85,6 +88,8 @@ pub async fn run_ci_once(
     config_repo: &dyn ConfigRepository,
     github: &dyn GitHubRepository,
     shell: &dyn ShellAdapter,
+    fs: &dyn FileSystem,
+    git: &dyn GitService,
     mut options: CiWorkflowOptions,
     ctx: Arc<TaskContext>,
 ) -> Result<()> {
@@ -97,7 +102,7 @@ pub async fn run_ci_once(
     }
     options.task_context = Some(ctx.clone());
 
-    let workflow = CiWorkflow::new(config_repo, github, shell, options);
+    let workflow = CiWorkflow::new(config_repo, github, shell, fs, git, options);
     let stats = run_with_heartbeat("ci-once", workflow.run_once(), &ctx).await?;
     if stats.is_empty() {
         println!("no repositories matched current filters");
@@ -120,6 +125,8 @@ pub async fn run_review_ad_hoc(
     config_repo: &dyn ConfigRepository,
     github: &dyn GitHubRepository,
     shell: &dyn ShellAdapter,
+    fs: &dyn FileSystem,
+    git: &dyn GitService,
     owner: &str,
     repo: &str,
     pr_number: u64,
@@ -129,9 +136,9 @@ pub async fn run_review_ad_hoc(
     if ctx.is_cancelled() {
         return Err(anyhow!(DomainError::CancelledBySignal));
     }
-    panic_if_cli_agents_missing(&options, "review-ad-hoc");
+    panic_if_cli_agents_missing(fs, &options, "review-ad-hoc");
     options.task_context = Some(ctx.clone());
-    let workflow = ReviewWorkflow::new(config_repo, github, Some(shell), options);
+    let workflow = ReviewWorkflow::new(config_repo, github, Some(shell), fs, git, options);
     let stats = run_with_heartbeat(
         "review-ad-hoc",
         workflow.review_ad_hoc(owner, repo, pr_number),
@@ -139,7 +146,7 @@ pub async fn run_review_ad_hoc(
     )
     .await?;
 
-    let report_path = write_review_report("review-ad-hoc", std::slice::from_ref(&stats))?;
+    let report_path = write_review_report(fs, "review-ad-hoc", std::slice::from_ref(&stats))?;
     println!("report_file={}", report_path.display());
 
     println!(
@@ -282,7 +289,11 @@ struct ReviewReport<'a> {
     repos: &'a [RepoReviewStats],
 }
 
-fn write_review_report(mode: &str, stats: &[RepoReviewStats]) -> Result<PathBuf> {
+fn write_review_report(
+    fs: &dyn FileSystem,
+    mode: &str,
+    stats: &[RepoReviewStats],
+) -> Result<PathBuf> {
     let report = ReviewReport {
         generated_at: chrono::Utc::now().to_rfc3339(),
         mode,
@@ -292,11 +303,8 @@ fn write_review_report(mode: &str, stats: &[RepoReviewStats]) -> Result<PathBuf>
         repos: stats,
     };
 
-    let root = std::env::current_dir()
-        .unwrap_or_else(|_| PathBuf::from("."))
-        .join(".prismflow")
-        .join("reports");
-    fs::create_dir_all(&root)?;
+    let root = fs.current_dir()?.join(".prismflow").join("reports");
+    fs.create_dir_all(&root)?;
 
     let latest = root.join("latest-review-report.json");
     let timestamped = root.join(format!(
@@ -304,8 +312,8 @@ fn write_review_report(mode: &str, stats: &[RepoReviewStats]) -> Result<PathBuf>
         chrono::Utc::now().format("%Y%m%d-%H%M%S")
     ));
     let raw = serde_json::to_string_pretty(&report)?;
-    fs::write(&latest, &raw)?;
-    fs::write(&timestamped, raw)?;
+    fs.write(&latest, raw.as_bytes())?;
+    fs.write(&timestamped, raw.as_bytes())?;
     Ok(timestamped)
 }
 

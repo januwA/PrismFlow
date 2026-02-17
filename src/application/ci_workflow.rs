@@ -1,6 +1,5 @@
 use std::{
     collections::HashSet,
-    fs,
     path::PathBuf,
     sync::{
         Arc,
@@ -8,18 +7,18 @@ use std::{
     },
 };
 
-use anyhow::{Result, anyhow};
+use anyhow::{Context, Result, anyhow};
 use futures::stream::{self, StreamExt};
 use serde::Serialize;
-use sha2::{Digest, Sha256};
-use tokio::process::Command;
 
 use crate::{
     application::context::TaskContext,
     domain::{
         entities::{AppConfig, CiFailure, MonitoredRepo},
-        errors::DomainError,
-        ports::{CommandContext, ConfigRepository, GitHubRepository, ShellAdapter},
+        ports::{
+            CommandContext, ConfigRepository, FileSystem, GitHubRepository, GitService,
+            ShellAdapter,
+        },
     },
 };
 
@@ -67,6 +66,8 @@ pub struct CiWorkflow<'a> {
     config_repo: &'a dyn ConfigRepository,
     github: &'a dyn GitHubRepository,
     shell: &'a dyn ShellAdapter,
+    fs: &'a dyn FileSystem,
+    git: &'a dyn GitService,
     engine_fingerprint: String,
     options: CiWorkflowOptions,
     next_engine_idx: AtomicUsize,
@@ -77,6 +78,8 @@ impl<'a> CiWorkflow<'a> {
         config_repo: &'a dyn ConfigRepository,
         github: &'a dyn GitHubRepository,
         shell: &'a dyn ShellAdapter,
+        fs: &'a dyn FileSystem,
+        git: &'a dyn GitService,
         options: CiWorkflowOptions,
     ) -> Self {
         let workflow_fp = workflow_engine_fingerprint(&options.engine_specs);
@@ -84,6 +87,8 @@ impl<'a> CiWorkflow<'a> {
             config_repo,
             github,
             shell,
+            fs,
+            git,
             engine_fingerprint: workflow_fp,
             options,
             next_engine_idx: AtomicUsize::new(0),
@@ -197,18 +202,16 @@ impl<'a> CiWorkflow<'a> {
                     .get_pull_request_git_context(owner, repo, pr.number)
                     .await
                 {
-                    if let Ok(repo_dir) = prepare_repo_checkout(
-                        self.options.task_context.as_deref(),
-                        &ctx.head_clone_url,
-                        &ctx.head_sha,
-                        &ctx.head_ref,
-                        owner,
-                        repo,
-                        pr.number,
-                        &self.options.clone_workspace_dir,
-                        self.options.clone_depth,
-                    )
-                    .await
+                    if let Ok(repo_dir) = self
+                        .prepare_repo_checkout(
+                            &ctx.head_clone_url,
+                            &ctx.head_sha,
+                            &ctx.head_ref,
+                            owner,
+                            repo,
+                            pr.number,
+                        )
+                        .await
                     {
                         repo_dir_for_shell = Some(repo_dir.to_string_lossy().to_string());
                         repo_head_ref_for_shell = ctx.head_ref;
@@ -225,7 +228,7 @@ impl<'a> CiWorkflow<'a> {
                 self.options.engine_prompt.as_deref(),
             );
             let payload_file =
-                match write_temp_ci_payload(&monitored.full_name, pr.number, &payload) {
+                match self.write_temp_ci_payload(&monitored.full_name, pr.number, &payload) {
                     Ok(v) => v,
                     Err(_) => {
                         stats.failed += 1;
@@ -250,7 +253,7 @@ impl<'a> CiWorkflow<'a> {
                         .map(|ctx| ctx as &dyn CommandContext),
                 )
                 .await;
-            let _ = fs::remove_file(&payload_file);
+            let _ = self.fs.remove_file(&payload_file);
 
             let analysis = match output {
                 Ok(v) => v,
@@ -285,6 +288,72 @@ impl<'a> CiWorkflow<'a> {
         let idx = self.next_engine_idx.fetch_add(1, Ordering::Relaxed);
         let picked = self.options.engine_specs[idx % self.options.engine_specs.len()].clone();
         Ok(picked)
+    }
+
+    fn write_temp_ci_payload(&self, repo: &str, pr_number: u64, content: &str) -> Result<PathBuf> {
+        let cwd = self.fs.current_dir().unwrap_or_else(|_| PathBuf::from("."));
+        let root = cwd.join(".prismflow").join("tmp-ci");
+        self.fs.create_dir_all(&root)?;
+        let sanitized = repo.replace('/', "_");
+        let path = root.join(format!("prismflow_{}_{}_ci.txt", sanitized, pr_number));
+        self.fs.write(&path, content.as_bytes())?;
+        Ok(path)
+    }
+
+    async fn prepare_repo_checkout(
+        &self,
+        clone_url: &str,
+        head_sha: &str,
+        head_ref: &str,
+        owner: &str,
+        repo: &str,
+        pr_number: u64,
+    ) -> Result<PathBuf> {
+        let cwd = self.fs.current_dir().unwrap_or_else(|_| PathBuf::from("."));
+        let root = cwd.join(&self.options.clone_workspace_dir);
+        self.fs.create_dir_all(&root)?;
+        let dir_name = format!(
+            "{}_{}_pr{}_{}",
+            owner.replace('/', "_"),
+            repo.replace('/', "_"),
+            pr_number,
+            &head_sha.chars().take(12).collect::<String>()
+        );
+        let target = root.join(dir_name);
+
+        let ctx = self
+            .options
+            .task_context
+            .as_deref()
+            .map(|c| c as &dyn CommandContext);
+
+        if !self.fs.exists(&target.join(".git")) {
+            self.git
+                .clone_repo(clone_url, &target, ctx)
+                .await
+                .context("git clone failed")?;
+        }
+
+        // Fetch by sha
+        if let Err(_) = self
+            .git
+            .fetch(&target, "origin", head_sha, self.options.clone_depth, ctx)
+            .await
+        {
+            // fallback fetch by ref
+            let refspec = format!("refs/heads/{head_ref}");
+            self.git
+                .fetch(&target, "origin", &refspec, self.options.clone_depth, ctx)
+                .await
+                .context("git fetch by ref failed")?;
+        }
+
+        self.git
+            .checkout(&target, head_sha, ctx)
+            .await
+            .context("git checkout failed")?;
+
+        Ok(target)
     }
 }
 
@@ -397,194 +466,23 @@ fn build_ci_payload(
     out
 }
 
-fn write_temp_ci_payload(repo: &str, pr_number: u64, content: &str) -> Result<PathBuf> {
-    let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
-    let root = cwd.join(".prismflow").join("tmp-ci");
-    fs::create_dir_all(&root)?;
-    let sanitized = repo.replace('/', "_");
-    let path = root.join(format!("prismflow_{}_{}_ci.txt", sanitized, pr_number));
-    fs::write(&path, content)?;
-    Ok(path)
-}
-
-async fn prepare_repo_checkout(
-    task_ctx: Option<&TaskContext>,
-    clone_url: &str,
-    head_sha: &str,
-    head_ref: &str,
-    owner: &str,
-    repo: &str,
-    pr_number: u64,
-    workspace_dir: &str,
-    clone_depth: usize,
-) -> Result<PathBuf> {
-    let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
-    let root = cwd.join(workspace_dir);
-    fs::create_dir_all(&root)?;
-    let dir_name = format!(
-        "{}_{}_pr{}_{}",
-        owner.replace('/', "_"),
-        repo.replace('/', "_"),
-        pr_number,
-        &head_sha.chars().take(12).collect::<String>()
-    );
-    let target = root.join(dir_name);
-    let target_str = target.to_string_lossy().to_string();
-    let depth_str = clone_depth.max(1).to_string();
-    if !target.join(".git").exists() {
-        let status = run_git_command(
-            task_ctx,
-            &["clone", "--no-checkout", clone_url, &target_str],
-            None,
-            "git clone",
-        )
-        .await?;
-        if !status.success() {
-            anyhow::bail!("git clone failed for {}", clone_url);
-        }
-    }
-    let fetch_status = run_git_command(
-        task_ctx,
-        &[
-            "-C",
-            &target_str,
-            "fetch",
-            "--depth",
-            &depth_str,
-            "origin",
-            head_sha,
-        ],
-        None,
-        "git fetch by sha",
-    )
-    .await?;
-    if !fetch_status.success() {
-        let refspec = format!("refs/heads/{head_ref}");
-        let fetch_ref_status = run_git_command(
-            task_ctx,
-            &[
-                "-C",
-                &target_str,
-                "fetch",
-                "--depth",
-                &depth_str,
-                "origin",
-                &refspec,
-            ],
-            None,
-            "git fetch by ref",
-        )
-        .await?;
-        if !fetch_ref_status.success() {
-            anyhow::bail!("git fetch failed for sha={} ref={}", head_sha, head_ref);
-        }
-    }
-    let checkout_status = run_git_command(
-        task_ctx,
-        &["-C", &target_str, "checkout", "--force", head_sha],
-        None,
-        "git checkout",
-    )
-    .await?;
-    if !checkout_status.success() {
-        anyhow::bail!("git checkout failed for sha={}", head_sha);
-    }
-    Ok(target)
-}
-
-async fn run_git_command(
-    task_ctx: Option<&TaskContext>,
-    args: &[&str],
-    workdir: Option<&str>,
-    label: &str,
-) -> Result<std::process::ExitStatus> {
-    let mut cmd = Command::new("git");
-    cmd.args(args);
-    if let Some(dir) = workdir {
-        cmd.current_dir(dir);
-    }
-    let mut child = cmd.spawn()?;
-    let pid = child.id();
-    if let (Some(ctx), Some(pid)) = (task_ctx, pid) {
-        let fp = command_fingerprint(args);
-        ctx.register_child(pid, format!("command_fingerprint={} {}", fp, label))
-            .await;
-    }
-    let status = if let Some(ctx) = task_ctx {
-        tokio::select! {
-            s = child.wait() => s?,
-            _ = ctx.cancelled() => {
-                let _ = child.kill().await;
-                if let (Some(ctx), Some(pid)) = (task_ctx, pid) {
-                    ctx.unregister_child(pid).await;
-                }
-                anyhow::bail!(DomainError::CancelledBySignal);
-            }
-        }
-    } else {
-        child.wait().await?
-    };
-    if let (Some(ctx), Some(pid)) = (task_ctx, pid) {
-        ctx.unregister_child(pid).await;
-    }
-    Ok(status)
-}
-
-fn command_fingerprint(args: &[&str]) -> String {
-    let mut hasher = Sha256::new();
-    hasher.update(args.join(" ").as_bytes());
-    let hex = hex::encode(hasher.finalize());
-    hex.chars().take(12).collect()
-}
-
 #[cfg(test)]
 mod tests {
     use std::sync::Mutex;
 
-    use anyhow::Result;
+    use anyhow::{Result, anyhow};
     use async_trait::async_trait;
 
-    use super::{CiWorkflow, CiWorkflowOptions, EngineSpec, run_git_command};
+    use super::{CiWorkflow, CiWorkflowOptions, EngineSpec};
     use crate::application::context::TaskContext;
     use crate::domain::entities::{
         AppConfig, MonitoredRepo, PullRequestCiSnapshot, PullRequestFilePatch,
         PullRequestGitContext, PullRequestMetrics, PullRequestSummary, ReviewFilterConfig,
     };
-    use crate::domain::ports::{CommandContext, ConfigRepository, GitHubRepository, ShellAdapter};
+    use crate::domain::ports::{
+        CommandContext, ConfigRepository, FileSystem, GitHubRepository, GitService, ShellAdapter,
+    };
     use std::sync::Arc;
-    use std::time::Duration;
-
-    #[tokio::test]
-    async fn git_runner_respects_cancellation_and_cleans_registry() {
-        let ctx = Arc::new(TaskContext::new("ci-git-cancel-test"));
-
-        #[cfg(target_os = "windows")]
-        let args_owned = vec![
-            "-c".to_string(),
-            "alias.wait=!powershell -NoProfile -Command \"Start-Sleep -Seconds 8\"".to_string(),
-            "wait".to_string(),
-        ];
-        #[cfg(not(target_os = "windows"))]
-        let args_owned = vec![
-            "-c".to_string(),
-            "alias.wait=!sleep 8".to_string(),
-            "wait".to_string(),
-        ];
-        let args = args_owned.iter().map(|s| s.as_str()).collect::<Vec<&str>>();
-
-        let ((), result) = tokio::join!(
-            async {
-                tokio::time::sleep(Duration::from_millis(300)).await;
-                ctx.cancel();
-            },
-            async { run_git_command(Some(&ctx), &args, None, "git wait").await }
-        );
-
-        assert!(result.is_err());
-        let msg = format!("{:#}", result.err().expect("cancelled"));
-        assert!(msg.contains("operation cancelled by signal"));
-        assert_eq!(ctx.child_count().await, 0);
-    }
 
     struct InMemoryConfigRepo {
         inner: Mutex<AppConfig>,
@@ -829,6 +727,109 @@ mod tests {
         }
     }
 
+    struct MockFileSystem;
+    impl FileSystem for MockFileSystem {
+        fn create_dir_all(&self, _path: &std::path::Path) -> Result<()> {
+            Ok(())
+        }
+        fn write(&self, _path: &std::path::Path, _content: &[u8]) -> Result<()> {
+            Ok(())
+        }
+        fn read_to_string(&self, _path: &std::path::Path) -> Result<String> {
+            Ok(String::new())
+        }
+        fn remove_file(&self, _path: &std::path::Path) -> Result<()> {
+            Ok(())
+        }
+        fn current_dir(&self) -> Result<std::path::PathBuf> {
+            Ok(std::path::PathBuf::from("."))
+        }
+        fn config_dir(&self) -> Option<std::path::PathBuf> {
+            None
+        }
+        fn exists(&self, _path: &std::path::Path) -> bool {
+            false
+        }
+    }
+
+    struct MockGit;
+    #[async_trait::async_trait]
+    impl GitService for MockGit {
+        async fn clone_repo(
+            &self,
+            _url: &str,
+            _target_dir: &std::path::Path,
+            _ctx: Option<&dyn CommandContext>,
+        ) -> Result<()> {
+            Ok(())
+        }
+        async fn fetch(
+            &self,
+            _target_dir: &std::path::Path,
+            _remote: &str,
+            _refspec: &str,
+            _depth: usize,
+            _ctx: Option<&dyn CommandContext>,
+        ) -> Result<()> {
+            Ok(())
+        }
+        async fn checkout(
+            &self,
+            _target_dir: &std::path::Path,
+            _rev: &str,
+            _ctx: Option<&dyn CommandContext>,
+        ) -> Result<()> {
+            Ok(())
+        }
+    }
+
+    #[derive(Default)]
+    struct RecordingGit {
+        fetch_calls: Mutex<Vec<String>>,
+        checkout_calls: Mutex<Vec<String>>,
+    }
+
+    #[async_trait::async_trait]
+    impl GitService for RecordingGit {
+        async fn clone_repo(
+            &self,
+            _url: &str,
+            _target_dir: &std::path::Path,
+            _ctx: Option<&dyn CommandContext>,
+        ) -> Result<()> {
+            Ok(())
+        }
+
+        async fn fetch(
+            &self,
+            _target_dir: &std::path::Path,
+            _remote: &str,
+            refspec: &str,
+            _depth: usize,
+            _ctx: Option<&dyn CommandContext>,
+        ) -> Result<()> {
+            let mut calls = self.fetch_calls.lock().expect("lock fetch_calls");
+            calls.push(refspec.to_string());
+            if calls.len() == 1 {
+                return Err(anyhow!("fetch by sha failed"));
+            }
+            Ok(())
+        }
+
+        async fn checkout(
+            &self,
+            _target_dir: &std::path::Path,
+            rev: &str,
+            _ctx: Option<&dyn CommandContext>,
+        ) -> Result<()> {
+            self.checkout_calls
+                .lock()
+                .expect("lock checkout_calls")
+                .push(rev.to_string());
+            Ok(())
+        }
+    }
+
     fn config_with_repo() -> AppConfig {
         AppConfig {
             agent_prompt_dirs: vec![],
@@ -864,7 +865,9 @@ mod tests {
             ..CiWorkflowOptions::default()
         };
         let shell = MockShell;
-        let stats = CiWorkflow::new(&config, &github, &shell, options)
+        let fs = MockFileSystem;
+        let git = MockGit;
+        let stats = CiWorkflow::new(&config, &github, &shell, &fs, &git, options)
             .run_once()
             .await
             .expect("run_once");
@@ -874,5 +877,55 @@ mod tests {
         assert_eq!(stats[0].failed, 0);
         assert_eq!(stats[0].skipped_no_failures, 0);
         assert_eq!(stats[0].skipped_completed, 0);
+    }
+
+    #[tokio::test]
+    async fn prepare_repo_checkout_falls_back_to_ref_fetch_when_sha_fetch_fails() {
+        let github = MinimalGitHub { prs: vec![] };
+        let config = InMemoryConfigRepo::new(config_with_repo());
+        let shell = MockShell;
+        let fs = MockFileSystem;
+        let git = RecordingGit::default();
+        let workflow = CiWorkflow::new(
+            &config,
+            &github,
+            &shell,
+            &fs,
+            &git,
+            CiWorkflowOptions {
+                clone_workspace_dir: ".prismflow/test-ci-cache".to_string(),
+                clone_depth: 1,
+                ..CiWorkflowOptions::default()
+            },
+        );
+
+        let repo_dir = workflow
+            .prepare_repo_checkout(
+                "https://github.com/owner/repo.git",
+                "abc123",
+                "main",
+                "owner",
+                "repo",
+                42,
+            )
+            .await
+            .expect("prepare_repo_checkout should succeed with fallback fetch");
+
+        let fetch_calls = git.fetch_calls.lock().expect("lock fetch_calls").clone();
+        assert_eq!(fetch_calls.len(), 2);
+        assert_eq!(fetch_calls[0], "abc123");
+        assert_eq!(fetch_calls[1], "refs/heads/main");
+
+        let checkout_calls = git
+            .checkout_calls
+            .lock()
+            .expect("lock checkout_calls")
+            .clone();
+        assert_eq!(checkout_calls, vec!["abc123".to_string()]);
+        assert!(
+            repo_dir
+                .to_string_lossy()
+                .contains("owner_repo_pr42_abc123")
+        );
     }
 }
