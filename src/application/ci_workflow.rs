@@ -242,6 +242,10 @@ impl<'a> CiWorkflow<'a> {
             command = command.replace("{repo_dir}", repo_dir_for_shell.as_deref().unwrap_or(""));
             command = command.replace("{repo_head_sha}", &ci.head_sha);
             command = command.replace("{repo_head_ref}", &repo_head_ref_for_shell);
+            println!(
+                "[ENGINE] repo={}/{} pr={} engine={} command_line={}",
+                owner, repo, pr.number, selected_engine.fingerprint, command
+            );
             let output = self
                 .shell
                 .run_command_line_in_dir(

@@ -263,26 +263,40 @@ pub async fn dispatch(
                     max_concurrent_api,
                     "ci",
                 )?;
-                run_ci_once(
-                    config_repo.as_ref(),
-                    github.as_ref(),
-                    shell,
-                    fs,
-                    git,
-                    CiWorkflowOptions {
-                        max_concurrent_repos,
-                        engine_specs: resolved_engines,
-                        engine_prompt: resolved_prompt,
-                        clone_repo_enabled: clone_repo,
-                        clone_workspace_dir,
-                        clone_depth,
-                        include_repos: repos,
-                        exclude_repos,
-                        task_context: None,
-                    },
-                    once_ctx,
-                )
-                .await?;
+                tokio::select! {
+                    r = run_ci_once(
+                        config_repo.as_ref(),
+                        github.as_ref(),
+                        shell,
+                        fs,
+                        git,
+                        CiWorkflowOptions {
+                            max_concurrent_repos,
+                            engine_specs: resolved_engines,
+                            engine_prompt: resolved_prompt,
+                            clone_repo_enabled: clone_repo,
+                            clone_workspace_dir,
+                            clone_depth,
+                            include_repos: repos,
+                            exclude_repos,
+                            task_context: None,
+                        },
+                        once_ctx.clone(),
+                    ) => {
+                        r?;
+                    }
+                    _ = wait_for_shutdown_signal() => {
+                        shutdown_cycle(
+                            "ci",
+                            &once_ctx,
+                            SHUTDOWN_GRACE_SECS,
+                            process_manager,
+                            None,
+                        )
+                        .await;
+                        println!("received Ctrl+C, exiting ci once");
+                    }
+                }
             }
             CiSubcommand::Daemon {
                 interval_secs,
@@ -333,7 +347,7 @@ pub async fn dispatch(
                                 eprintln!("ci cycle failed: {err:#}");
                             }
                         }
-                        _ = tokio::signal::ctrl_c() => {
+                        _ = wait_for_shutdown_signal() => {
                             stop_daemon = true;
                             shutdown_cycle(
                                 "ci",
@@ -351,7 +365,7 @@ pub async fn dispatch(
                     }
                     tokio::select! {
                         _ = sleep(Duration::from_secs(interval_secs)) => {}
-                        _ = tokio::signal::ctrl_c() => {
+                        _ = wait_for_shutdown_signal() => {
                             println!("received Ctrl+C, exiting ci daemon");
                             break;
                         }
@@ -407,18 +421,32 @@ pub async fn dispatch(
                     max_concurrent_api,
                     "review",
                 )?;
-                run_review_once(
-                    config_repo.as_ref(),
-                    github.as_ref(),
-                    shell,
-                    fs,
-                    git,
-                    options,
-                    once_ctx,
-                    false,
-                    None,
-                )
-                .await?;
+                tokio::select! {
+                    r = run_review_once(
+                        config_repo.as_ref(),
+                        github.as_ref(),
+                        shell,
+                        fs,
+                        git,
+                        options,
+                        once_ctx.clone(),
+                        false,
+                        None,
+                    ) => {
+                        r?;
+                    }
+                    _ = wait_for_shutdown_signal() => {
+                        shutdown_cycle(
+                            "review",
+                            &once_ctx,
+                            SHUTDOWN_GRACE_SECS,
+                            process_manager,
+                            None,
+                        )
+                        .await;
+                        println!("received Ctrl+C, exiting review once");
+                    }
+                }
             }
             ReviewSubcommand::Daemon {
                 interval_secs,
@@ -687,7 +715,7 @@ pub async fn dispatch(
                                 let _ = status_tx.send("cycle:done".to_string());
                             }
                         }
-                        _ = tokio::signal::ctrl_c() => {
+                        _ = wait_for_shutdown_signal() => {
                             stop_daemon = true;
                             shutdown_cycle(
                                 "review",
@@ -716,7 +744,7 @@ pub async fn dispatch(
                         _ = ui_notify.notified() => {
                             let _ = status_tx.send("ui:wakeup".to_string());
                         }
-                        _ = tokio::signal::ctrl_c() => {
+                        _ = wait_for_shutdown_signal() => {
                             println!("received Ctrl+C, exiting daemon");
                             break;
                         }
@@ -767,19 +795,33 @@ pub async fn dispatch(
                     max_concurrent_api,
                     "ad-hoc review",
                 )?;
-                run_review_ad_hoc(
-                    config_repo.as_ref(),
-                    github.as_ref(),
-                    shell,
-                    fs,
-                    git,
-                    owner,
-                    repo,
-                    pr_number,
-                    options,
-                    adhoc_ctx,
-                )
-                .await?;
+                tokio::select! {
+                    r = run_review_ad_hoc(
+                        config_repo.as_ref(),
+                        github.as_ref(),
+                        shell,
+                        fs,
+                        git,
+                        owner,
+                        repo,
+                        pr_number,
+                        options,
+                        adhoc_ctx.clone(),
+                    ) => {
+                        r?;
+                    }
+                    _ = wait_for_shutdown_signal() => {
+                        shutdown_cycle(
+                            "review",
+                            &adhoc_ctx,
+                            SHUTDOWN_GRACE_SECS,
+                            process_manager,
+                            None,
+                        )
+                        .await;
+                        println!("received Ctrl+C, exiting review ad-hoc");
+                    }
+                }
             }
             ReviewSubcommand::Clean {
                 pr_urls,
@@ -953,6 +995,22 @@ fn github_client_for_action(
     github_factory.create(token, max_concurrent_api)
 }
 
+#[cfg(windows)]
+async fn wait_for_shutdown_signal() {
+    use tokio::signal::windows::{ctrl_break, ctrl_c};
+    let mut sig_c = ctrl_c().expect("failed to register Ctrl+C handler");
+    let mut sig_break = ctrl_break().expect("failed to register Ctrl+Break handler");
+    tokio::select! {
+        _ = sig_c.recv() => {}
+        _ = sig_break.recv() => {}
+    }
+}
+
+#[cfg(not(windows))]
+async fn wait_for_shutdown_signal() {
+    let _ = tokio::signal::ctrl_c().await;
+}
+
 async fn shutdown_cycle(
     kind: &str,
     ctx: &Arc<TaskContext>,
@@ -1020,7 +1078,7 @@ async fn shutdown_cycle(
 
         tokio::select! {
             _ = sleep(Duration::from_millis(200)) => {}
-            _ = tokio::signal::ctrl_c() => {
+            _ = wait_for_shutdown_signal() => {
                 println!(
                     "shutdown:{} second_ctrl_c immediate_force_kill cancel_reason=signal_second",
                     kind

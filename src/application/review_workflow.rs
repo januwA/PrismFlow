@@ -1010,6 +1010,14 @@ impl<'a> ReviewWorkflow<'a> {
         command = command.replace("{repo_dir}", repo_dir.unwrap_or(""));
         command = command.replace("{repo_head_ref}", repo_head_ref);
         let command_line = command;
+        println!(
+            "[ENGINE] repo={}/{} pr={} engine={} command_line={}",
+            owner, repo, pr_number, selected_engine.fingerprint, command_line
+        );
+        self.emit_status(format!(
+            "repo={}/{} pr={} stage=EngineCommand engine={} command_line={}",
+            owner, repo, pr_number, selected_engine.fingerprint, command_line
+        ));
         let output = match shell
             .run_command_line(
                 &command_line,
