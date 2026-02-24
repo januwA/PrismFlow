@@ -114,6 +114,9 @@ impl ShellAdapter for CommandShellAdapter {
         workdir: Option<&str>,
         ctx: Option<&dyn CommandContext>,
     ) -> Result<String> {
+        if ctx.map(|task_ctx| task_ctx.is_cancelled()).unwrap_or(false) {
+            anyhow::bail!(DomainError::CancelledBySignal);
+        }
         let shell_program = self.resolve_shell_program();
         let mut cmd = TokioCommand::new(&shell_program);
         match shell_kind(&shell_program) {

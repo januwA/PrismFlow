@@ -21,7 +21,6 @@ use crate::domain::{
         AppConfig, MonitoredRepo, PullRequestFilePatch, PullRequestSummary, ReviewComment,
         ReviewFilterConfig,
     },
-    errors::DomainError,
     ports::{
         CommandContext, ConfigRepository, FileSystem, GitHubRepository, GitService, ShellAdapter,
     },
@@ -55,6 +54,7 @@ pub struct RepoReviewStats {
     pub processed: usize,
     pub skipped_completed: usize,
     pub skipped_processing: usize,
+    pub skipped_by_author: usize,
     pub recovered_stale_processing: usize,
     pub fallback_general: usize,
     pub failed_retryable: usize,
@@ -83,6 +83,8 @@ pub struct ReviewWorkflowOptions {
     pub cli_agents: Vec<String>,
     pub include_repos: Vec<String>,
     pub exclude_repos: Vec<String>,
+    pub include_authors: Vec<String>,
+    pub exclude_authors: Vec<String>,
     pub status_tx: Option<broadcast::Sender<String>>,
     pub skip_flag: Option<Arc<AtomicBool>>,
     pub task_context: Option<Arc<TaskContext>>,
@@ -107,6 +109,8 @@ impl Default for ReviewWorkflowOptions {
             cli_agents: vec![],
             include_repos: vec![],
             exclude_repos: vec![],
+            include_authors: vec![],
+            exclude_authors: vec![],
             status_tx: None,
             skip_flag: None,
             task_context: None,
@@ -297,6 +301,16 @@ impl<'a> ReviewWorkflow<'a> {
                 };
             }
         };
+        let author_selector = AuthorSelector::from_options(&self.options);
+        let mut selected_prs = Vec::new();
+        for pr in prs {
+            if author_selector.matches(pr.author_login.as_deref()) {
+                selected_prs.push(pr);
+            } else {
+                stats.skipped_by_author += 1;
+                self.mark_stage(ReviewStage::Skipped, &monitored.full_name, pr.number);
+            }
+        }
 
         let pr_concurrency = self.options.max_concurrent_prs.max(1);
         let repo_name_for_tasks = monitored.full_name.clone();
@@ -306,7 +320,7 @@ impl<'a> ReviewWorkflow<'a> {
         } else {
             self.options.cli_agents.clone()
         };
-        let outcomes = stream::iter(prs)
+        let outcomes = stream::iter(selected_prs)
             .map(|pr| {
                 let repo_name_for_tasks = repo_name_for_tasks.clone();
                 let filter_for_tasks = filter_for_tasks.clone();
@@ -1120,6 +1134,42 @@ impl RepoSelector {
     }
 }
 
+#[derive(Debug, Clone)]
+struct AuthorSelector {
+    includes: HashSet<String>,
+    excludes: HashSet<String>,
+}
+
+impl AuthorSelector {
+    fn from_options(options: &ReviewWorkflowOptions) -> Self {
+        Self {
+            includes: options
+                .include_authors
+                .iter()
+                .map(|v| normalize_author_selector(v))
+                .filter(|v| !v.is_empty())
+                .collect(),
+            excludes: options
+                .exclude_authors
+                .iter()
+                .map(|v| normalize_author_selector(v))
+                .filter(|v| !v.is_empty())
+                .collect(),
+        }
+    }
+
+    fn matches(&self, author_login: Option<&str>) -> bool {
+        let key = normalize_author_selector(author_login.unwrap_or_default());
+        if !key.is_empty() && self.excludes.contains(&key) {
+            return false;
+        }
+        if self.includes.is_empty() {
+            return true;
+        }
+        !key.is_empty() && self.includes.contains(&key)
+    }
+}
+
 fn normalize_repo_selector(input: &str) -> String {
     let trimmed = input.trim().trim_end_matches('/');
     if trimmed.is_empty() {
@@ -1129,6 +1179,10 @@ fn normalize_repo_selector(input: &str) -> String {
         return repo.to_ascii_lowercase();
     }
     trimmed.to_ascii_lowercase()
+}
+
+fn normalize_author_selector(input: &str) -> String {
+    input.trim().to_ascii_lowercase()
 }
 
 fn parse_github_repo_like_url(input: &str) -> Option<String> {
@@ -1684,6 +1738,7 @@ mod tests {
         time::Duration,
     };
 
+    use crate::domain::errors::DomainError;
     use anyhow::anyhow;
     use async_trait::async_trait;
 
@@ -2303,6 +2358,7 @@ mod tests {
                 title: "t".to_string(),
                 head_sha: sha.to_string(),
                 html_url: None,
+                author_login: Some("mock-user".to_string()),
             }],
             issue_comments: Mutex::new(HashMap::from([(1, vec![completed])])),
             ..Default::default()
@@ -2334,6 +2390,7 @@ mod tests {
                 title: "t".to_string(),
                 head_sha: sha.to_string(),
                 html_url: None,
+                author_login: Some("mock-user".to_string()),
             }],
             files: HashMap::from([(
                 1,
@@ -2364,6 +2421,7 @@ mod tests {
                 title: "t".to_string(),
                 head_sha: sha.to_string(),
                 html_url: None,
+                author_login: Some("mock-user".to_string()),
             }],
             files: HashMap::from([(
                 1,
@@ -2411,6 +2469,7 @@ mod tests {
                 title: "t".to_string(),
                 head_sha: "abc123".to_string(),
                 html_url: None,
+                author_login: Some("mock-user".to_string()),
             }],
             files: HashMap::from([(
                 1,
@@ -2446,6 +2505,7 @@ mod tests {
                 title: "t".to_string(),
                 head_sha: sha.to_string(),
                 html_url: None,
+                author_login: Some("mock-user".to_string()),
             }],
             issue_labels: Mutex::new(HashMap::from([(7, vec![label])])),
             ..Default::default()
@@ -2471,6 +2531,7 @@ mod tests {
                 title: "t".to_string(),
                 head_sha: "abc123".to_string(),
                 html_url: None,
+                author_login: Some("mock-user".to_string()),
             }],
             files: HashMap::from([(
                 3,
@@ -2502,6 +2563,7 @@ mod tests {
                 title: "t".to_string(),
                 head_sha: sha.to_string(),
                 html_url: None,
+                author_login: Some("mock-user".to_string()),
             }],
             files: HashMap::from([(
                 1,
@@ -2531,6 +2593,7 @@ mod tests {
                 title: "t".to_string(),
                 head_sha: "abc123".to_string(),
                 html_url: None,
+                author_login: Some("mock-user".to_string()),
             }],
             files: HashMap::from([(
                 1,
@@ -2572,6 +2635,7 @@ mod tests {
                 title: "t".to_string(),
                 head_sha: "abc123".to_string(),
                 html_url: None,
+                author_login: Some("mock-user".to_string()),
             }],
             files: HashMap::from([(
                 1,
@@ -2604,6 +2668,7 @@ mod tests {
                 title: "t".to_string(),
                 head_sha: "abc123".to_string(),
                 html_url: None,
+                author_login: Some("mock-user".to_string()),
             }],
             files: HashMap::from([(
                 1,
@@ -2629,6 +2694,142 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn review_once_filters_with_include_authors() {
+        let github = MockGitHub {
+            prs: vec![
+                PullRequestSummary {
+                    number: 1,
+                    title: "t1".to_string(),
+                    head_sha: "abc123".to_string(),
+                    html_url: None,
+                    author_login: Some("alice".to_string()),
+                },
+                PullRequestSummary {
+                    number: 2,
+                    title: "t2".to_string(),
+                    head_sha: "def456".to_string(),
+                    html_url: None,
+                    author_login: Some("bob".to_string()),
+                },
+            ],
+            files: HashMap::from([
+                (
+                    1,
+                    vec![PullRequestFilePatch {
+                        path: "src/lib.rs".to_string(),
+                        patch: Some("@@ -1,1 +1,2 @@\n line\n+let x = 1;".to_string()),
+                    }],
+                ),
+                (
+                    2,
+                    vec![PullRequestFilePatch {
+                        path: "src/lib.rs".to_string(),
+                        patch: Some("@@ -1,1 +1,2 @@\n line\n+let y = 2;".to_string()),
+                    }],
+                ),
+            ]),
+            ..Default::default()
+        };
+        let config = InMemoryConfigRepo::new(config_with_repo());
+        let opts = ReviewWorkflowOptions {
+            include_authors: vec!["alice".to_string()],
+            ..ReviewWorkflowOptions::default()
+        };
+
+        let stats = workflow(&config, &github, opts)
+            .review_once()
+            .await
+            .expect("review_once");
+        assert_eq!(stats[0].processed, 1);
+        assert_eq!(stats[0].skipped_by_author, 1);
+    }
+
+    #[tokio::test]
+    async fn review_once_filters_with_exclude_authors() {
+        let github = MockGitHub {
+            prs: vec![
+                PullRequestSummary {
+                    number: 1,
+                    title: "t1".to_string(),
+                    head_sha: "abc123".to_string(),
+                    html_url: None,
+                    author_login: Some("alice".to_string()),
+                },
+                PullRequestSummary {
+                    number: 2,
+                    title: "t2".to_string(),
+                    head_sha: "def456".to_string(),
+                    html_url: None,
+                    author_login: Some("bob".to_string()),
+                },
+            ],
+            files: HashMap::from([
+                (
+                    1,
+                    vec![PullRequestFilePatch {
+                        path: "src/lib.rs".to_string(),
+                        patch: Some("@@ -1,1 +1,2 @@\n line\n+let x = 1;".to_string()),
+                    }],
+                ),
+                (
+                    2,
+                    vec![PullRequestFilePatch {
+                        path: "src/lib.rs".to_string(),
+                        patch: Some("@@ -1,1 +1,2 @@\n line\n+let y = 2;".to_string()),
+                    }],
+                ),
+            ]),
+            ..Default::default()
+        };
+        let config = InMemoryConfigRepo::new(config_with_repo());
+        let opts = ReviewWorkflowOptions {
+            exclude_authors: vec!["bob".to_string()],
+            ..ReviewWorkflowOptions::default()
+        };
+
+        let stats = workflow(&config, &github, opts)
+            .review_once()
+            .await
+            .expect("review_once");
+        assert_eq!(stats[0].processed, 1);
+        assert_eq!(stats[0].skipped_by_author, 1);
+    }
+
+    #[tokio::test]
+    async fn review_once_author_exclude_has_higher_priority_than_include() {
+        let github = MockGitHub {
+            prs: vec![PullRequestSummary {
+                number: 1,
+                title: "t1".to_string(),
+                head_sha: "abc123".to_string(),
+                html_url: None,
+                author_login: Some("alice".to_string()),
+            }],
+            files: HashMap::from([(
+                1,
+                vec![PullRequestFilePatch {
+                    path: "src/lib.rs".to_string(),
+                    patch: Some("@@ -1,1 +1,2 @@\n line\n+let x = 1;".to_string()),
+                }],
+            )]),
+            ..Default::default()
+        };
+        let config = InMemoryConfigRepo::new(config_with_repo());
+        let opts = ReviewWorkflowOptions {
+            include_authors: vec!["alice".to_string()],
+            exclude_authors: vec!["alice".to_string()],
+            ..ReviewWorkflowOptions::default()
+        };
+
+        let stats = workflow(&config, &github, opts)
+            .review_once()
+            .await
+            .expect("review_once");
+        assert_eq!(stats[0].processed, 0);
+        assert_eq!(stats[0].skipped_by_author, 1);
+    }
+
+    #[tokio::test]
     async fn review_once_respects_cancelled_task_context() {
         let github = MockGitHub {
             prs: vec![PullRequestSummary {
@@ -2636,6 +2837,7 @@ mod tests {
                 title: "t".to_string(),
                 head_sha: "abc123".to_string(),
                 html_url: None,
+                author_login: Some("mock-user".to_string()),
             }],
             ..Default::default()
         };
@@ -2663,6 +2865,7 @@ mod tests {
                 title: "t".to_string(),
                 head_sha: "abc123".to_string(),
                 html_url: None,
+                author_login: Some("mock-user".to_string()),
             }],
             files: HashMap::from([(
                 1,

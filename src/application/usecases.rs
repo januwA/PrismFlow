@@ -49,13 +49,14 @@ pub async fn run_review_once(
         for item in stats {
             if let Some(tx) = status_tx {
                 let _ = tx.send(format!(
-                    "run_id={} repo={} processed={} skip_completed={} skip_processing={} skip_filtered={} skip_by_operator={} retryable_fail={} fatal_fail={} retryable_error={:?} fatal_error={:?}",
+                    "run_id={} repo={} processed={} skip_completed={} skip_processing={} skip_filtered={} skip_by_author={} skip_by_operator={} retryable_fail={} fatal_fail={} retryable_error={:?} fatal_error={:?}",
                     ctx.run_id(),
                     item.repo,
                     item.processed,
                     item.skipped_completed,
                     item.skipped_processing,
                     item.skipped_filtered,
+                    item.skipped_by_author,
                     item.skipped_by_operator,
                     item.failed_retryable,
                     item.failed_fatal,
@@ -64,12 +65,13 @@ pub async fn run_review_once(
                 ));
             }
             println!(
-                "repo={} processed={} skipped_completed={} skipped_processing={} skipped_filtered={} skipped_by_operator={} recovered_stale_processing={} fallback_general={} failed_retryable={} failed_fatal={} last_retryable_error={:?} last_fatal_error={:?}",
+                "repo={} processed={} skipped_completed={} skipped_processing={} skipped_filtered={} skipped_by_author={} skipped_by_operator={} recovered_stale_processing={} fallback_general={} failed_retryable={} failed_fatal={} last_retryable_error={:?} last_fatal_error={:?}",
                 item.repo,
                 item.processed,
                 item.skipped_completed,
                 item.skipped_processing,
                 item.skipped_filtered,
+                item.skipped_by_author,
                 item.skipped_by_operator,
                 item.recovered_stale_processing,
                 item.fallback_general,
@@ -150,12 +152,13 @@ pub async fn run_review_ad_hoc(
     println!("report_file={}", report_path.display());
 
     println!(
-        "repo={} processed={} skipped_completed={} skipped_processing={} skipped_filtered={} skipped_by_operator={} recovered_stale_processing={} fallback_general={} failed_retryable={} failed_fatal={} last_retryable_error={:?} last_fatal_error={:?}",
+        "repo={} processed={} skipped_completed={} skipped_processing={} skipped_filtered={} skipped_by_author={} skipped_by_operator={} recovered_stale_processing={} fallback_general={} failed_retryable={} failed_fatal={} last_retryable_error={:?} last_fatal_error={:?}",
         stats.repo,
         stats.processed,
         stats.skipped_completed,
         stats.skipped_processing,
         stats.skipped_filtered,
+        stats.skipped_by_author,
         stats.skipped_by_operator,
         stats.recovered_stale_processing,
         stats.fallback_general,

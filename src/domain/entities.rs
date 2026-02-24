@@ -76,6 +76,7 @@ pub struct PullRequestSummary {
     pub title: String,
     pub head_sha: String,
     pub html_url: Option<String>,
+    pub author_login: Option<String>,
 }
 
 #[derive(Debug, Clone, Default)]

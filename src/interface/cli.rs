@@ -101,7 +101,7 @@ pub enum AuthSubcommand {
 
 #[derive(Debug, Args)]
 #[command(
-    after_long_help = "scan COMMAND 可选：\n  once [--max-concurrent-api <值>] [--repo <owner/repo>] [--exclude-repo <owner/repo>]\n\n说明：\n  scan 只读取 PR 信息和幂等键，不会提交评论，也不依赖引擎参数。\n\n示例：\n  cargo run -- scan once\n  cargo run -- scan once --repo owner/repo --max-concurrent-api 12"
+    after_long_help = "说明：\n  scan 只读取 PR 信息和幂等键，不会提交评论，也不依赖引擎参数。\n\n示例：\n  cargo run -- scan once\n  cargo run -- scan once --repo owner/repo --max-concurrent-api 12"
 )]
 pub struct ScanCommand {
     #[command(subcommand)]
@@ -110,7 +110,7 @@ pub struct ScanCommand {
 
 #[derive(Debug, Args)]
 #[command(
-    after_long_help = "ci COMMAND 可选：\n  once [--engine <指纹> <命令>] [--clone-repo] [--clone-workspace-dir <目录>] [--clone-depth <值>] [--engine-prompt <提示词>] [--engine-prompt-file <文件>] [--max-concurrent-api <值>] [--repo <owner/repo>] [--exclude-repo <owner/repo>]\n  daemon [--interval-secs <秒>] [--engine <指纹> <命令>] [--clone-repo] [--clone-workspace-dir <目录>] [--clone-depth <值>] [--engine-prompt <提示词>] [--engine-prompt-file <文件>] [--max-concurrent-api <值>] [--repo <owner/repo>] [--exclude-repo <owner/repo>]\n\n说明：\n  ci 会读取 PR 的失败 CI 状态并调用引擎生成修复建议，随后写入 PR 评论。\n  命令支持 {ci_file}、{repo_dir}、{repo_head_sha}、{repo_head_ref} 占位符。\n\n示例：\n  cargo run -- ci once --engine gemini-cli \"gemini -y -p \\\"$(cat {ci_file})\\\"\"\n  cargo run -- ci daemon --interval-secs 60 --engine gemini-cli \"gemini -y -p \\\"$(cat {ci_file})\\\"\""
+    after_long_help = "说明：\n  ci 会读取 PR 的失败 CI 状态并调用引擎生成修复建议，随后写入 PR 评论。\n  命令支持 {ci_file}、{repo_dir}、{repo_head_sha}、{repo_head_ref} 占位符。\n\n示例：\n  cargo run -- ci once --engine gemini-cli \"gemini -y -p \\\"$(cat {ci_file})\\\"\"\n  cargo run -- ci daemon --interval-secs 60 --engine gemini-cli \"gemini -y -p \\\"$(cat {ci_file})\\\"\""
 )]
 pub struct CiCommand {
     #[command(subcommand)]
@@ -236,7 +236,7 @@ pub enum ScanSubcommand {
 
 #[derive(Debug, Args)]
 #[command(
-    after_long_help = "review COMMAND 可选：\n  once [--engine <指纹> <命令>] [--clone-repo] [--clone-workspace-dir <目录>] [--clone-depth <值>] [--engine-prompt <提示词>] [--engine-prompt-file <文件>] [--agent <名称>] [--keep-diff-files] [--max-concurrent-repos <值>] [--max-concurrent-prs <值>] [--max-concurrent-api <值>]\n  daemon [--interval-secs <秒>] [--ui] [--ui-bind <地址>] [--ui-token <口令>] [--engine <指纹> <命令>] [--clone-repo] [--clone-workspace-dir <目录>] [--clone-depth <值>] [--engine-prompt <提示词>] [--engine-prompt-file <文件>] [--agent <名称>] [--keep-diff-files] [--max-concurrent-repos <值>] [--max-concurrent-prs <值>] [--max-concurrent-api <值>]\n  ad-hoc <pr_url> [--engine <指纹> <命令>] [--clone-repo] [--clone-workspace-dir <目录>] [--clone-depth <值>] [--engine-prompt <提示词>] [--engine-prompt-file <文件>] [--agent <名称>] [--keep-diff-files] [--max-concurrent-api <值>]\n\n说明：\n  review 会向 GitHub 提交评论。\n  review 固定使用 shell 模式，本地命令支持 {patch_file}、{agents_file} 与 {changed_files_file} 占位符。\n  启用 --clone-repo 后，可额外使用 {repo_dir}、{repo_head_sha}、{repo_head_ref} 占位符。\n  --clone-depth 控制 clone/fetch 深度，默认 1；设置为 2 可获取最近两个提交用于对比。\n  {patch_file} 仅包含 diff 内容；{agents_file} 包含 --engine-prompt/--engine-prompt-file 与 Agent 汇总内容；{changed_files_file} 仅包含变更文件名列表。\n  --engine-prompt 和 --engine-prompt-file 不能同时使用。\n  --engine 可重复传入，每次必须给两个参数：<fingerprint> <command>，按 PR 轮询使用。\n  --agent 会先按全局 agent 目录配置查找；再回退到 当前目录/.prismflow/prompts 与系统配置目录 pr-reviewer/prompts。\n  --ui 启动本地 HTTP 管理页面；若开放局域网访问，建议同时设置 --ui-token。\n  默认会自动删除生成的 diff 文件；加 --keep-diff-files 可保留到 .prismflow/tmp-diffs。\n\n示例：\n  cargo run -- review once --clone-repo --clone-depth 2 --engine qwen-v1 \"qwen -y \\\"diff={patch_file} agents={agents_file} files={changed_files_file} repo={repo_dir} sha={repo_head_sha}\\\"\" --engine-prompt-file prompts/bug-only.txt --agent logic\n  cargo run -- review ad-hoc https://github.com/owner/repo/pull/123 --engine ollama:qwen2.5:1.5b \"cat {patch_file} {agents_file} {changed_files_file} | ollama run qwen2.5:1.5b\" --engine-prompt-file prompts/bug-only.txt --agent security\n  cargo run -- review daemon --ui --ui-bind 0.0.0.0:8787 --ui-token mysecret --interval-secs 30 --clone-repo --clone-depth 2 --engine qwen-v1 \"qwen -y \\\"diff: {patch_file} agents: {agents_file} files: {changed_files_file}\\\"\" --max-concurrent-repos 3 --max-concurrent-prs 6 --max-concurrent-api 12"
+    after_long_help = "说明：\n  review 会向 GitHub 提交评论。\n  review 固定使用 shell 模式，本地命令支持 {patch_file}、{agents_file} 与 {changed_files_file} 占位符。\n  启用 --clone-repo 后，可额外使用 {repo_dir}、{repo_head_sha}、{repo_head_ref} 占位符。\n  --clone-depth 控制 clone/fetch 深度，默认 1；设置为 2 可获取最近两个提交用于对比。\n  {patch_file} 仅包含 diff 内容；{agents_file} 包含 --engine-prompt/--engine-prompt-file 与 Agent 汇总内容；{changed_files_file} 仅包含变更文件名列表。\n  --engine-prompt 和 --engine-prompt-file 不能同时使用。\n  --engine 可重复传入，每次必须给两个参数：<fingerprint> <command>，按 PR 轮询使用。\n  --repo 非空时仅处理指定仓库；可重复传入。\n  --author 非空时仅处理指定作者（GitHub login）；可重复传入。\n  --exclude-author 可排除指定作者（优先级高于 --author）。\n  --agent 会先按全局 agent 目录配置查找；再回退到 当前目录/.prismflow/prompts 与系统配置目录 pr-reviewer/prompts。\n  --ui 启动本地 HTTP 管理页面；若开放局域网访问，建议同时设置 --ui-token。\n  默认会自动删除生成的 diff 文件；加 --keep-diff-files 可保留到 .prismflow/tmp-diffs。\n\n示例：\n  cargo run -- review once --clone-repo --clone-depth 2 --engine qwen-v1 \"qwen -y \\\"diff={patch_file} agents={agents_file} files={changed_files_file} repo={repo_dir} sha={repo_head_sha}\\\"\" --engine-prompt-file prompts/bug-only.txt --agent logic --repo owner/repo-a --author teammate-a\n  cargo run -- review ad-hoc https://github.com/owner/repo/pull/123 --engine ollama:qwen2.5:1.5b \"cat {patch_file} {agents_file} {changed_files_file} | ollama run qwen2.5:1.5b\" --engine-prompt-file prompts/bug-only.txt --agent security\n  cargo run -- review daemon --ui --ui-bind 0.0.0.0:8787 --ui-token mysecret --interval-secs 30 --clone-repo --clone-depth 2 --engine qwen-v1 \"qwen -y \\\"diff: {patch_file} agents: {agents_file} files: {changed_files_file}\\\"\" --max-concurrent-repos 3 --max-concurrent-prs 6 --max-concurrent-api 12 --repo owner/repo-a --repo owner/repo-b --exclude-author bot-user"
 )]
 pub struct ReviewCommand {
     #[command(subcommand)]
@@ -321,6 +321,20 @@ pub enum ReviewSubcommand {
             help = "排除指定仓库（owner/repo 或 github URL，可重复）"
         )]
         exclude_repos: Vec<String>,
+        #[arg(
+            long = "author",
+            num_args = 1..,
+            action = ArgAction::Append,
+            help = "仅处理指定作者（GitHub login，可重复）"
+        )]
+        authors: Vec<String>,
+        #[arg(
+            long = "exclude-author",
+            num_args = 1..,
+            action = ArgAction::Append,
+            help = "排除指定作者（GitHub login，可重复）"
+        )]
+        exclude_authors: Vec<String>,
     },
     #[command(about = "守护模式持续审查（按间隔轮询执行）")]
     Daemon {
@@ -410,6 +424,20 @@ pub enum ReviewSubcommand {
             help = "排除指定仓库（owner/repo 或 github URL，可重复）"
         )]
         exclude_repos: Vec<String>,
+        #[arg(
+            long = "author",
+            num_args = 1..,
+            action = ArgAction::Append,
+            help = "仅处理指定作者（GitHub login，可重复）"
+        )]
+        authors: Vec<String>,
+        #[arg(
+            long = "exclude-author",
+            num_args = 1..,
+            action = ArgAction::Append,
+            help = "排除指定作者（GitHub login，可重复）"
+        )]
+        exclude_authors: Vec<String>,
     },
     #[command(about = "即时审查单个 PR URL（无需预先加入 repo 列表）")]
     AdHoc {

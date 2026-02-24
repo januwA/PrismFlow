@@ -376,6 +376,8 @@ pub async fn dispatch(
                 large_pr_max_lines,
                 repos,
                 exclude_repos,
+                authors,
+                exclude_authors,
             } => {
                 let resolved_prompt = resolve_engine_prompt(fs, engine_prompt, engine_prompt_file)?;
                 let resolved_engines = resolve_engine_specs(engines)?;
@@ -395,6 +397,8 @@ pub async fn dispatch(
                     max_concurrent_prs,
                     include_repos: repos,
                     exclude_repos,
+                    include_authors: authors,
+                    exclude_authors,
                     ..ReviewWorkflowOptions::default()
                 };
                 let github = github_client_for_action(
@@ -435,6 +439,8 @@ pub async fn dispatch(
                 large_pr_max_lines,
                 repos,
                 exclude_repos,
+                authors,
+                exclude_authors,
             } => {
                 let resolved_prompt = resolve_engine_prompt(fs, engine_prompt, engine_prompt_file)?;
                 let resolved_engines = resolve_engine_specs(engines)?;
@@ -453,6 +459,8 @@ pub async fn dispatch(
                     max_concurrent_prs,
                     include_repos: repos,
                     exclude_repos,
+                    include_authors: authors,
+                    exclude_authors,
                     ..ReviewWorkflowOptions::default()
                 };
                 let (status_tx, mut status_rx) = broadcast::channel::<String>(256);

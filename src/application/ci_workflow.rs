@@ -851,6 +851,7 @@ mod tests {
                 title: "t".to_string(),
                 head_sha: "abc123".to_string(),
                 html_url: None,
+                author_login: Some("mock-user".to_string()),
             }],
         };
         let config = InMemoryConfigRepo::new(config_with_repo());

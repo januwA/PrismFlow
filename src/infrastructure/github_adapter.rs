@@ -75,6 +75,7 @@ impl GitHubRepository for OctocrabGitHubRepository {
                 title: pr.title.unwrap_or_else(|| "(no title)".to_string()),
                 head_sha: pr.head.sha,
                 html_url: pr.html_url.map(|url| url.to_string()),
+                author_login: pr.user.map(|u| u.login),
             })
             .collect();
 
@@ -94,6 +95,7 @@ impl GitHubRepository for OctocrabGitHubRepository {
             title: pr.title.unwrap_or_else(|| "(no title)".to_string()),
             head_sha: pr.head.sha,
             html_url: pr.html_url.map(|u| u.to_string()),
+            author_login: pr.user.map(|u| u.login),
         })
     }
 
