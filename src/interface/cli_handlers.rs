@@ -415,6 +415,7 @@ pub async fn dispatch(
                     git,
                     options,
                     once_ctx,
+                    false,
                     None,
                 )
                 .await?;
@@ -676,6 +677,7 @@ pub async fn dispatch(
                                 ..options.clone()
                             },
                             cycle_ctx.clone(),
+                            true,
                             Some(&status_tx),
                         ) => {
                             if let Err(err) = r {

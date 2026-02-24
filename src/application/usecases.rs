@@ -25,6 +25,7 @@ pub async fn run_review_once(
     git: &dyn GitService,
     mut options: ReviewWorkflowOptions,
     ctx: Arc<TaskContext>,
+    archive_report_on_failure_only: bool,
     status_tx: Option<&broadcast::Sender<String>>,
 ) -> Result<()> {
     if ctx.is_cancelled() {
@@ -44,7 +45,8 @@ pub async fn run_review_once(
     if stats.is_empty() {
         println!("no repositories configured");
     } else {
-        let report_path = write_review_report(fs, "review-once", &stats)?;
+        let report_path =
+            write_review_report(fs, "review-once", &stats, archive_report_on_failure_only)?;
         println!("report_file={}", report_path.display());
         for item in stats {
             if let Some(tx) = status_tx {
@@ -148,7 +150,8 @@ pub async fn run_review_ad_hoc(
     )
     .await?;
 
-    let report_path = write_review_report(fs, "review-ad-hoc", std::slice::from_ref(&stats))?;
+    let report_path =
+        write_review_report(fs, "review-ad-hoc", std::slice::from_ref(&stats), false)?;
     println!("report_file={}", report_path.display());
 
     println!(
@@ -296,6 +299,7 @@ fn write_review_report(
     fs: &dyn FileSystem,
     mode: &str,
     stats: &[RepoReviewStats],
+    archive_on_failure_only: bool,
 ) -> Result<PathBuf> {
     let report = ReviewReport {
         generated_at: chrono::Utc::now().to_rfc3339(),
@@ -316,8 +320,18 @@ fn write_review_report(
     ));
     let raw = serde_json::to_string_pretty(&report)?;
     fs.write(&latest, raw.as_bytes())?;
-    fs.write(&timestamped, raw.as_bytes())?;
-    Ok(timestamped)
+    let should_archive = !archive_on_failure_only || has_review_failures(stats);
+    if should_archive {
+        fs.write(&timestamped, raw.as_bytes())?;
+        return Ok(timestamped);
+    }
+    Ok(latest)
+}
+
+fn has_review_failures(stats: &[RepoReviewStats]) -> bool {
+    stats
+        .iter()
+        .any(|s| s.failed_retryable > 0 || s.failed_fatal > 0)
 }
 
 async fn run_with_heartbeat<T, F>(tag: &str, fut: F, ctx: &TaskContext) -> Result<T>
@@ -349,4 +363,36 @@ fn is_prismflow_trace_comment(body: &str) -> bool {
     lower.contains("prismflow")
         || lower.contains("<!-- prismflow:")
         || lower.contains("[prismflow]")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn has_review_failures_detects_no_failure() {
+        let stats = vec![RepoReviewStats {
+            repo: "owner/repo".to_string(),
+            processed: 1,
+            ..RepoReviewStats::default()
+        }];
+        assert!(!has_review_failures(&stats));
+    }
+
+    #[test]
+    fn has_review_failures_detects_retryable_or_fatal() {
+        let retryable = vec![RepoReviewStats {
+            repo: "owner/repo".to_string(),
+            failed_retryable: 1,
+            ..RepoReviewStats::default()
+        }];
+        assert!(has_review_failures(&retryable));
+
+        let fatal = vec![RepoReviewStats {
+            repo: "owner/repo".to_string(),
+            failed_fatal: 1,
+            ..RepoReviewStats::default()
+        }];
+        assert!(has_review_failures(&fatal));
+    }
 }
