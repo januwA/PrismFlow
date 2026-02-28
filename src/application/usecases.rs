@@ -1,6 +1,7 @@
-use std::path::PathBuf;
+use std::fs;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, SystemTime};
 
 use anyhow::{Result, anyhow};
 use serde::Serialize;
@@ -17,6 +18,9 @@ use crate::domain::ports::{
     ConfigRepository, FileSystem, GitHubRepository, GitService, ShellAdapter,
 };
 
+const CACHE_STALE_AFTER: Duration = Duration::from_secs(2 * 24 * 60 * 60);
+const CACHE_SCAN_DIRS: [&str; 2] = ["tmp-diffs", "tmp-ci"];
+
 pub async fn run_review_once(
     config_repo: &dyn ConfigRepository,
     github: &dyn GitHubRepository,
@@ -31,6 +35,7 @@ pub async fn run_review_once(
     if ctx.is_cancelled() {
         return Err(anyhow!(DomainError::CancelledBySignal));
     }
+    inspect_and_cleanup_stale_prismflow_cache(fs);
     let config = config_repo.load_config()?;
     if config.repos.is_empty() {
         println!("no repositories configured");
@@ -100,6 +105,7 @@ pub async fn run_ci_once(
     if ctx.is_cancelled() {
         return Err(anyhow!(DomainError::CancelledBySignal));
     }
+    inspect_and_cleanup_stale_prismflow_cache(fs);
     if config_repo.load_config()?.repos.is_empty() {
         println!("no repositories configured");
         return Ok(());
@@ -140,6 +146,7 @@ pub async fn run_review_ad_hoc(
     if ctx.is_cancelled() {
         return Err(anyhow!(DomainError::CancelledBySignal));
     }
+    inspect_and_cleanup_stale_prismflow_cache(fs);
     panic_if_cli_agents_missing(fs, &options, "review-ad-hoc");
     options.task_context = Some(ctx.clone());
     let workflow = ReviewWorkflow::new(config_repo, github, Some(shell), fs, git, options);
@@ -365,9 +372,102 @@ fn is_prismflow_trace_comment(body: &str) -> bool {
         || lower.contains("[prismflow]")
 }
 
+#[derive(Debug, Default, Clone, Copy)]
+struct CacheCleanupStats {
+    checked_files: usize,
+    stale_files: usize,
+    removed_files: usize,
+    remove_failures: usize,
+}
+
+fn inspect_and_cleanup_stale_prismflow_cache(fs: &dyn FileSystem) {
+    let cwd = match fs.current_dir() {
+        Ok(v) => v,
+        Err(_) => return,
+    };
+    let stats = cleanup_stale_prismflow_cache_under(&cwd, CACHE_STALE_AFTER, SystemTime::now());
+    if stats.stale_files > 0 || stats.remove_failures > 0 {
+        println!(
+            "cache_check root={} checked_files={} stale_files={} removed_files={} remove_failures={}",
+            cwd.join(".prismflow").display(),
+            stats.checked_files,
+            stats.stale_files,
+            stats.removed_files,
+            stats.remove_failures
+        );
+    }
+}
+
+fn cleanup_stale_prismflow_cache_under(
+    cwd: &Path,
+    stale_after: Duration,
+    now: SystemTime,
+) -> CacheCleanupStats {
+    let root = cwd.join(".prismflow");
+    let mut stats = CacheCleanupStats::default();
+    for dir in CACHE_SCAN_DIRS {
+        walk_and_cleanup_stale_files(&root.join(dir), stale_after, now, &mut stats);
+    }
+    stats
+}
+
+fn walk_and_cleanup_stale_files(
+    dir: &Path,
+    stale_after: Duration,
+    now: SystemTime,
+    stats: &mut CacheCleanupStats,
+) {
+    let entries = match fs::read_dir(dir) {
+        Ok(v) => v,
+        Err(_) => return,
+    };
+
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let file_type = match entry.file_type() {
+            Ok(v) => v,
+            Err(_) => continue,
+        };
+        if file_type.is_dir() {
+            walk_and_cleanup_stale_files(&path, stale_after, now, stats);
+            continue;
+        }
+        if !file_type.is_file() {
+            continue;
+        }
+        stats.checked_files += 1;
+
+        let metadata = match entry.metadata() {
+            Ok(v) => v,
+            Err(_) => continue,
+        };
+        let modified = match metadata.modified() {
+            Ok(v) => v,
+            Err(_) => continue,
+        };
+        let age = match now.duration_since(modified) {
+            Ok(v) => v,
+            Err(_) => continue,
+        };
+
+        if age < stale_after {
+            continue;
+        }
+
+        stats.stale_files += 1;
+        if fs::remove_file(&path).is_ok() {
+            stats.removed_files += 1;
+        } else {
+            stats.remove_failures += 1;
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::path::PathBuf;
+    use std::time::{SystemTime, UNIX_EPOCH};
 
     #[test]
     fn has_review_failures_detects_no_failure() {
@@ -394,5 +494,54 @@ mod tests {
             ..RepoReviewStats::default()
         }];
         assert!(has_review_failures(&fatal));
+    }
+
+    #[test]
+    fn cleanup_stale_prismflow_cache_removes_old_files() {
+        let base = make_temp_dir("cleanup_removes_old_files");
+        let root = base.join(".prismflow").join("tmp-diffs");
+        fs::create_dir_all(&root).expect("create tmp-diffs");
+        let stale_file = root.join("a.diff");
+        fs::write(&stale_file, b"old").expect("write stale file");
+
+        let stats =
+            cleanup_stale_prismflow_cache_under(&base, Duration::from_secs(0), SystemTime::now());
+
+        assert_eq!(stats.checked_files, 1);
+        assert_eq!(stats.stale_files, 1);
+        assert_eq!(stats.removed_files, 1);
+        assert!(!stale_file.exists());
+        let _ = fs::remove_dir_all(base);
+    }
+
+    #[test]
+    fn cleanup_stale_prismflow_cache_keeps_recent_files() {
+        let base = make_temp_dir("cleanup_keeps_recent_files");
+        let root = base.join(".prismflow").join("tmp-ci");
+        fs::create_dir_all(&root).expect("create tmp-ci");
+        let recent_file = root.join("payload.json");
+        fs::write(&recent_file, b"recent").expect("write recent file");
+
+        let stats = cleanup_stale_prismflow_cache_under(
+            &base,
+            Duration::from_secs(24 * 60 * 60),
+            SystemTime::now(),
+        );
+
+        assert_eq!(stats.checked_files, 1);
+        assert_eq!(stats.stale_files, 0);
+        assert_eq!(stats.removed_files, 0);
+        assert!(recent_file.exists());
+        let _ = fs::remove_dir_all(base);
+    }
+
+    fn make_temp_dir(tag: &str) -> PathBuf {
+        let stamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("duration")
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!("prismflow-usecases-{tag}-{stamp}"));
+        fs::create_dir_all(&dir).expect("create temp dir");
+        dir
     }
 }

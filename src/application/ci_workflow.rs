@@ -257,7 +257,6 @@ impl<'a> CiWorkflow<'a> {
                         .map(|ctx| ctx as &dyn CommandContext),
                 )
                 .await;
-            let _ = self.fs.remove_file(&payload_file);
 
             let analysis = match output {
                 Ok(v) => v,
