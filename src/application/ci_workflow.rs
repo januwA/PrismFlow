@@ -37,6 +37,7 @@ pub struct RepoCiStats {
 pub struct CiWorkflowOptions {
     pub max_concurrent_repos: usize,
     pub engine_specs: Vec<EngineSpec>,
+    pub engine_start_index: usize,
     pub engine_prompt: Option<String>,
     pub clone_repo_enabled: bool,
     pub clone_workspace_dir: String,
@@ -51,6 +52,7 @@ impl Default for CiWorkflowOptions {
         Self {
             max_concurrent_repos: 2,
             engine_specs: vec![],
+            engine_start_index: 0,
             engine_prompt: None,
             clone_repo_enabled: false,
             clone_workspace_dir: ".prismflow/ci-repo-cache".to_string(),
@@ -90,8 +92,8 @@ impl<'a> CiWorkflow<'a> {
             fs,
             git,
             engine_fingerprint: workflow_fp,
+            next_engine_idx: AtomicUsize::new(options.engine_start_index),
             options,
-            next_engine_idx: AtomicUsize::new(0),
         }
     }
 
@@ -242,9 +244,13 @@ impl<'a> CiWorkflow<'a> {
             command = command.replace("{repo_dir}", repo_dir_for_shell.as_deref().unwrap_or(""));
             command = command.replace("{repo_head_sha}", &ci.head_sha);
             command = command.replace("{repo_head_ref}", &repo_head_ref_for_shell);
+            let pr_url = pr
+                .html_url
+                .clone()
+                .unwrap_or_else(|| format!("https://github.com/{owner}/{repo}/pull/{}", pr.number));
             println!(
-                "[ENGINE] repo={}/{} pr={} engine={} command_line={}",
-                owner, repo, pr.number, selected_engine.fingerprint, command
+                "[ENGINE] repo={}/{} pr={} pr_url={} engine={} command_line={}",
+                owner, repo, pr.number, pr_url, selected_engine.fingerprint, command
             );
             let output = self
                 .shell
@@ -881,6 +887,41 @@ mod tests {
         assert_eq!(stats[0].failed, 0);
         assert_eq!(stats[0].skipped_no_failures, 0);
         assert_eq!(stats[0].skipped_completed, 0);
+    }
+
+    #[test]
+    fn pick_engine_respects_start_index() {
+        let github = MinimalGitHub { prs: vec![] };
+        let config = InMemoryConfigRepo::new(config_with_repo());
+        let shell = MockShell;
+        let fs = MockFileSystem;
+        let git = MockGit;
+        let workflow = CiWorkflow::new(
+            &config,
+            &github,
+            &shell,
+            &fs,
+            &git,
+            CiWorkflowOptions {
+                engine_specs: vec![
+                    EngineSpec {
+                        fingerprint: "engine-a".to_string(),
+                        command: "a".to_string(),
+                    },
+                    EngineSpec {
+                        fingerprint: "engine-b".to_string(),
+                        command: "b".to_string(),
+                    },
+                ],
+                engine_start_index: 1,
+                ..CiWorkflowOptions::default()
+            },
+        );
+
+        let first = workflow.pick_engine().expect("pick first");
+        let second = workflow.pick_engine().expect("pick second");
+        assert_eq!(first.fingerprint, "engine-b");
+        assert_eq!(second.fingerprint, "engine-a");
     }
 
     #[tokio::test]

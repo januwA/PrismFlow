@@ -273,6 +273,7 @@ pub async fn dispatch(
                         CiWorkflowOptions {
                             max_concurrent_repos,
                             engine_specs: resolved_engines,
+                            engine_start_index: 0,
                             engine_prompt: resolved_prompt,
                             clone_repo_enabled: clone_repo,
                             clone_workspace_dir,
@@ -315,6 +316,7 @@ pub async fn dispatch(
                 let options = CiWorkflowOptions {
                     max_concurrent_repos,
                     engine_specs: resolve_engine_specs(engines)?,
+                    engine_start_index: 0,
                     engine_prompt: resolved_prompt,
                     clone_repo_enabled: clone_repo,
                     clone_workspace_dir,
@@ -324,7 +326,10 @@ pub async fn dispatch(
                     task_context: None,
                 };
                 println!("ci daemon started: interval={}s", interval_secs);
+                let mut cycle_engine_start: usize = 0;
                 loop {
+                    let engine_start_index = cycle_engine_start;
+                    cycle_engine_start = cycle_engine_start.wrapping_add(1);
                     let cycle_ctx = Arc::new(TaskContext::new("ci-daemon-cycle"));
                     let github = github_client_for_action(
                         auth_manager,
@@ -340,7 +345,10 @@ pub async fn dispatch(
                             shell,
                             fs,
                             git,
-                            options.clone(),
+                            CiWorkflowOptions {
+                                engine_start_index,
+                                ..options.clone()
+                            },
                             cycle_ctx.clone(),
                         ) => {
                             if let Err(err) = r {
@@ -547,7 +555,10 @@ pub async fn dispatch(
 
                 println!("review daemon started: interval={}s", interval_secs);
                 println!("control: type `skip` then Enter to skip next pending PR");
+                let mut cycle_engine_start: usize = 0;
                 loop {
+                    let engine_start_index = cycle_engine_start;
+                    cycle_engine_start = cycle_engine_start.wrapping_add(1);
                     if let Ok(dirs) = repo_manager.list_agent_prompt_dirs() {
                         options.agent_prompt_dirs = dirs;
                     }
@@ -702,6 +713,7 @@ pub async fn dispatch(
                             ReviewWorkflowOptions {
                                 status_tx: Some(status_tx.clone()),
                                 skip_flag: Some(skip_flag.clone()),
+                                engine_start_index,
                                 ..options.clone()
                             },
                             cycle_ctx.clone(),

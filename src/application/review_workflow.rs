@@ -72,6 +72,7 @@ pub struct ReviewWorkflowOptions {
     pub retry_attempts: usize,
     pub retry_backoff_ms: u64,
     pub engine_specs: Vec<EngineSpec>,
+    pub engine_start_index: usize,
     pub engine_prompt: Option<String>,
     pub agent_prompt_dirs: Vec<String>,
     pub keep_diff_files: bool,
@@ -98,6 +99,7 @@ impl Default for ReviewWorkflowOptions {
             retry_attempts: DEFAULT_RETRY_ATTEMPTS,
             retry_backoff_ms: DEFAULT_RETRY_BACKOFF_MS,
             engine_specs: vec![],
+            engine_start_index: 0,
             engine_prompt: None,
             agent_prompt_dirs: vec![],
             keep_diff_files: false,
@@ -152,8 +154,8 @@ impl<'a> ReviewWorkflow<'a> {
             fs,
             git,
             engine_fingerprint: workflow_fp,
+            next_engine_idx: AtomicUsize::new(options.engine_start_index),
             options,
-            next_engine_idx: AtomicUsize::new(0),
         }
     }
 
@@ -1010,13 +1012,14 @@ impl<'a> ReviewWorkflow<'a> {
         command = command.replace("{repo_dir}", repo_dir.unwrap_or(""));
         command = command.replace("{repo_head_ref}", repo_head_ref);
         let command_line = command;
+        let pr_url = format!("https://github.com/{owner}/{repo}/pull/{pr_number}");
         println!(
-            "[ENGINE] repo={}/{} pr={} engine={} command_line={}",
-            owner, repo, pr_number, selected_engine.fingerprint, command_line
+            "[ENGINE] repo={}/{} pr={} pr_url={} engine={} command_line={}",
+            owner, repo, pr_number, pr_url, selected_engine.fingerprint, command_line
         );
         self.emit_status(format!(
-            "repo={}/{} pr={} stage=EngineCommand engine={} command_line={}",
-            owner, repo, pr_number, selected_engine.fingerprint, command_line
+            "repo={}/{} pr={} pr_url={} stage=EngineCommand engine={} command_line={}",
+            owner, repo, pr_number, pr_url, selected_engine.fingerprint, command_line
         ));
         let output = match shell
             .run_command_line(
@@ -2352,6 +2355,35 @@ mod tests {
             .clone();
         assert_eq!(checkout_calls, vec!["abc123".to_string()]);
         assert!(repo_dir.to_string_lossy().contains("owner_repo_pr7_abc123"));
+    }
+
+    #[test]
+    fn pick_engine_respects_start_index() {
+        let github = MockGitHub::default();
+        let config = InMemoryConfigRepo::new(config_with_repo());
+        let workflow = workflow(
+            &config,
+            &github,
+            ReviewWorkflowOptions {
+                engine_specs: vec![
+                    EngineSpec {
+                        fingerprint: "engine-a".to_string(),
+                        command: "a".to_string(),
+                    },
+                    EngineSpec {
+                        fingerprint: "engine-b".to_string(),
+                        command: "b".to_string(),
+                    },
+                ],
+                engine_start_index: 1,
+                ..ReviewWorkflowOptions::default()
+            },
+        );
+
+        let first = workflow.pick_engine_for_pr().expect("pick first");
+        let second = workflow.pick_engine_for_pr().expect("pick second");
+        assert_eq!(first.fingerprint, "engine-b");
+        assert_eq!(second.fingerprint, "engine-a");
     }
 
     #[tokio::test]
