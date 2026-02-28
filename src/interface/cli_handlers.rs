@@ -325,18 +325,18 @@ pub async fn dispatch(
                     exclude_repos,
                     task_context: None,
                 };
+                let github = github_client_for_action(
+                    auth_manager,
+                    github_factory,
+                    max_concurrent_api,
+                    "ci",
+                )?;
                 println!("ci daemon started: interval={}s", interval_secs);
                 let mut cycle_engine_start: usize = 0;
                 loop {
                     let engine_start_index = cycle_engine_start;
                     cycle_engine_start = cycle_engine_start.wrapping_add(1);
                     let cycle_ctx = Arc::new(TaskContext::new("ci-daemon-cycle"));
-                    let github = github_client_for_action(
-                        auth_manager,
-                        github_factory,
-                        max_concurrent_api,
-                        "ci",
-                    )?;
                     let mut stop_daemon = false;
                     tokio::select! {
                         r = run_ci_once(
@@ -553,6 +553,12 @@ pub async fn dispatch(
                     }
                 });
 
+                let github = github_client_for_action(
+                    auth_manager,
+                    github_factory,
+                    max_concurrent_api,
+                    "review",
+                )?;
                 println!("review daemon started: interval={}s", interval_secs);
                 println!("control: type `skip` then Enter to skip next pending PR");
                 let mut cycle_engine_start: usize = 0;
@@ -576,20 +582,6 @@ pub async fn dispatch(
                                         let mut adhoc_opts = options.clone();
                                         adhoc_opts.status_tx = Some(status_tx.clone());
                                         let adhoc_ctx = Arc::new(TaskContext::new("review-adhoc"));
-                                        let github = github_client_for_action(
-                                            auth_manager,
-                                            github_factory,
-                                            max_concurrent_api,
-                                            "ad-hoc review",
-                                        );
-                                        let github = match github {
-                                            Ok(client) => client,
-                                            Err(err) => {
-                                                let _ = status_tx
-                                                    .send(format!("ui:adhoc failed error={err:#}"));
-                                                continue;
-                                            }
-                                        };
                                         if let Err(err) = run_review_ad_hoc(
                                             config_repo.as_ref(),
                                             github.as_ref(),
@@ -696,12 +688,6 @@ pub async fn dispatch(
                     }
                     let _ = status_tx.send("cycle:start".to_string());
                     let cycle_ctx = Arc::new(TaskContext::new("review-daemon-cycle"));
-                    let github = github_client_for_action(
-                        auth_manager,
-                        github_factory,
-                        max_concurrent_api,
-                        "review",
-                    )?;
                     let mut stop_daemon = false;
                     tokio::select! {
                         r = run_review_once(
