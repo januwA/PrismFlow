@@ -386,6 +386,7 @@ pub async fn dispatch(
                 engines,
                 engine_prompt,
                 engine_prompt_file,
+                prompt_template,
                 agents,
                 clone_repo,
                 clone_workspace_dir,
@@ -403,10 +404,12 @@ pub async fn dispatch(
             } => {
                 let resolved_prompt = resolve_engine_prompt(fs, engine_prompt, engine_prompt_file)?;
                 let resolved_engines = resolve_engine_specs(engines)?;
+                print_review_engine_list(&resolved_engines, prompt_template.as_deref());
                 let once_ctx = Arc::new(TaskContext::new("review-once"));
                 let options = ReviewWorkflowOptions {
                     engine_specs: resolved_engines,
                     engine_prompt: resolved_prompt,
+                    prompt_template,
                     agent_prompt_dirs: repo_manager.list_agent_prompt_dirs()?,
                     cli_agents: agents,
                     clone_repo_enabled: clone_repo,
@@ -464,6 +467,7 @@ pub async fn dispatch(
                 engines,
                 engine_prompt,
                 engine_prompt_file,
+                prompt_template,
                 agents,
                 clone_repo,
                 clone_workspace_dir,
@@ -481,9 +485,11 @@ pub async fn dispatch(
             } => {
                 let resolved_prompt = resolve_engine_prompt(fs, engine_prompt, engine_prompt_file)?;
                 let resolved_engines = resolve_engine_specs(engines)?;
+                print_review_engine_list(&resolved_engines, prompt_template.as_deref());
                 let mut options = ReviewWorkflowOptions {
                     engine_specs: resolved_engines,
                     engine_prompt: resolved_prompt,
+                    prompt_template,
                     agent_prompt_dirs: repo_manager.list_agent_prompt_dirs()?,
                     cli_agents: agents,
                     clone_repo_enabled: clone_repo,
@@ -760,6 +766,7 @@ pub async fn dispatch(
                 engines,
                 engine_prompt,
                 engine_prompt_file,
+                prompt_template,
                 agents,
                 clone_repo,
                 clone_workspace_dir,
@@ -773,10 +780,12 @@ pub async fn dispatch(
                     .with_context(|| format!("invalid GitHub PR URL: {pr_url}"))?;
                 let resolved_prompt = resolve_engine_prompt(fs, engine_prompt, engine_prompt_file)?;
                 let resolved_engines = resolve_engine_specs(engines)?;
+                print_review_engine_list(&resolved_engines, prompt_template.as_deref());
                 let adhoc_ctx = Arc::new(TaskContext::new("review-adhoc"));
                 let options = ReviewWorkflowOptions {
                     engine_specs: resolved_engines,
                     engine_prompt: resolved_prompt,
+                    prompt_template,
                     agent_prompt_dirs: repo_manager.list_agent_prompt_dirs()?,
                     cli_agents: agents,
                     clone_repo_enabled: clone_repo,
@@ -969,6 +978,27 @@ fn resolve_engine_specs(engines: Vec<String>) -> Result<Vec<EngineSpec>> {
         });
     }
     Ok(out)
+}
+
+fn print_review_engine_list(engine_specs: &[EngineSpec], prompt_template: Option<&str>) {
+    let engine_pairs = engine_specs
+        .iter()
+        .map(|spec| {
+            let expanded = expand_engine_preview(&spec.command, prompt_template);
+            format!("{} => {}", spec.fingerprint, expanded)
+        })
+        .collect::<Vec<_>>()
+        .join(", ");
+    println!("review engines: [{}]", engine_pairs);
+}
+
+fn expand_engine_preview(command: &str, prompt_template: Option<&str>) -> String {
+    if let Some(template) = prompt_template {
+        return command
+            .replace("{prompt_template}", template)
+            .replace("{prompt}", template);
+    }
+    command.to_string()
 }
 
 fn short_key(full: &str) -> &str {

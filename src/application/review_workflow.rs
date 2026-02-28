@@ -74,6 +74,7 @@ pub struct ReviewWorkflowOptions {
     pub engine_specs: Vec<EngineSpec>,
     pub engine_start_index: usize,
     pub engine_prompt: Option<String>,
+    pub prompt_template: Option<String>,
     pub agent_prompt_dirs: Vec<String>,
     pub keep_diff_files: bool,
     pub clone_repo_enabled: bool,
@@ -101,6 +102,7 @@ impl Default for ReviewWorkflowOptions {
             engine_specs: vec![],
             engine_start_index: 0,
             engine_prompt: None,
+            prompt_template: None,
             agent_prompt_dirs: vec![],
             keep_diff_files: false,
             clone_repo_enabled: false,
@@ -1011,6 +1013,19 @@ impl<'a> ReviewWorkflow<'a> {
         command = command.replace("{repo_head_sha}", head_sha);
         command = command.replace("{repo_dir}", repo_dir.unwrap_or(""));
         command = command.replace("{repo_head_ref}", repo_head_ref);
+        if let Some(template) = &self.options.prompt_template {
+            let rendered_prompt = render_prompt_template(
+                template,
+                &patch_file_str,
+                &agents_file_str,
+                &changed_files_file_str,
+                repo_dir.unwrap_or(""),
+                head_sha,
+                repo_head_ref,
+            );
+            command = command.replace("{prompt_template}", &rendered_prompt);
+            command = command.replace("{prompt}", &rendered_prompt);
+        }
         let command_line = command;
         let pr_url = format!("https://github.com/{owner}/{repo}/pull/{pr_number}");
         println!(
@@ -1449,6 +1464,24 @@ fn build_fallback_summary(
     }
 
     out
+}
+
+fn render_prompt_template(
+    template: &str,
+    patch_file: &str,
+    agents_file: &str,
+    changed_files_file: &str,
+    repo_dir: &str,
+    repo_head_sha: &str,
+    repo_head_ref: &str,
+) -> String {
+    template
+        .replace("{patch_file}", patch_file)
+        .replace("{agents_file}", agents_file)
+        .replace("{changed_files_file}", changed_files_file)
+        .replace("{repo_dir}", repo_dir)
+        .replace("{repo_head_sha}", repo_head_sha)
+        .replace("{repo_head_ref}", repo_head_ref)
 }
 
 fn build_patch_dump(
@@ -2384,6 +2417,20 @@ mod tests {
         let second = workflow.pick_engine_for_pr().expect("pick second");
         assert_eq!(first.fingerprint, "engine-b");
         assert_eq!(second.fingerprint, "engine-a");
+    }
+
+    #[test]
+    fn render_prompt_template_replaces_supported_placeholders() {
+        let rendered = render_prompt_template(
+            "p={patch_file};a={agents_file};f={changed_files_file};d={repo_dir};s={repo_head_sha};r={repo_head_ref}",
+            "P",
+            "A",
+            "F",
+            "D",
+            "S",
+            "R",
+        );
+        assert_eq!(rendered, "p=P;a=A;f=F;d=D;s=S;r=R");
     }
 
     #[tokio::test]
