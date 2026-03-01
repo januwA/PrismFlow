@@ -1101,7 +1101,7 @@ impl<'a> ReviewWorkflow<'a> {
         self.fs.create_dir_all(&root)?;
 
         let sanitized = repo.replace('/', "_");
-        let path = root.join(format!("prismflow_{}_{}_agents.txt", sanitized, pr_number));
+        let path = root.join(format!("prismflow_{}_{}_agents.md", sanitized, pr_number));
         self.fs.write(&path, content.as_bytes())?;
         Ok(path)
     }

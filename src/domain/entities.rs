@@ -20,7 +20,7 @@ pub struct MonitoredRepo {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ReviewFilterConfig {
-    #[serde(default = "default_exclude_prefixes")]
+    #[serde(default)]
     pub exclude_prefixes: Vec<String>,
     #[serde(default)]
     pub exclude_files: Vec<String>,
@@ -33,25 +33,25 @@ pub struct ReviewFilterConfig {
 impl Default for ReviewFilterConfig {
     fn default() -> Self {
         Self {
-            exclude_prefixes: default_exclude_prefixes(),
+            exclude_prefixes: vec![
+                "vendor/".to_string(),
+                "node_modules/".to_string(),
+                "dist/".to_string(),
+                "build/".to_string(),
+                ".github/".to_string(),
+                ".vscode/".to_string(),
+            ],
             exclude_files: vec![
                 "package-lock.json".to_string(),
                 "pnpm-lock.yaml".to_string(),
-                "yarn.lock".to_string(),
             ],
-            exclude_extensions: vec![],
+            exclude_extensions: vec![
+                ".db".to_string(),
+                ".lock".to_string(),
+            ],
             skip_binary_without_patch: true,
         }
     }
-}
-
-fn default_exclude_prefixes() -> Vec<String> {
-    vec![
-        "vendor/".to_string(),
-        "node_modules/".to_string(),
-        "dist/".to_string(),
-        "build/".to_string(),
-    ]
 }
 
 fn default_true() -> bool {
