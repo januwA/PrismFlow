@@ -53,9 +53,9 @@ cargo run -- scan once --repo owner/a --exclude-repo owner/b
 ### 代码审查（必须传 `--engine`）
 
 ```bash
-cargo run -- review once --engine qwen-v1 "qwen -y \"diff={patch_file}\""
-cargo run -- review daemon --engine qwen-v1 "qwen -y \"diff={patch_file}\""
-cargo run -- review ad-hoc https://github.com/owner/repo/pull/123 --engine qwen-v1 "qwen -y \"diff={patch_file}\""
+cargo run -- review once --engine qwen-v1 "qwen -y \"diff={diff_file}\""
+cargo run -- review daemon --engine qwen-v1 "qwen -y \"diff={diff_file}\""
+cargo run -- review ad-hoc https://github.com/owner/repo/pull/123 --engine qwen-v1 "qwen -y \"diff={diff_file}\""
 ```
 
 ### CI 失败分析（必须传 `--engine`）
@@ -91,9 +91,15 @@ cargo run -- ci daemon --interval-secs 60 --engine gemini-cli "gemini -y -p \"$(
 
 可用占位符：
 
-- 审查：`{patch_file}`、`{agents_file}`、`{changed_files_file}`
+- 审查：`{diff_file}`、`{agents_file}`
 - CI：`{ci_file}`
 - clone 上下文：`{repo_dir}`、`{repo_head_sha}`、`{repo_head_ref}`
+
+审查文件过滤（`review_filter`）：
+
+- 仅支持排除规则：`exclude_files`、`exclude_prefixes`、`exclude_extensions`
+- `exclude_files` 使用仓库内相对路径（精确匹配）
+- `exclude_extensions` 支持 `.ext` 或 `ext` 写法（大小写不敏感）
 
 并行运行建议（推荐）：
 

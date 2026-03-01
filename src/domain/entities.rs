@@ -45,10 +45,7 @@ impl Default for ReviewFilterConfig {
                 "package-lock.json".to_string(),
                 "pnpm-lock.yaml".to_string(),
             ],
-            exclude_extensions: vec![
-                ".db".to_string(),
-                ".lock".to_string(),
-            ],
+            exclude_extensions: vec![".db".to_string(), ".lock".to_string()],
             skip_binary_without_patch: true,
         }
     }

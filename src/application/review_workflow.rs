@@ -1001,24 +1001,18 @@ impl<'a> ReviewWorkflow<'a> {
         let agents_payload = effective_prompt.unwrap_or_default();
         let agents_file =
             self.write_temp_agents_file(&format!("{owner}/{repo}"), pr_number, agents_payload)?;
-        let files_payload = build_changed_files_list(owner, repo, pr_number, head_sha, files);
-        let changed_files_file =
-            self.write_temp_files_file(&format!("{owner}/{repo}"), pr_number, &files_payload)?;
-        let patch_file_str = patch_file.to_string_lossy().to_string();
+        let diff_file_str = patch_file.to_string_lossy().to_string();
         let agents_file_str = agents_file.to_string_lossy().to_string();
-        let changed_files_file_str = changed_files_file.to_string_lossy().to_string();
-        command = command.replace("{patch_file}", &patch_file_str);
+        command = command.replace("{diff_file}", &diff_file_str);
         command = command.replace("{agents_file}", &agents_file_str);
-        command = command.replace("{changed_files_file}", &changed_files_file_str);
         command = command.replace("{repo_head_sha}", head_sha);
         command = command.replace("{repo_dir}", repo_dir.unwrap_or(""));
         command = command.replace("{repo_head_ref}", repo_head_ref);
         if let Some(template) = &self.options.prompt_template {
             let rendered_prompt = render_prompt_template(
                 template,
-                &patch_file_str,
+                &diff_file_str,
                 &agents_file_str,
-                &changed_files_file_str,
                 repo_dir.unwrap_or(""),
                 head_sha,
                 repo_head_ref,
@@ -1050,7 +1044,6 @@ impl<'a> ReviewWorkflow<'a> {
                 if !self.options.keep_diff_files {
                     let _ = self.fs.remove_file(&patch_file);
                     let _ = self.fs.remove_file(&agents_file);
-                    let _ = self.fs.remove_file(&changed_files_file);
                 }
                 v
             }
@@ -1058,7 +1051,6 @@ impl<'a> ReviewWorkflow<'a> {
                 if !self.options.keep_diff_files {
                     let _ = self.fs.remove_file(&patch_file);
                     let _ = self.fs.remove_file(&agents_file);
-                    let _ = self.fs.remove_file(&changed_files_file);
                 }
                 return Err(e);
             }
@@ -1102,17 +1094,6 @@ impl<'a> ReviewWorkflow<'a> {
 
         let sanitized = repo.replace('/', "_");
         let path = root.join(format!("prismflow_{}_{}_agents.md", sanitized, pr_number));
-        self.fs.write(&path, content.as_bytes())?;
-        Ok(path)
-    }
-
-    fn write_temp_files_file(&self, repo: &str, pr_number: u64, content: &str) -> Result<PathBuf> {
-        let cwd = self.fs.current_dir().unwrap_or_else(|_| PathBuf::from("."));
-        let root = cwd.join(".prismflow").join("tmp-diffs");
-        self.fs.create_dir_all(&root)?;
-
-        let sanitized = repo.replace('/', "_");
-        let path = root.join(format!("prismflow_{}_{}_files.txt", sanitized, pr_number));
         self.fs.write(&path, content.as_bytes())?;
         Ok(path)
     }
@@ -1468,17 +1449,15 @@ fn build_fallback_summary(
 
 fn render_prompt_template(
     template: &str,
-    patch_file: &str,
+    diff_file: &str,
     agents_file: &str,
-    changed_files_file: &str,
     repo_dir: &str,
     repo_head_sha: &str,
     repo_head_ref: &str,
 ) -> String {
     template
-        .replace("{patch_file}", patch_file)
+        .replace("{diff_file}", diff_file)
         .replace("{agents_file}", agents_file)
-        .replace("{changed_files_file}", changed_files_file)
         .replace("{repo_dir}", repo_dir)
         .replace("{repo_head_sha}", repo_head_sha)
         .replace("{repo_head_ref}", repo_head_ref)
@@ -1492,15 +1471,6 @@ fn build_patch_dump(
     files: &[PullRequestFilePatch],
 ) -> String {
     let mut out = String::new();
-    out.push_str("# PrismFlow Review Task\n");
-    out.push_str("You are reviewing a GitHub PR diff.\n");
-    out.push_str("Only use the diff content in this file. Ignore local workspace path/context.\n");
-    out.push_str("Do not ask clarification questions. Produce direct review output.\n");
-    out.push_str("Output format:\n");
-    out.push_str("1) A short summary paragraph.\n");
-    out.push_str("2) Zero or more inline findings, each on one line as:\n");
-    out.push_str("   path:line: message\n");
-    out.push_str("Where `path` must be a file path from the diff and `line` is the new-file line number.\n\n");
     out.push_str(&format!(
         "Repo: {owner}/{repo}\nPR: #{pr_number}\nSHA: {head_sha}\n\n"
     ));
@@ -1511,25 +1481,6 @@ fn build_patch_dump(
             out.push_str(p);
             out.push('\n');
         }
-    }
-    out
-}
-
-fn build_changed_files_list(
-    owner: &str,
-    repo: &str,
-    pr_number: u64,
-    head_sha: &str,
-    files: &[PullRequestFilePatch],
-) -> String {
-    let mut out = String::new();
-    out.push_str("# PrismFlow Changed Files\n");
-    out.push_str(&format!(
-        "Repo: {owner}/{repo}\nPR: #{pr_number}\nSHA: {head_sha}\n\n"
-    ));
-    for f in files {
-        out.push_str(&f.path);
-        out.push('\n');
     }
     out
 }
@@ -2261,7 +2212,7 @@ mod tests {
         if opts.engine_specs.is_empty() {
             opts.engine_specs = vec![EngineSpec {
                 fingerprint: "engine".to_string(),
-                command: "mock {patch_file}".to_string(),
+                command: "mock {diff_file}".to_string(),
             }];
         }
         opts
@@ -2405,15 +2356,14 @@ mod tests {
     #[test]
     fn render_prompt_template_replaces_supported_placeholders() {
         let rendered = render_prompt_template(
-            "p={patch_file};a={agents_file};f={changed_files_file};d={repo_dir};s={repo_head_sha};r={repo_head_ref}",
+            "p={diff_file};a={agents_file};d={repo_dir};s={repo_head_sha};r={repo_head_ref}",
             "P",
             "A",
-            "F",
             "D",
             "S",
             "R",
         );
-        assert_eq!(rendered, "p=P;a=A;f=F;d=D;s=S;r=R");
+        assert_eq!(rendered, "p=P;a=A;d=D;s=S;r=R");
     }
 
     #[tokio::test]
