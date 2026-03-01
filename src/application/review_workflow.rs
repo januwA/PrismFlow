@@ -107,7 +107,7 @@ impl Default for ReviewWorkflowOptions {
             keep_diff_files: false,
             clone_repo_enabled: false,
             clone_workspace_dir: ".prismflow/repo-cache".to_string(),
-            clone_depth: 1,
+            clone_depth: 2,
             large_pr_max_files: DEFAULT_LARGE_PR_MAX_FILES,
             large_pr_max_changed_lines: DEFAULT_LARGE_PR_MAX_CHANGED_LINES,
             cli_agents: vec![],
@@ -585,6 +585,21 @@ impl<'a> ReviewWorkflow<'a> {
                     )
                     .await
                 {
+                    let cmd_ctx = self
+                        .options
+                        .task_context
+                        .as_deref()
+                        .map(|c| c as &dyn CommandContext);
+                    if let Ok(commit_count) = self.git.commit_count(&repo_dir, cmd_ctx).await {
+                        if commit_count <= 1 {
+                            self.emit_status(format!(
+                                "repo={}/{} pr={} stage=Skipped reason=single-commit-history",
+                                owner, repo, pr.number
+                            ));
+                            self.mark_stage(ReviewStage::Skipped, full_repo_name, pr.number);
+                            return PrReviewOutcome::SkippedFiltered;
+                        }
+                    }
                     repo_dir_for_shell = Some(repo_dir.to_string_lossy().to_string());
                     repo_head_ref_for_shell = ctx.head_ref;
                 }
@@ -2286,6 +2301,13 @@ mod tests {
         ) -> Result<()> {
             Ok(())
         }
+        async fn commit_count(
+            &self,
+            _target_dir: &std::path::Path,
+            _ctx: Option<&dyn CommandContext>,
+        ) -> Result<usize> {
+            Ok(2)
+        }
     }
 
     #[derive(Default)]
@@ -2332,6 +2354,14 @@ mod tests {
                 .expect("lock checkout_calls")
                 .push(rev.to_string());
             Ok(())
+        }
+
+        async fn commit_count(
+            &self,
+            _target_dir: &std::path::Path,
+            _ctx: Option<&dyn CommandContext>,
+        ) -> Result<usize> {
+            Ok(2)
         }
     }
 
@@ -2594,6 +2624,90 @@ mod tests {
             .expect("review_once");
 
         assert_eq!(stats[0].processed, 1);
+    }
+
+    #[derive(Default)]
+    struct SingleCommitGit;
+
+    #[async_trait::async_trait]
+    impl GitService for SingleCommitGit {
+        async fn clone_repo(
+            &self,
+            _url: &str,
+            _target_dir: &std::path::Path,
+            _ctx: Option<&dyn CommandContext>,
+        ) -> Result<()> {
+            Ok(())
+        }
+
+        async fn fetch(
+            &self,
+            _target_dir: &std::path::Path,
+            _remote: &str,
+            _refspec: &str,
+            _depth: usize,
+            _ctx: Option<&dyn CommandContext>,
+        ) -> Result<()> {
+            Ok(())
+        }
+
+        async fn checkout(
+            &self,
+            _target_dir: &std::path::Path,
+            _rev: &str,
+            _ctx: Option<&dyn CommandContext>,
+        ) -> Result<()> {
+            Ok(())
+        }
+
+        async fn commit_count(
+            &self,
+            _target_dir: &std::path::Path,
+            _ctx: Option<&dyn CommandContext>,
+        ) -> Result<usize> {
+            Ok(1)
+        }
+    }
+
+    #[tokio::test]
+    async fn skips_review_when_clone_repo_has_single_commit_history() {
+        let github = MockGitHub {
+            prs: vec![PullRequestSummary {
+                number: 1,
+                title: "t".to_string(),
+                head_sha: "abc123".to_string(),
+                html_url: None,
+                author_login: Some("mock-user".to_string()),
+            }],
+            files: HashMap::from([(
+                1,
+                vec![PullRequestFilePatch {
+                    path: "src/lib.rs".to_string(),
+                    patch: Some("@@ -1,1 +1,2 @@\n line\n+let x = y.unwrap();".to_string()),
+                }],
+            )]),
+            ..Default::default()
+        };
+        let config = InMemoryConfigRepo::new(config_with_repo());
+        let shell = MockShell;
+        let fs = MockFileSystem;
+        let git = SingleCommitGit;
+        let stats = ReviewWorkflow::new(
+            &config,
+            &github,
+            Some(&shell),
+            &fs,
+            &git,
+            ReviewWorkflowOptions {
+                clone_repo_enabled: true,
+                ..normalize_test_opts(ReviewWorkflowOptions::default())
+            },
+        )
+        .review_once()
+        .await
+        .expect("review_once");
+        assert_eq!(stats[0].processed, 0);
+        assert_eq!(stats[0].skipped_filtered, 1);
     }
 
     #[tokio::test]

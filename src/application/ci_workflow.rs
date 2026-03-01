@@ -56,7 +56,7 @@ impl Default for CiWorkflowOptions {
             engine_prompt: None,
             clone_repo_enabled: false,
             clone_workspace_dir: ".prismflow/ci-repo-cache".to_string(),
-            clone_depth: 1,
+            clone_depth: 2,
             include_repos: vec![],
             exclude_repos: vec![],
             task_context: None,
@@ -790,6 +790,13 @@ mod tests {
         ) -> Result<()> {
             Ok(())
         }
+        async fn commit_count(
+            &self,
+            _target_dir: &std::path::Path,
+            _ctx: Option<&dyn CommandContext>,
+        ) -> Result<usize> {
+            Ok(2)
+        }
     }
 
     #[derive(Default)]
@@ -836,6 +843,13 @@ mod tests {
                 .expect("lock checkout_calls")
                 .push(rev.to_string());
             Ok(())
+        }
+        async fn commit_count(
+            &self,
+            _target_dir: &std::path::Path,
+            _ctx: Option<&dyn CommandContext>,
+        ) -> Result<usize> {
+            Ok(2)
         }
     }
 

@@ -87,7 +87,9 @@ cargo run -- ci daemon --interval-secs 60 --engine gemini-cli "gemini -y -p \"$(
 - `--shell "<path>"`：指定命令执行 shell（例如 `D:\apps\Git\bin\bash.exe`）
 - `--repo` / `--exclude-repo`：包含/排除仓库（可重复）
 - `--clone-repo`：启用仓库 clone 上下文
+- `--clone-depth`：clone/fetch 深度（默认 `2`）
 - `--clone-workspace-dir`：可指定 clone 缓存目录（`review` 与 `ci` 建议使用不同目录）
+- `review` 在 clone 模式下若检测到仓库历史仅 1 个提交，会跳过该 PR（避免首次脚手架提交噪音）
 
 可用占位符：
 

@@ -78,6 +78,31 @@ impl GitService for LocalGitAdapter {
         .await?;
         Ok(())
     }
+
+    async fn commit_count(
+        &self,
+        target_dir: &Path,
+        ctx: Option<&dyn CommandContext>,
+    ) -> Result<usize> {
+        let output = run_git_capture(
+            ctx,
+            &[
+                "-C",
+                &target_dir.to_string_lossy(),
+                "rev-list",
+                "--count",
+                "HEAD",
+            ],
+            None,
+            "git rev-list --count",
+        )
+        .await?;
+        let trimmed = output.trim();
+        let count = trimmed
+            .parse::<usize>()
+            .map_err(|e| anyhow::anyhow!("failed to parse commit count `{trimmed}`: {e}"))?;
+        Ok(count)
+    }
 }
 
 async fn run_git_command(
@@ -129,6 +154,80 @@ async fn run_git_command(
     }
 
     Ok(status)
+}
+
+async fn run_git_capture(
+    task_ctx: Option<&dyn CommandContext>,
+    args: &[&str],
+    workdir: Option<&str>,
+    label: &str,
+) -> Result<String> {
+    let mut cmd = Command::new("git");
+    cmd.args(args);
+    if let Some(dir) = workdir {
+        cmd.current_dir(dir);
+    }
+    cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
+
+    let mut child = cmd.spawn()?;
+    let pid = child.id();
+    let stdout_reader = child.stdout.take().map(|mut out| {
+        tokio::spawn(async move {
+            use tokio::io::AsyncReadExt;
+            let mut buf = Vec::new();
+            let _ = out.read_to_end(&mut buf).await;
+            buf
+        })
+    });
+    let stderr_reader = child.stderr.take().map(|mut err| {
+        tokio::spawn(async move {
+            use tokio::io::AsyncReadExt;
+            let mut buf = Vec::new();
+            let _ = err.read_to_end(&mut buf).await;
+            buf
+        })
+    });
+    if let (Some(ctx), Some(pid)) = (task_ctx, pid) {
+        ctx.register_child(pid, label.to_string()).await;
+    }
+
+    let status = if let Some(ctx) = task_ctx {
+        tokio::select! {
+            r = child.wait() => r?,
+            _ = ctx.cancelled() => {
+                let _ = child.kill().await;
+                if let (Some(ctx), Some(pid)) = (task_ctx, pid) {
+                    ctx.unregister_child(pid).await;
+                }
+                anyhow::bail!(DomainError::CancelledBySignal);
+            }
+        }
+    } else {
+        child.wait().await?
+    };
+    let out_stdout = match stdout_reader {
+        Some(handle) => handle.await.unwrap_or_default(),
+        None => Vec::new(),
+    };
+    let out_stderr = match stderr_reader {
+        Some(handle) => handle.await.unwrap_or_default(),
+        None => Vec::new(),
+    };
+
+    if let (Some(ctx), Some(pid)) = (task_ctx, pid) {
+        ctx.unregister_child(pid).await;
+    }
+
+    if !status.success() {
+        anyhow::bail!(
+            "git command failed: {} (status={}) {}",
+            label,
+            status,
+            String::from_utf8_lossy(&out_stderr)
+        );
+    }
+
+    Ok(String::from_utf8_lossy(&out_stdout).to_string())
 }
 
 #[cfg(test)]

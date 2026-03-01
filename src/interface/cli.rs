@@ -142,7 +142,7 @@ pub enum CiSubcommand {
             help = "clone 缓存目录"
         )]
         clone_workspace_dir: String,
-        #[arg(long, default_value_t = 1, help = "clone/fetch 深度（最小为 1）")]
+        #[arg(long, default_value_t = 2, help = "clone/fetch 深度（最小为 1）")]
         clone_depth: usize,
         #[arg(long, default_value_t = 2, help = "仓库并发数")]
         max_concurrent_repos: usize,
@@ -188,7 +188,7 @@ pub enum CiSubcommand {
             help = "clone 缓存目录"
         )]
         clone_workspace_dir: String,
-        #[arg(long, default_value_t = 1, help = "clone/fetch 深度（最小为 1）")]
+        #[arg(long, default_value_t = 2, help = "clone/fetch 深度（最小为 1）")]
         clone_depth: usize,
         #[arg(long, default_value_t = 2, help = "仓库并发数")]
         max_concurrent_repos: usize,
@@ -236,7 +236,7 @@ pub enum ScanSubcommand {
 
 #[derive(Debug, Args)]
 #[command(
-    after_long_help = "说明：\n  review 会向 GitHub 提交评论。\n  review 固定使用 shell 模式，本地命令支持 {diff_file} 与 {agents_file} 占位符。\n  启用 --clone-repo 后，可额外使用 {repo_dir}、{repo_head_sha}、{repo_head_ref} 占位符。\n  --clone-depth 控制 clone/fetch 深度，默认 1；设置为 2 可获取最近两个提交用于对比。\n  {diff_file} 仅包含 diff 内容；{agents_file} 包含 --engine-prompt/--engine-prompt-file 与 Agent 汇总内容。\n  也支持 PF 语法：{PF|name}（路径/标量）与 {PF%name}（文件内容）；支持变量：diff_file、agents_file、repo_dir、repo_head_sha、repo_head_ref、pr_url、repo_full_name、pr_number。\n  --engine-prompt 和 --engine-prompt-file 不能同时使用。\n  --prompt-template 可定义统一模板，并在 --engine 命令中通过 {prompt_template} 或 {prompt} 引用（模板本身支持上述占位符与 PF 语法）。\n  --engine 可重复传入，每次必须给两个参数：<fingerprint> <command>，按 PR 轮询使用。\n  --repo 非空时仅处理指定仓库；可重复传入。\n  --author 非空时仅处理指定作者（GitHub login）；可重复传入。\n  --exclude-author 可排除指定作者（优先级高于 --author）。\n  --agent 会先按全局 agent 目录配置查找；再回退到 当前目录/.prismflow/prompts 与系统配置目录 pr-reviewer/prompts。\n  --ui 启动本地 HTTP 管理页面；若开放局域网访问，建议同时设置 --ui-token。\n  默认会自动删除生成的 diff 文件；加 --keep-diff-files 可保留到 .prismflow/tmp-diffs。\n\n示例：\n  cargo run -- review once --clone-repo --clone-depth 2 --engine qwen-v1 \"qwen -y \\\"diff={diff_file} agents={agents_file} repo={repo_dir} sha={repo_head_sha}\\\"\" --engine-prompt-file prompts/bug-only.txt --agent logic --repo owner/repo-a --author teammate-a\n  cargo run -- review ad-hoc https://github.com/owner/repo/pull/123 --engine ollama:qwen2.5:1.5b \"cat {diff_file} {agents_file} | ollama run qwen2.5:1.5b\" --engine-prompt-file prompts/bug-only.txt --agent security\n  cargo run -- review daemon --ui --ui-bind 0.0.0.0:8787 --ui-token mysecret --interval-secs 30 --clone-repo --clone-depth 2 --engine qwen-v1 \"qwen -y \\\"diff: {PF|diff_file} agents: {PF|agents_file}\\\"\" --max-concurrent-repos 3 --max-concurrent-prs 6 --max-concurrent-api 12 --repo owner/repo-a --repo owner/repo-b --exclude-author bot-user"
+    after_long_help = "说明：\n  review 会向 GitHub 提交评论。\n  review 固定使用 shell 模式，本地命令支持 {diff_file} 与 {agents_file} 占位符。\n  启用 --clone-repo 后，可额外使用 {repo_dir}、{repo_head_sha}、{repo_head_ref} 占位符。\n  --clone-depth 控制 clone/fetch 深度，默认 2。\n  当 clone 到的仓库历史仅有 1 个提交时，会跳过该 PR（常见于首次脚手架提交）。\n  {diff_file} 仅包含 diff 内容；{agents_file} 包含 --engine-prompt/--engine-prompt-file 与 Agent 汇总内容。\n  也支持 PF 语法：{PF|name}（路径/标量）与 {PF%name}（文件内容）；支持变量：diff_file、agents_file、repo_dir、repo_head_sha、repo_head_ref、pr_url、repo_full_name、pr_number。\n  --engine-prompt 和 --engine-prompt-file 不能同时使用。\n  --prompt-template 可定义统一模板，并在 --engine 命令中通过 {prompt_template} 或 {prompt} 引用（模板本身支持上述占位符与 PF 语法）。\n  --engine 可重复传入，每次必须给两个参数：<fingerprint> <command>，按 PR 轮询使用。\n  --repo 非空时仅处理指定仓库；可重复传入。\n  --author 非空时仅处理指定作者（GitHub login）；可重复传入。\n  --exclude-author 可排除指定作者（优先级高于 --author）。\n  --agent 会先按全局 agent 目录配置查找；再回退到 当前目录/.prismflow/prompts 与系统配置目录 pr-reviewer/prompts。\n  --ui 启动本地 HTTP 管理页面；若开放局域网访问，建议同时设置 --ui-token。\n  默认会自动删除生成的 diff 文件；加 --keep-diff-files 可保留到 .prismflow/tmp-diffs。\n\n示例：\n  cargo run -- review once --clone-repo --clone-depth 2 --engine qwen-v1 \"qwen -y \\\"diff={diff_file} agents={agents_file} repo={repo_dir} sha={repo_head_sha}\\\"\" --engine-prompt-file prompts/bug-only.txt --agent logic --repo owner/repo-a --author teammate-a\n  cargo run -- review ad-hoc https://github.com/owner/repo/pull/123 --engine ollama:qwen2.5:1.5b \"cat {diff_file} {agents_file} | ollama run qwen2.5:1.5b\" --engine-prompt-file prompts/bug-only.txt --agent security\n  cargo run -- review daemon --ui --ui-bind 0.0.0.0:8787 --ui-token mysecret --interval-secs 30 --clone-repo --clone-depth 2 --engine qwen-v1 \"qwen -y \\\"diff: {PF|diff_file} agents: {PF|agents_file}\\\"\" --max-concurrent-repos 3 --max-concurrent-prs 6 --max-concurrent-api 12 --repo owner/repo-a --repo owner/repo-b --exclude-author bot-user"
 )]
 pub struct ReviewCommand {
     #[command(subcommand)]
@@ -286,7 +286,7 @@ pub enum ReviewSubcommand {
         clone_repo: bool,
         #[arg(long, default_value = ".prismflow/repo-cache", help = "clone 缓存目录")]
         clone_workspace_dir: String,
-        #[arg(long, default_value_t = 1, help = "clone/fetch 深度（最小为 1）")]
+        #[arg(long, default_value_t = 2, help = "clone/fetch 深度（最小为 1）")]
         clone_depth: usize,
         #[arg(
             long,
@@ -394,7 +394,7 @@ pub enum ReviewSubcommand {
         clone_repo: bool,
         #[arg(long, default_value = ".prismflow/repo-cache", help = "clone 缓存目录")]
         clone_workspace_dir: String,
-        #[arg(long, default_value_t = 1, help = "clone/fetch 深度（最小为 1）")]
+        #[arg(long, default_value_t = 2, help = "clone/fetch 深度（最小为 1）")]
         clone_depth: usize,
         #[arg(
             long,
@@ -492,7 +492,7 @@ pub enum ReviewSubcommand {
         clone_repo: bool,
         #[arg(long, default_value = ".prismflow/repo-cache", help = "clone 缓存目录")]
         clone_workspace_dir: String,
-        #[arg(long, default_value_t = 1, help = "clone/fetch 深度（最小为 1）")]
+        #[arg(long, default_value_t = 2, help = "clone/fetch 深度（最小为 1）")]
         clone_depth: usize,
         #[arg(
             long,

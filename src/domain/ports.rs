@@ -209,4 +209,9 @@ pub trait GitService: Send + Sync {
         rev: &str,
         ctx: Option<&dyn CommandContext>,
     ) -> Result<()>;
+    async fn commit_count(
+        &self,
+        target_dir: &Path,
+        ctx: Option<&dyn CommandContext>,
+    ) -> Result<usize>;
 }
