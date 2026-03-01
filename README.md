@@ -95,6 +95,13 @@ cargo run -- ci daemon --interval-secs 60 --engine gemini-cli "gemini -y -p \"$(
 - CI：`{ci_file}`
 - clone 上下文：`{repo_dir}`、`{repo_head_sha}`、`{repo_head_ref}`
 
+PF 模板语法（review）：
+
+- `{PF|name}`：渲染为路径/标量
+- `{PF%name}`：渲染为文件内容
+- 支持变量：`diff_file`、`agents_file`、`repo_dir`、`repo_head_sha`、`repo_head_ref`、`pr_url`、`repo_full_name`、`pr_number`
+- 适用范围：`--engine`、`--prompt-template`、`--engine-prompt`/`--engine-prompt-file`
+
 审查文件过滤（`review_filter`）：
 
 - 仅支持排除规则：`exclude_files`、`exclude_prefixes`、`exclude_extensions`

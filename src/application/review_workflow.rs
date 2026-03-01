@@ -591,15 +591,6 @@ impl<'a> ReviewWorkflow<'a> {
             }
         }
 
-        let effective_prompt = match self.resolve_effective_prompt(agents) {
-            Ok(v) => v,
-            Err(err) => {
-                return match classify_error(&err) {
-                    ErrorClass::Retryable => PrReviewOutcome::FailedRetryable(err.to_string()),
-                    ErrorClass::Fatal => PrReviewOutcome::FailedFatal(err.to_string()),
-                };
-            }
-        };
         let analysis = match self
             .analyze_review(
                 owner,
@@ -607,7 +598,7 @@ impl<'a> ReviewWorkflow<'a> {
                 pr.number,
                 &pr.head_sha,
                 &files,
-                effective_prompt.as_deref(),
+                agents,
                 &selected_engine,
                 repo_dir_for_shell.as_deref(),
                 &repo_head_ref_for_shell,
@@ -985,7 +976,7 @@ impl<'a> ReviewWorkflow<'a> {
         pr_number: u64,
         head_sha: &str,
         files: &[PullRequestFilePatch],
-        effective_prompt: Option<&str>,
+        agents: &[String],
         selected_engine: &EngineSpec,
         repo_dir: Option<&str>,
         repo_head_ref: &str,
@@ -993,35 +984,73 @@ impl<'a> ReviewWorkflow<'a> {
         let shell = self
             .shell
             .ok_or_else(|| anyhow!("shell adapter is unavailable"))?;
-        let mut command = selected_engine.command.clone();
-
+        let pr_url = format!("https://github.com/{owner}/{repo}/pull/{pr_number}");
+        let full_repo_name = format!("{owner}/{repo}");
         let patch = build_patch_dump(owner, repo, pr_number, head_sha, files);
         let patch_file =
             self.write_temp_patch_file(&format!("{owner}/{repo}"), pr_number, &patch)?;
-        let agents_payload = effective_prompt.unwrap_or_default();
-        let agents_file =
-            self.write_temp_agents_file(&format!("{owner}/{repo}"), pr_number, agents_payload)?;
         let diff_file_str = patch_file.to_string_lossy().to_string();
+        let base_prompt = self.resolve_effective_prompt(agents)?;
+        let prompt_ctx = TemplateRenderContext {
+            diff_file: Some(TemplateFile {
+                path: &diff_file_str,
+                content: Some(&patch),
+            }),
+            agents_file: None,
+            repo_dir,
+            repo_head_sha: head_sha,
+            repo_head_ref,
+            pr_url: &pr_url,
+            repo_full_name: &full_repo_name,
+            pr_number,
+        };
+        let agents_payload = match base_prompt {
+            Some(v) => render_runtime_template(&v, &prompt_ctx)?,
+            None => String::new(),
+        };
+        let agents_file =
+            self.write_temp_agents_file(&format!("{owner}/{repo}"), pr_number, &agents_payload)?;
         let agents_file_str = agents_file.to_string_lossy().to_string();
-        command = command.replace("{diff_file}", &diff_file_str);
-        command = command.replace("{agents_file}", &agents_file_str);
-        command = command.replace("{repo_head_sha}", head_sha);
-        command = command.replace("{repo_dir}", repo_dir.unwrap_or(""));
-        command = command.replace("{repo_head_ref}", repo_head_ref);
+        let mut command = selected_engine.command.clone();
         if let Some(template) = &self.options.prompt_template {
-            let rendered_prompt = render_prompt_template(
-                template,
-                &diff_file_str,
-                &agents_file_str,
-                repo_dir.unwrap_or(""),
-                head_sha,
+            let prompt_template_ctx = TemplateRenderContext {
+                diff_file: Some(TemplateFile {
+                    path: &diff_file_str,
+                    content: Some(&patch),
+                }),
+                agents_file: Some(TemplateFile {
+                    path: &agents_file_str,
+                    content: Some(&agents_payload),
+                }),
+                repo_dir,
+                repo_head_sha: head_sha,
                 repo_head_ref,
-            );
+                pr_url: &pr_url,
+                repo_full_name: &full_repo_name,
+                pr_number,
+            };
+            let rendered_prompt = render_runtime_template(template, &prompt_template_ctx)?;
             command = command.replace("{prompt_template}", &rendered_prompt);
             command = command.replace("{prompt}", &rendered_prompt);
         }
+        let command_ctx = TemplateRenderContext {
+            diff_file: Some(TemplateFile {
+                path: &diff_file_str,
+                content: Some(&patch),
+            }),
+            agents_file: Some(TemplateFile {
+                path: &agents_file_str,
+                content: Some(&agents_payload),
+            }),
+            repo_dir,
+            repo_head_sha: head_sha,
+            repo_head_ref,
+            pr_url: &pr_url,
+            repo_full_name: &full_repo_name,
+            pr_number,
+        };
+        command = render_runtime_template(&command, &command_ctx)?;
         let command_line = command;
-        let pr_url = format!("https://github.com/{owner}/{repo}/pull/{pr_number}");
         println!(
             "[ENGINE] repo={}/{} pr={} pr_url={} engine={} command_line={}",
             owner, repo, pr_number, pr_url, selected_engine.fingerprint, command_line
@@ -1447,20 +1476,122 @@ fn build_fallback_summary(
     out
 }
 
-fn render_prompt_template(
-    template: &str,
-    diff_file: &str,
-    agents_file: &str,
-    repo_dir: &str,
-    repo_head_sha: &str,
-    repo_head_ref: &str,
-) -> String {
-    template
-        .replace("{diff_file}", diff_file)
-        .replace("{agents_file}", agents_file)
-        .replace("{repo_dir}", repo_dir)
-        .replace("{repo_head_sha}", repo_head_sha)
-        .replace("{repo_head_ref}", repo_head_ref)
+#[derive(Clone, Copy)]
+struct TemplateFile<'a> {
+    path: &'a str,
+    content: Option<&'a str>,
+}
+
+#[derive(Clone, Copy)]
+struct TemplateRenderContext<'a> {
+    diff_file: Option<TemplateFile<'a>>,
+    agents_file: Option<TemplateFile<'a>>,
+    repo_dir: Option<&'a str>,
+    repo_head_sha: &'a str,
+    repo_head_ref: &'a str,
+    pr_url: &'a str,
+    repo_full_name: &'a str,
+    pr_number: u64,
+}
+
+fn render_runtime_template(input: &str, ctx: &TemplateRenderContext<'_>) -> Result<String> {
+    let with_legacy = render_legacy_placeholders(input, ctx);
+    render_pf_placeholders(&with_legacy, ctx)
+}
+
+fn render_legacy_placeholders(input: &str, ctx: &TemplateRenderContext<'_>) -> String {
+    let mut out = input.to_string();
+    if let Some(file) = ctx.diff_file {
+        out = out.replace("{diff_file}", file.path);
+    }
+    if let Some(file) = ctx.agents_file {
+        out = out.replace("{agents_file}", file.path);
+    }
+    out = out.replace("{repo_head_sha}", ctx.repo_head_sha);
+    out = out.replace("{repo_head_ref}", ctx.repo_head_ref);
+    out = out.replace("{repo_dir}", ctx.repo_dir.unwrap_or(""));
+    out
+}
+
+fn render_pf_placeholders(input: &str, ctx: &TemplateRenderContext<'_>) -> Result<String> {
+    let mut out = String::with_capacity(input.len());
+    let mut cursor = 0usize;
+    while let Some(start_rel) = input[cursor..].find("{PF") {
+        let start = cursor + start_rel;
+        out.push_str(&input[cursor..start]);
+
+        let tail = &input[start..];
+        let close_rel = tail
+            .find('}')
+            .ok_or_else(|| anyhow!("invalid PF template token: missing closing `}}`"))?;
+        let token = &tail[..=close_rel];
+        let rendered = render_pf_token(token, ctx)?;
+        out.push_str(&rendered);
+        cursor = start + close_rel + 1;
+    }
+    out.push_str(&input[cursor..]);
+    Ok(out)
+}
+
+fn render_pf_token(token: &str, ctx: &TemplateRenderContext<'_>) -> Result<String> {
+    if token.len() < 6 || !token.starts_with("{PF") || !token.ends_with('}') {
+        anyhow::bail!("invalid PF template token: {token}");
+    }
+    let mode = token
+        .as_bytes()
+        .get(3)
+        .copied()
+        .ok_or_else(|| anyhow!("invalid PF template token: {token}"))?;
+    if mode != b'|' && mode != b'%' {
+        anyhow::bail!("invalid PF template token mode (expect `|` or `%`): {token}");
+    }
+    let name = &token[4..token.len() - 1];
+    if name.is_empty()
+        || !name
+            .chars()
+            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_')
+    {
+        anyhow::bail!("invalid PF template token name: {token}");
+    }
+    resolve_pf_value(mode as char, name, ctx)
+}
+
+fn resolve_pf_value(mode: char, name: &str, ctx: &TemplateRenderContext<'_>) -> Result<String> {
+    match (mode, name) {
+        ('|', "diff_file") => Ok(ctx
+            .diff_file
+            .map(|v| v.path.to_string())
+            .unwrap_or_default()),
+        ('%', "diff_file") => Ok(ctx
+            .diff_file
+            .and_then(|v| v.content)
+            .unwrap_or_default()
+            .to_string()),
+        ('|', "agents_file") => Ok(ctx
+            .agents_file
+            .map(|v| v.path.to_string())
+            .unwrap_or_default()),
+        ('%', "agents_file") => Ok(ctx
+            .agents_file
+            .and_then(|v| v.content)
+            .unwrap_or_default()
+            .to_string()),
+        ('|', "repo_dir") => Ok(ctx.repo_dir.unwrap_or_default().to_string()),
+        ('|', "repo_head_sha") => Ok(ctx.repo_head_sha.to_string()),
+        ('|', "repo_head_ref") => Ok(ctx.repo_head_ref.to_string()),
+        ('|', "pr_url") => Ok(ctx.pr_url.to_string()),
+        ('|', "repo_full_name") => Ok(ctx.repo_full_name.to_string()),
+        ('|', "pr_number") => Ok(ctx.pr_number.to_string()),
+        ('%', "repo_dir")
+        | ('%', "repo_head_sha")
+        | ('%', "repo_head_ref")
+        | ('%', "pr_url")
+        | ('%', "repo_full_name")
+        | ('%', "pr_number") => {
+            anyhow::bail!("PF token does not support `%` content mode: {{PF%{name}}}")
+        }
+        _ => anyhow::bail!("unknown PF template token: {{PF{mode}{name}}}"),
+    }
 }
 
 fn build_patch_dump(
@@ -2354,16 +2485,49 @@ mod tests {
     }
 
     #[test]
-    fn render_prompt_template_replaces_supported_placeholders() {
-        let rendered = render_prompt_template(
-            "p={diff_file};a={agents_file};d={repo_dir};s={repo_head_sha};r={repo_head_ref}",
-            "P",
-            "A",
-            "D",
-            "S",
-            "R",
+    fn render_runtime_template_supports_legacy_and_pf_tokens() {
+        let ctx = TemplateRenderContext {
+            diff_file: Some(TemplateFile {
+                path: "D:/tmp/d.diff",
+                content: Some("diff-content"),
+            }),
+            agents_file: Some(TemplateFile {
+                path: "D:/tmp/a.md",
+                content: Some("agents-content"),
+            }),
+            repo_dir: Some("D:/repo"),
+            repo_head_sha: "abc123",
+            repo_head_ref: "feature/x",
+            pr_url: "https://github.com/owner/repo/pull/1",
+            repo_full_name: "owner/repo",
+            pr_number: 1,
+        };
+
+        let rendered = render_runtime_template(
+            "d={diff_file}|{PF|diff_file}|{PF%diff_file};a={agents_file}|{PF%agents_file};repo={repo_dir}|{PF|repo_dir};sha={repo_head_sha}|{PF|repo_head_sha};ref={repo_head_ref}|{PF|repo_head_ref};url={PF|pr_url};num={PF|pr_number};name={PF|repo_full_name}",
+            &ctx,
+        )
+        .expect("render template");
+        assert_eq!(
+            rendered,
+            "d=D:/tmp/d.diff|D:/tmp/d.diff|diff-content;a=D:/tmp/a.md|agents-content;repo=D:/repo|D:/repo;sha=abc123|abc123;ref=feature/x|feature/x;url=https://github.com/owner/repo/pull/1;num=1;name=owner/repo"
         );
-        assert_eq!(rendered, "p=P;a=A;d=D;s=S;r=R");
+    }
+
+    #[test]
+    fn render_runtime_template_rejects_unknown_pf_token() {
+        let ctx = TemplateRenderContext {
+            diff_file: None,
+            agents_file: None,
+            repo_dir: None,
+            repo_head_sha: "abc123",
+            repo_head_ref: "feature/x",
+            pr_url: "https://github.com/owner/repo/pull/1",
+            repo_full_name: "owner/repo",
+            pr_number: 1,
+        };
+        let err = render_runtime_template("x={PF|unknown_key}", &ctx).expect_err("must fail");
+        assert!(err.to_string().contains("unknown PF template token"));
     }
 
     #[tokio::test]
