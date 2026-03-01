@@ -138,8 +138,20 @@ impl ShellAdapter for CommandShellAdapter {
             .spawn()
             .with_context(|| format!("failed to execute command line via {}", shell_program))?;
         let pid = child.id();
-        let mut stdout = child.stdout.take();
-        let mut stderr = child.stderr.take();
+        let stdout_reader = child.stdout.take().map(|mut out| {
+            tokio::spawn(async move {
+                let mut buf = Vec::new();
+                let _ = out.read_to_end(&mut buf).await;
+                buf
+            })
+        });
+        let stderr_reader = child.stderr.take().map(|mut err| {
+            tokio::spawn(async move {
+                let mut buf = Vec::new();
+                let _ = err.read_to_end(&mut buf).await;
+                buf
+            })
+        });
         if let (Some(task_ctx), Some(pid)) = (ctx, pid) {
             task_ctx
                 .register_child(
@@ -166,13 +178,13 @@ impl ShellAdapter for CommandShellAdapter {
         } else {
             child.wait().await?
         };
-        let mut stdout_buf = Vec::new();
-        let mut stderr_buf = Vec::new();
-        if let Some(ref mut out) = stdout {
-            let _ = out.read_to_end(&mut stdout_buf).await;
-        }
-        if let Some(ref mut err) = stderr {
-            let _ = err.read_to_end(&mut stderr_buf).await;
+        let stdout_buf = match stdout_reader {
+            Some(handle) => handle.await.unwrap_or_default(),
+            None => Vec::new(),
+        };
+        let stderr_buf = match stderr_reader {
+            Some(handle) => handle.await.unwrap_or_default(),
+            None => Vec::new(),
         };
         if let (Some(task_ctx), Some(pid)) = (ctx, pid) {
             task_ctx.unregister_child(pid).await;
@@ -276,5 +288,24 @@ mod tests {
             .await
             .expect("command should succeed");
         assert!(output.to_ascii_lowercase().contains("prismflow"));
+    }
+
+    #[tokio::test]
+    async fn command_line_large_output_does_not_deadlock() {
+        let adapter = CommandShellAdapter::default();
+        #[cfg(target_os = "windows")]
+        let command = "1..12000 | ForEach-Object { 'prismflow' }";
+        #[cfg(not(target_os = "windows"))]
+        let command = "for i in $(seq 1 12000); do echo prismflow; done";
+
+        let result = tokio::time::timeout(
+            Duration::from_secs(8),
+            adapter.run_command_line(command, None),
+        )
+        .await
+        .expect("command should not hang")
+        .expect("command should succeed");
+
+        assert!(result.contains("prismflow"));
     }
 }

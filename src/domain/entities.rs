@@ -23,13 +23,7 @@ pub struct ReviewFilterConfig {
     #[serde(default = "default_exclude_prefixes")]
     pub exclude_prefixes: Vec<String>,
     #[serde(default)]
-    pub include_prefixes: Vec<String>,
-    #[serde(default)]
-    pub include_files: Vec<String>,
-    #[serde(default)]
     pub exclude_files: Vec<String>,
-    #[serde(default)]
-    pub include_extensions: Vec<String>,
     #[serde(default)]
     pub exclude_extensions: Vec<String>,
     #[serde(default = "default_true")]
@@ -40,17 +34,11 @@ impl Default for ReviewFilterConfig {
     fn default() -> Self {
         Self {
             exclude_prefixes: default_exclude_prefixes(),
-            include_prefixes: vec![],
-            include_files: vec![
-                ".github/workflows/ci.yml".to_string(),
-                ".github/workflows/release.yml".to_string(),
-            ],
             exclude_files: vec![
                 "package-lock.json".to_string(),
                 "pnpm-lock.yaml".to_string(),
                 "yarn.lock".to_string(),
             ],
-            include_extensions: vec![],
             exclude_extensions: vec![],
             skip_binary_without_patch: true,
         }

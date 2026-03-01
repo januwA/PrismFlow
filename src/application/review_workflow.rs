@@ -1650,16 +1650,7 @@ fn should_review_file(path: &str, has_patch: bool, filter: &ReviewFilterConfig) 
         return false;
     }
 
-    if filter.include_files.iter().any(|v| v == &p) {
-        return true;
-    }
     if filter.exclude_files.iter().any(|v| v == &p) {
-        return false;
-    }
-
-    if !filter.include_prefixes.is_empty()
-        && !filter.include_prefixes.iter().any(|pre| p.starts_with(pre))
-    {
         return false;
     }
 
@@ -1672,14 +1663,6 @@ fn should_review_file(path: &str, has_patch: bool, filter: &ReviewFilterConfig) 
         .next()
         .unwrap_or_default()
         .to_ascii_lowercase();
-    if !filter.include_extensions.is_empty()
-        && !filter
-            .include_extensions
-            .iter()
-            .any(|e| e.trim_start_matches('.').eq_ignore_ascii_case(&ext))
-    {
-        return false;
-    }
     if filter
         .exclude_extensions
         .iter()
