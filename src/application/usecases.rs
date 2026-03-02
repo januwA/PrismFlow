@@ -18,7 +18,6 @@ use crate::domain::ports::{
     ConfigRepository, FileSystem, GitHubRepository, GitService, ShellAdapter,
 };
 
-const CACHE_STALE_AFTER: Duration = Duration::from_secs(2 * 24 * 60 * 60);
 const CACHE_SCAN_DIRS: [&str; 2] = ["tmp-diffs", "tmp-ci"];
 
 pub async fn run_review_once(
@@ -29,13 +28,14 @@ pub async fn run_review_once(
     git: &dyn GitService,
     mut options: ReviewWorkflowOptions,
     ctx: Arc<TaskContext>,
+    cache_cleanup_hours: u64,
     archive_report_on_failure_only: bool,
     status_tx: Option<&broadcast::Sender<String>>,
 ) -> Result<()> {
     if ctx.is_cancelled() {
         return Err(anyhow!(DomainError::CancelledBySignal));
     }
-    inspect_and_cleanup_stale_prismflow_cache(fs);
+    inspect_and_cleanup_stale_prismflow_cache(fs, cache_cleanup_hours);
     let config = config_repo.load_config()?;
     if config.repos.is_empty() {
         println!("no repositories configured");
@@ -101,11 +101,12 @@ pub async fn run_ci_once(
     git: &dyn GitService,
     mut options: CiWorkflowOptions,
     ctx: Arc<TaskContext>,
+    cache_cleanup_hours: u64,
 ) -> Result<()> {
     if ctx.is_cancelled() {
         return Err(anyhow!(DomainError::CancelledBySignal));
     }
-    inspect_and_cleanup_stale_prismflow_cache(fs);
+    inspect_and_cleanup_stale_prismflow_cache(fs, cache_cleanup_hours);
     if config_repo.load_config()?.repos.is_empty() {
         println!("no repositories configured");
         return Ok(());
@@ -142,11 +143,12 @@ pub async fn run_review_ad_hoc(
     pr_number: u64,
     mut options: ReviewWorkflowOptions,
     ctx: Arc<TaskContext>,
+    cache_cleanup_hours: u64,
 ) -> Result<()> {
     if ctx.is_cancelled() {
         return Err(anyhow!(DomainError::CancelledBySignal));
     }
-    inspect_and_cleanup_stale_prismflow_cache(fs);
+    inspect_and_cleanup_stale_prismflow_cache(fs, cache_cleanup_hours);
     panic_if_cli_agents_missing(fs, &options, "review-ad-hoc");
     options.task_context = Some(ctx.clone());
     let workflow = ReviewWorkflow::new(config_repo, github, Some(shell), fs, git, options);
@@ -380,16 +382,19 @@ struct CacheCleanupStats {
     remove_failures: usize,
 }
 
-fn inspect_and_cleanup_stale_prismflow_cache(fs: &dyn FileSystem) {
+fn inspect_and_cleanup_stale_prismflow_cache(fs: &dyn FileSystem, cache_cleanup_hours: u64) {
     let cwd = match fs.current_dir() {
         Ok(v) => v,
         Err(_) => return,
     };
-    let stats = cleanup_stale_prismflow_cache_under(&cwd, CACHE_STALE_AFTER, SystemTime::now());
+    let stale_after =
+        Duration::from_secs(cache_cleanup_hours.saturating_mul(60).saturating_mul(60));
+    let stats = cleanup_stale_prismflow_cache_under(&cwd, stale_after, SystemTime::now());
     if stats.stale_files > 0 || stats.remove_failures > 0 {
         println!(
-            "cache_check root={} checked_files={} stale_files={} removed_files={} remove_failures={}",
+            "cache_check root={} cleanup_hours={} checked_files={} stale_files={} removed_files={} remove_failures={}",
             cwd.join(".prismflow").display(),
+            cache_cleanup_hours,
             stats.checked_files,
             stats.stale_files,
             stats.removed_files,

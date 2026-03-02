@@ -76,7 +76,6 @@ pub struct ReviewWorkflowOptions {
     pub engine_prompt: Option<String>,
     pub prompt_template: Option<String>,
     pub agent_prompt_dirs: Vec<String>,
-    pub keep_diff_files: bool,
     pub clone_repo_enabled: bool,
     pub clone_workspace_dir: String,
     pub clone_depth: usize,
@@ -104,7 +103,6 @@ impl Default for ReviewWorkflowOptions {
             engine_prompt: None,
             prompt_template: None,
             agent_prompt_dirs: vec![],
-            keep_diff_files: false,
             clone_repo_enabled: false,
             clone_workspace_dir: ".prismflow/repo-cache".to_string(),
             clone_depth: 2,
@@ -1084,18 +1082,8 @@ impl<'a> ReviewWorkflow<'a> {
             )
             .await
         {
-            Ok(v) => {
-                if !self.options.keep_diff_files {
-                    let _ = self.fs.remove_file(&patch_file);
-                    let _ = self.fs.remove_file(&agents_file);
-                }
-                v
-            }
+            Ok(v) => v,
             Err(e) => {
-                if !self.options.keep_diff_files {
-                    let _ = self.fs.remove_file(&patch_file);
-                    let _ = self.fs.remove_file(&agents_file);
-                }
                 return Err(e);
             }
         };

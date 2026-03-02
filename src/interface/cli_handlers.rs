@@ -250,6 +250,7 @@ pub async fn dispatch(
                 clone_workspace_dir,
                 clone_depth,
                 max_concurrent_repos,
+                cache_cleanup_hours,
                 max_concurrent_api,
                 repos,
                 exclude_repos,
@@ -283,6 +284,7 @@ pub async fn dispatch(
                             task_context: None,
                         },
                         once_ctx.clone(),
+                        cache_cleanup_hours,
                     ) => {
                         r?;
                     }
@@ -308,6 +310,7 @@ pub async fn dispatch(
                 clone_workspace_dir,
                 clone_depth,
                 max_concurrent_repos,
+                cache_cleanup_hours,
                 max_concurrent_api,
                 repos,
                 exclude_repos,
@@ -350,6 +353,7 @@ pub async fn dispatch(
                                 ..options.clone()
                             },
                             cycle_ctx.clone(),
+                            cache_cleanup_hours,
                         ) => {
                             if let Err(err) = r {
                                 eprintln!("ci cycle failed: {err:#}");
@@ -391,9 +395,9 @@ pub async fn dispatch(
                 clone_repo,
                 clone_workspace_dir,
                 clone_depth,
-                keep_diff_files,
                 max_concurrent_repos,
                 max_concurrent_prs,
+                cache_cleanup_hours,
                 max_concurrent_api,
                 large_pr_max_files,
                 large_pr_max_lines,
@@ -417,7 +421,6 @@ pub async fn dispatch(
                     clone_depth,
                     large_pr_max_files,
                     large_pr_max_changed_lines: large_pr_max_lines,
-                    keep_diff_files,
                     max_concurrent_repos,
                     max_concurrent_prs,
                     include_repos: repos,
@@ -441,6 +444,7 @@ pub async fn dispatch(
                         git,
                         options,
                         once_ctx.clone(),
+                        cache_cleanup_hours,
                         false,
                         None,
                     ) => {
@@ -472,9 +476,9 @@ pub async fn dispatch(
                 clone_repo,
                 clone_workspace_dir,
                 clone_depth,
-                keep_diff_files,
                 max_concurrent_repos,
                 max_concurrent_prs,
+                cache_cleanup_hours,
                 max_concurrent_api,
                 large_pr_max_files,
                 large_pr_max_lines,
@@ -497,7 +501,6 @@ pub async fn dispatch(
                     clone_depth,
                     large_pr_max_files,
                     large_pr_max_changed_lines: large_pr_max_lines,
-                    keep_diff_files,
                     max_concurrent_repos,
                     max_concurrent_prs,
                     include_repos: repos,
@@ -599,6 +602,7 @@ pub async fn dispatch(
                                             pr_number,
                                             adhoc_opts,
                                             adhoc_ctx,
+                                            cache_cleanup_hours,
                                         )
                                         .await
                                         {
@@ -709,6 +713,7 @@ pub async fn dispatch(
                                 ..options.clone()
                             },
                             cycle_ctx.clone(),
+                            cache_cleanup_hours,
                             true,
                             Some(&status_tx),
                         ) => {
@@ -771,7 +776,7 @@ pub async fn dispatch(
                 clone_repo,
                 clone_workspace_dir,
                 clone_depth,
-                keep_diff_files,
+                cache_cleanup_hours,
                 max_concurrent_api,
                 large_pr_max_files,
                 large_pr_max_lines,
@@ -793,7 +798,6 @@ pub async fn dispatch(
                     clone_depth,
                     large_pr_max_files,
                     large_pr_max_changed_lines: large_pr_max_lines,
-                    keep_diff_files,
                     ..ReviewWorkflowOptions::default()
                 };
                 let github = github_client_for_action(
@@ -814,6 +818,7 @@ pub async fn dispatch(
                         pr_number,
                         options,
                         adhoc_ctx.clone(),
+                        cache_cleanup_hours,
                     ) => {
                         r?;
                     }
