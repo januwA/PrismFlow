@@ -1,5 +1,5 @@
 use std::{
-    collections::HashSet,
+    collections::{HashMap, HashSet},
     fs,
     path::{Path, PathBuf},
     sync::{
@@ -74,6 +74,7 @@ pub struct ReviewWorkflowOptions {
     pub engine_start_index: usize,
     pub engine_prompt: Option<String>,
     pub prompt_template: Option<String>,
+    pub custom_template_vars: HashMap<String, String>,
     pub agent_prompt_dirs: Vec<String>,
     pub clone_repo_enabled: bool,
     pub clone_workspace_dir: String,
@@ -99,6 +100,7 @@ impl Default for ReviewWorkflowOptions {
             engine_start_index: 0,
             engine_prompt: None,
             prompt_template: None,
+            custom_template_vars: HashMap::new(),
             agent_prompt_dirs: vec![],
             clone_repo_enabled: false,
             clone_workspace_dir: ".prismflow/repo-cache".to_string(),
@@ -990,6 +992,7 @@ impl<'a> ReviewWorkflow<'a> {
             pr_url: &pr_url,
             repo_full_name: &full_repo_name,
             pr_number,
+            custom_template_vars: &self.options.custom_template_vars,
         };
         let agents_payload = match base_prompt {
             Some(v) => render_runtime_template(&v, &prompt_ctx)?,
@@ -1015,6 +1018,7 @@ impl<'a> ReviewWorkflow<'a> {
                 pr_url: &pr_url,
                 repo_full_name: &full_repo_name,
                 pr_number,
+                custom_template_vars: &self.options.custom_template_vars,
             };
             let rendered_prompt = render_runtime_template(template, &prompt_template_ctx)?;
             command = command.replace("{prompt_template}", &rendered_prompt);
@@ -1035,6 +1039,7 @@ impl<'a> ReviewWorkflow<'a> {
             pr_url: &pr_url,
             repo_full_name: &full_repo_name,
             pr_number,
+            custom_template_vars: &self.options.custom_template_vars,
         };
         command = render_runtime_template(&command, &command_ctx)?;
         let command_line = command;
@@ -1505,6 +1510,7 @@ struct TemplateRenderContext<'a> {
     pr_url: &'a str,
     repo_full_name: &'a str,
     pr_number: u64,
+    custom_template_vars: &'a HashMap<String, String>,
 }
 
 fn render_runtime_template(input: &str, ctx: &TemplateRenderContext<'_>) -> Result<String> {
@@ -1555,8 +1561,8 @@ fn render_pf_token(token: &str, ctx: &TemplateRenderContext<'_>) -> Result<Strin
         .get(3)
         .copied()
         .ok_or_else(|| anyhow!("invalid PF template token: {token}"))?;
-    if mode != b'|' && mode != b'%' {
-        anyhow::bail!("invalid PF template token mode (expect `|` or `%`): {token}");
+    if mode != b'|' && mode != b'%' && mode != b':' {
+        anyhow::bail!("invalid PF template token mode (expect `|` or `%` or `:`): {token}");
     }
     let name = &token[4..token.len() - 1];
     if name.is_empty()
@@ -1570,6 +1576,14 @@ fn render_pf_token(token: &str, ctx: &TemplateRenderContext<'_>) -> Result<Strin
 }
 
 fn resolve_pf_value(mode: char, name: &str, ctx: &TemplateRenderContext<'_>) -> Result<String> {
+    if mode == ':' {
+        return ctx
+            .custom_template_vars
+            .get(name)
+            .cloned()
+            .ok_or_else(|| anyhow!("unknown PF template token: {{PF:{name}}}"));
+    }
+
     match (mode, name) {
         ('|', "diff_file") => Ok(ctx
             .diff_file
@@ -2663,6 +2677,8 @@ mod tests {
 
     #[test]
     fn render_runtime_template_supports_legacy_and_pf_tokens() {
+        let mut custom_template_vars = HashMap::new();
+        custom_template_vars.insert("lang".to_string(), "zh-CN".to_string());
         let ctx = TemplateRenderContext {
             diff_file: Some(TemplateFile {
                 path: "D:/tmp/d.diff",
@@ -2678,21 +2694,23 @@ mod tests {
             pr_url: "https://github.com/owner/repo/pull/1",
             repo_full_name: "owner/repo",
             pr_number: 1,
+            custom_template_vars: &custom_template_vars,
         };
 
         let rendered = render_runtime_template(
-            "d={diff_file}|{PF|diff_file}|{PF%diff_file};a={agents_file}|{PF%agents_file};repo={repo_dir}|{PF|repo_dir};sha={repo_head_sha}|{PF|repo_head_sha};ref={repo_head_ref}|{PF|repo_head_ref};url={PF|pr_url};num={PF|pr_number};name={PF|repo_full_name}",
+            "d={diff_file}|{PF|diff_file}|{PF%diff_file};a={agents_file}|{PF%agents_file};repo={repo_dir}|{PF|repo_dir};sha={repo_head_sha}|{PF|repo_head_sha};ref={repo_head_ref}|{PF|repo_head_ref};url={PF|pr_url};num={PF|pr_number};name={PF|repo_full_name};lang={PF:lang}",
             &ctx,
         )
         .expect("render template");
         assert_eq!(
             rendered,
-            "d=D:/tmp/d.diff|D:/tmp/d.diff|diff-content;a=D:/tmp/a.md|agents-content;repo=D:/repo|D:/repo;sha=abc123|abc123;ref=feature/x|feature/x;url=https://github.com/owner/repo/pull/1;num=1;name=owner/repo"
+            "d=D:/tmp/d.diff|D:/tmp/d.diff|diff-content;a=D:/tmp/a.md|agents-content;repo=D:/repo|D:/repo;sha=abc123|abc123;ref=feature/x|feature/x;url=https://github.com/owner/repo/pull/1;num=1;name=owner/repo;lang=zh-CN"
         );
     }
 
     #[test]
     fn render_runtime_template_rejects_unknown_pf_token() {
+        let custom_template_vars = HashMap::new();
         let ctx = TemplateRenderContext {
             diff_file: None,
             agents_file: None,
@@ -2702,6 +2720,7 @@ mod tests {
             pr_url: "https://github.com/owner/repo/pull/1",
             repo_full_name: "owner/repo",
             pr_number: 1,
+            custom_template_vars: &custom_template_vars,
         };
         let err = render_runtime_template("x={PF|unknown_key}", &ctx).expect_err("must fail");
         assert!(err.to_string().contains("unknown PF template token"));
