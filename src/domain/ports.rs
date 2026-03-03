@@ -94,6 +94,14 @@ pub trait GitHubRepository: Send + Sync {
         repo: &str,
         pull_number: u64,
     ) -> Result<Vec<PullRequestFilePatch>>;
+    async fn list_pull_request_commit_messages(
+        &self,
+        _owner: &str,
+        _repo: &str,
+        _pull_number: u64,
+    ) -> Result<Vec<String>> {
+        Ok(Vec::new())
+    }
     async fn list_issue_comment_bodies(
         &self,
         owner: &str,

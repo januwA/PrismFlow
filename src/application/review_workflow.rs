@@ -575,12 +575,28 @@ impl<'a> ReviewWorkflow<'a> {
             }
         }
 
+        let commit_messages = match self
+            .github
+            .list_pull_request_commit_messages(owner, repo, pr.number)
+            .await
+        {
+            Ok(v) => v,
+            Err(_) => Vec::new(),
+        };
+        let pr_url = pr
+            .html_url
+            .clone()
+            .unwrap_or_else(|| format!("https://github.com/{owner}/{repo}/pull/{}", pr.number));
+
         let analysis = match self
             .analyze_review(
                 owner,
                 repo,
                 pr.number,
+                &pr.title,
+                &pr_url,
                 &pr.head_sha,
+                &commit_messages,
                 &files,
                 agents,
                 &selected_engine,
@@ -934,7 +950,10 @@ impl<'a> ReviewWorkflow<'a> {
         owner: &str,
         repo: &str,
         pr_number: u64,
+        pr_title: &str,
+        pr_url: &str,
         head_sha: &str,
+        commit_messages: &[String],
         files: &[PullRequestFilePatch],
         agents: &[String],
         selected_engine: &EngineSpec,
@@ -944,9 +963,17 @@ impl<'a> ReviewWorkflow<'a> {
         let shell = self
             .shell
             .ok_or_else(|| anyhow!("shell adapter is unavailable"))?;
-        let pr_url = format!("https://github.com/{owner}/{repo}/pull/{pr_number}");
         let full_repo_name = format!("{owner}/{repo}");
-        let patch = build_patch_dump(owner, repo, pr_number, head_sha, files);
+        let patch = build_patch_dump(
+            owner,
+            repo,
+            pr_number,
+            pr_title,
+            pr_url,
+            head_sha,
+            commit_messages,
+            files,
+        );
         let patch_file =
             self.write_temp_patch_file(&format!("{owner}/{repo}"), pr_number, &patch)?;
         let diff_file_str = patch_file.to_string_lossy().to_string();
@@ -1584,13 +1611,26 @@ fn build_patch_dump(
     owner: &str,
     repo: &str,
     pr_number: u64,
+    pr_title: &str,
+    pr_url: &str,
     head_sha: &str,
+    commit_messages: &[String],
     files: &[PullRequestFilePatch],
 ) -> String {
+    let title = pr_title.replace('\n', " ").trim().to_string();
     let mut out = String::new();
     out.push_str(&format!(
-        "Repo: {owner}/{repo}\nPR: #{pr_number}\nSHA: {head_sha}\n\n"
+        "Repo: {owner}/{repo}\nPR: #{pr_number}\nTitle: {title}\nURL: {pr_url}\nSHA: {head_sha}\n\n"
     ));
+    out.push_str("Commits:\n");
+    if commit_messages.is_empty() {
+        out.push_str("- (unavailable)\n");
+    } else {
+        for msg in commit_messages.iter().take(20) {
+            out.push_str(&format!("- {msg}\n"));
+        }
+    }
+    out.push('\n');
 
     for f in files {
         out.push_str(&format!("diff --git a/{0} b/{0}\n", f.path));

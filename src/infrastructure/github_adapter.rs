@@ -280,6 +280,45 @@ impl GitHubRepository for OctocrabGitHubRepository {
         Ok(files)
     }
 
+    async fn list_pull_request_commit_messages(
+        &self,
+        owner: &str,
+        repo: &str,
+        pull_number: u64,
+    ) -> Result<Vec<String>> {
+        #[derive(Debug, Deserialize)]
+        struct CommitDto {
+            sha: String,
+            commit: CommitDetailDto,
+        }
+        #[derive(Debug, Deserialize)]
+        struct CommitDetailDto {
+            message: String,
+        }
+
+        let _permit = self.acquire_api_permit().await?;
+        let route = format!("/repos/{owner}/{repo}/pulls/{pull_number}/commits");
+        let items: Vec<CommitDto> = self.client.get(route, None::<&()>).await?;
+
+        let messages = items
+            .into_iter()
+            .map(|c| {
+                let short_sha = &c.sha[..c.sha.len().min(12)];
+                let subject = c
+                    .commit
+                    .message
+                    .lines()
+                    .next()
+                    .map(str::trim)
+                    .filter(|v| !v.is_empty())
+                    .unwrap_or("(no commit message)");
+                format!("{short_sha} {subject}")
+            })
+            .collect::<Vec<_>>();
+
+        Ok(messages)
+    }
+
     async fn list_issue_comment_bodies(
         &self,
         owner: &str,
