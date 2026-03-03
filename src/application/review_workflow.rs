@@ -1641,7 +1641,18 @@ fn build_patch_dump(
         out.push_str("- (unavailable)\n");
     } else {
         for msg in commit_messages.iter().take(20) {
-            out.push_str(&format!("- {msg}\n"));
+            let normalized = msg.replace("\r\n", "\n");
+            let mut lines = normalized.lines();
+            if let Some(first) = lines.next() {
+                out.push_str(&format!("- {first}\n"));
+                for line in lines {
+                    out.push_str("  ");
+                    out.push_str(line);
+                    out.push('\n');
+                }
+            } else {
+                out.push_str("- (no commit message)\n");
+            }
         }
     }
     out.push('\n');
@@ -2724,6 +2735,24 @@ mod tests {
         };
         let err = render_runtime_template("x={PF|unknown_key}", &ctx).expect_err("must fail");
         assert!(err.to_string().contains("unknown PF template token"));
+    }
+
+    #[test]
+    fn build_patch_dump_includes_multiline_commit_body() {
+        let dump = build_patch_dump(
+            "owner",
+            "repo",
+            42,
+            "demo pr",
+            "https://github.com/owner/repo/pull/42",
+            "abc123",
+            &[String::from(
+                "abc123456789 feat: improve auth\n\nInclude token refresh path.\nHandle expired token.",
+            )],
+            &[],
+        );
+        assert!(dump.contains("Commits:\n- abc123456789 feat: improve auth\n"));
+        assert!(dump.contains("  \n  Include token refresh path.\n  Handle expired token.\n"));
     }
 
     #[tokio::test]

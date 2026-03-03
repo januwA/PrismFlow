@@ -304,15 +304,13 @@ impl GitHubRepository for OctocrabGitHubRepository {
             .into_iter()
             .map(|c| {
                 let short_sha = &c.sha[..c.sha.len().min(12)];
-                let subject = c
-                    .commit
-                    .message
-                    .lines()
-                    .next()
-                    .map(str::trim)
-                    .filter(|v| !v.is_empty())
-                    .unwrap_or("(no commit message)");
-                format!("{short_sha} {subject}")
+                let full_message = c.commit.message.replace("\r\n", "\n");
+                let trimmed = full_message.trim();
+                if trimmed.is_empty() {
+                    format!("{short_sha} (no commit message)")
+                } else {
+                    format!("{short_sha} {trimmed}")
+                }
             })
             .collect::<Vec<_>>();
 
