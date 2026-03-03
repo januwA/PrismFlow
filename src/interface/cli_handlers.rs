@@ -399,8 +399,6 @@ pub async fn dispatch(
                 max_concurrent_prs,
                 cache_cleanup_hours,
                 max_concurrent_api,
-                large_pr_max_files,
-                large_pr_max_lines,
                 repos,
                 exclude_repos,
                 authors,
@@ -419,8 +417,6 @@ pub async fn dispatch(
                     clone_repo_enabled: clone_repo,
                     clone_workspace_dir,
                     clone_depth,
-                    large_pr_max_files,
-                    large_pr_max_changed_lines: large_pr_max_lines,
                     max_concurrent_repos,
                     max_concurrent_prs,
                     include_repos: repos,
@@ -480,8 +476,6 @@ pub async fn dispatch(
                 max_concurrent_prs,
                 cache_cleanup_hours,
                 max_concurrent_api,
-                large_pr_max_files,
-                large_pr_max_lines,
                 repos,
                 exclude_repos,
                 authors,
@@ -499,8 +493,6 @@ pub async fn dispatch(
                     clone_repo_enabled: clone_repo,
                     clone_workspace_dir,
                     clone_depth,
-                    large_pr_max_files,
-                    large_pr_max_changed_lines: large_pr_max_lines,
                     max_concurrent_repos,
                     max_concurrent_prs,
                     include_repos: repos,
@@ -778,8 +770,6 @@ pub async fn dispatch(
                 clone_depth,
                 cache_cleanup_hours,
                 max_concurrent_api,
-                large_pr_max_files,
-                large_pr_max_lines,
             } => {
                 let (owner, repo, pr_number) = parse_github_pr_url(&pr_url)
                     .with_context(|| format!("invalid GitHub PR URL: {pr_url}"))?;
@@ -796,8 +786,6 @@ pub async fn dispatch(
                     clone_repo_enabled: clone_repo,
                     clone_workspace_dir,
                     clone_depth,
-                    large_pr_max_files,
-                    large_pr_max_changed_lines: large_pr_max_lines,
                     ..ReviewWorkflowOptions::default()
                 };
                 let github = github_client_for_action(

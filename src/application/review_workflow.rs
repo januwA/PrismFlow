@@ -32,8 +32,6 @@ const DEFAULT_RETRY_ATTEMPTS: usize = 3;
 const DEFAULT_RETRY_BACKOFF_MS: u64 = 300;
 const PROCESSING_TTL_SECS: i64 = 30 * 60;
 const ADHOC_COOLDOWN_SECS: i64 = 10 * 60;
-const DEFAULT_LARGE_PR_MAX_FILES: u64 = 120;
-const DEFAULT_LARGE_PR_MAX_CHANGED_LINES: u64 = 4000;
 
 #[derive(Debug, Clone)]
 pub struct ScanPrReport {
@@ -80,8 +78,6 @@ pub struct ReviewWorkflowOptions {
     pub clone_repo_enabled: bool,
     pub clone_workspace_dir: String,
     pub clone_depth: usize,
-    pub large_pr_max_files: u64,
-    pub large_pr_max_changed_lines: u64,
     pub cli_agents: Vec<String>,
     pub include_repos: Vec<String>,
     pub exclude_repos: Vec<String>,
@@ -107,8 +103,6 @@ impl Default for ReviewWorkflowOptions {
             clone_repo_enabled: false,
             clone_workspace_dir: ".prismflow/repo-cache".to_string(),
             clone_depth: 2,
-            large_pr_max_files: DEFAULT_LARGE_PR_MAX_FILES,
-            large_pr_max_changed_lines: DEFAULT_LARGE_PR_MAX_CHANGED_LINES,
             cli_agents: vec![],
             include_repos: vec![],
             exclude_repos: vec![],
@@ -440,7 +434,6 @@ impl<'a> ReviewWorkflow<'a> {
             }
         };
         let reviewed_label = reviewed_label_for_sha(&pr.head_sha);
-        let large_skip_label = large_skipped_label_for_sha(&pr.head_sha);
         let previous_reviewed_short_sha = labels.iter().find_map(|l| {
             l.strip_prefix("pr-reviewer:reviewed:")
                 .filter(|short| *short != pr.head_sha.get(0..12).unwrap_or_default())
@@ -450,7 +443,6 @@ impl<'a> ReviewWorkflow<'a> {
         if !force_run {
             if comments.iter().any(|body| body.contains(&completed_anchor))
                 || labels.iter().any(|l| l == &reviewed_label)
-                || labels.iter().any(|l| l == &large_skip_label)
             {
                 return PrReviewOutcome::SkippedCompleted;
             }
@@ -466,28 +458,6 @@ impl<'a> ReviewWorkflow<'a> {
             if age_secs <= ADHOC_COOLDOWN_SECS {
                 return PrReviewOutcome::SkippedProcessing;
             }
-        }
-
-        let metrics = self
-            .github
-            .get_pull_request_metrics(owner, repo, pr.number)
-            .await
-            .unwrap_or_default();
-        if metrics.changed_files >= self.options.large_pr_max_files
-            || metrics.additions.saturating_add(metrics.deletions)
-                >= self.options.large_pr_max_changed_lines
-        {
-            if let Err(err) = self
-                .sync_large_skip_labels(owner, repo, pr.number, &large_skip_label)
-                .await
-            {
-                return match classify_error(&err) {
-                    ErrorClass::Retryable => PrReviewOutcome::FailedRetryable(err.to_string()),
-                    ErrorClass::Fatal => PrReviewOutcome::FailedFatal(err.to_string()),
-                };
-            }
-            self.mark_stage(ReviewStage::Skipped, full_repo_name, pr.number);
-            return PrReviewOutcome::SkippedFiltered;
         }
 
         let selected_engine = match self.pick_engine_for_pr() {
@@ -839,40 +809,6 @@ impl<'a> ReviewWorkflow<'a> {
             .with_retry(|| self.github.list_issue_labels(owner, repo, issue_number))
             .await?;
         let prefix = "pr-reviewer:reviewed:";
-        for old in labels
-            .iter()
-            .filter(|l| l.starts_with(prefix) && l.as_str() != target_label)
-        {
-            let _ = self
-                .with_retry(|| {
-                    self.github
-                        .remove_issue_label(owner, repo, issue_number, old)
-                })
-                .await;
-        }
-
-        if !labels.iter().any(|l| l == target_label) {
-            let label_vec = vec![target_label.to_string()];
-            self.with_retry(|| {
-                self.github
-                    .add_issue_labels(owner, repo, issue_number, &label_vec)
-            })
-            .await?;
-        }
-        Ok(())
-    }
-
-    async fn sync_large_skip_labels(
-        &self,
-        owner: &str,
-        repo: &str,
-        issue_number: u64,
-        target_label: &str,
-    ) -> Result<()> {
-        let labels = self
-            .with_retry(|| self.github.list_issue_labels(owner, repo, issue_number))
-            .await?;
-        let prefix = "pr-reviewer:skipped-large:";
         for old in labels
             .iter()
             .filter(|l| l.starts_with(prefix) && l.as_str() != target_label)
@@ -1458,11 +1394,6 @@ fn workflow_engine_fingerprint(engine_specs: &[EngineSpec]) -> String {
 fn reviewed_label_for_sha(head_sha: &str) -> String {
     let short = &head_sha[..head_sha.len().min(12)];
     format!("pr-reviewer:reviewed:{short}")
-}
-
-fn large_skipped_label_for_sha(head_sha: &str) -> String {
-    let short = &head_sha[..head_sha.len().min(12)];
-    format!("pr-reviewer:skipped-large:{short}")
 }
 
 fn processing_anchor_prefix(key: &str) -> String {

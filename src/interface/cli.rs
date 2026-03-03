@@ -313,18 +313,6 @@ pub enum ReviewSubcommand {
         #[arg(long, default_value_t = 8, help = "全局 API 并发阈值")]
         max_concurrent_api: usize,
         #[arg(
-            long,
-            default_value_t = 120,
-            help = "大改动跳过阈值：文件数达到该值则直接打标签跳过"
-        )]
-        large_pr_max_files: u64,
-        #[arg(
-            long,
-            default_value_t = 4000,
-            help = "大改动跳过阈值：新增+删除行数达到该值则直接打标签跳过"
-        )]
-        large_pr_max_lines: u64,
-        #[arg(
             long = "repo",
             num_args = 1..,
             action = ArgAction::Append,
@@ -421,18 +409,6 @@ pub enum ReviewSubcommand {
         #[arg(long, default_value_t = 8, help = "全局 API 并发阈值")]
         max_concurrent_api: usize,
         #[arg(
-            long,
-            default_value_t = 120,
-            help = "大改动跳过阈值：文件数达到该值则直接打标签跳过"
-        )]
-        large_pr_max_files: u64,
-        #[arg(
-            long,
-            default_value_t = 4000,
-            help = "大改动跳过阈值：新增+删除行数达到该值则直接打标签跳过"
-        )]
-        large_pr_max_lines: u64,
-        #[arg(
             long = "repo",
             num_args = 1..,
             action = ArgAction::Append,
@@ -514,18 +490,6 @@ pub enum ReviewSubcommand {
         cache_cleanup_hours: u64,
         #[arg(long, default_value_t = 8, help = "全局 API 并发阈值")]
         max_concurrent_api: usize,
-        #[arg(
-            long,
-            default_value_t = 120,
-            help = "大改动跳过阈值：文件数达到该值则直接打标签跳过"
-        )]
-        large_pr_max_files: u64,
-        #[arg(
-            long,
-            default_value_t = 4000,
-            help = "大改动跳过阈值：新增+删除行数达到该值则直接打标签跳过"
-        )]
-        large_pr_max_lines: u64,
     },
     #[command(about = "清理指定 PR 上 PrismFlow 留下的评论与标签痕迹（尽力而为）")]
     Clean {
