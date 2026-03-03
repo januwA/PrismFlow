@@ -149,7 +149,7 @@ pub enum CiSubcommand {
         #[arg(
             long,
             default_value_t = 48,
-            help = "缓存清理阈值（小时）：删除 .prismflow/tmp-diffs 与 .prismflow/tmp-ci 中超过该时长的文件"
+            help = "缓存清理阈值（小时）：删除 .prismflow/tmp-diffs、.prismflow/tmp-ci、.prismflow/ci-repo-cache、.prismflow/repo-cache 中超过该时长的缓存"
         )]
         cache_cleanup_hours: u64,
         #[arg(long, default_value_t = 8, help = "全局 API 并发阈值")]
@@ -201,7 +201,7 @@ pub enum CiSubcommand {
         #[arg(
             long,
             default_value_t = 48,
-            help = "缓存清理阈值（小时）：删除 .prismflow/tmp-diffs 与 .prismflow/tmp-ci 中超过该时长的文件"
+            help = "缓存清理阈值（小时）：删除 .prismflow/tmp-diffs、.prismflow/tmp-ci、.prismflow/ci-repo-cache、.prismflow/repo-cache 中超过该时长的缓存"
         )]
         cache_cleanup_hours: u64,
         #[arg(long, default_value_t = 8, help = "全局 API 并发阈值")]
@@ -307,7 +307,7 @@ pub enum ReviewSubcommand {
         #[arg(
             long,
             default_value_t = 48,
-            help = "缓存清理阈值（小时）：删除 .prismflow/tmp-diffs 与 .prismflow/tmp-ci 中超过该时长的文件"
+            help = "缓存清理阈值（小时）：删除 .prismflow/tmp-diffs、.prismflow/tmp-ci、.prismflow/ci-repo-cache、.prismflow/repo-cache 中超过该时长的缓存"
         )]
         cache_cleanup_hours: u64,
         #[arg(long, default_value_t = 8, help = "全局 API 并发阈值")]
@@ -415,7 +415,7 @@ pub enum ReviewSubcommand {
         #[arg(
             long,
             default_value_t = 48,
-            help = "缓存清理阈值（小时）：删除 .prismflow/tmp-diffs 与 .prismflow/tmp-ci 中超过该时长的文件"
+            help = "缓存清理阈值（小时）：删除 .prismflow/tmp-diffs、.prismflow/tmp-ci、.prismflow/ci-repo-cache、.prismflow/repo-cache 中超过该时长的缓存"
         )]
         cache_cleanup_hours: u64,
         #[arg(long, default_value_t = 8, help = "全局 API 并发阈值")]
@@ -509,7 +509,7 @@ pub enum ReviewSubcommand {
         #[arg(
             long,
             default_value_t = 48,
-            help = "缓存清理阈值（小时）：删除 .prismflow/tmp-diffs 与 .prismflow/tmp-ci 中超过该时长的文件"
+            help = "缓存清理阈值（小时）：删除 .prismflow/tmp-diffs、.prismflow/tmp-ci、.prismflow/ci-repo-cache、.prismflow/repo-cache 中超过该时长的缓存"
         )]
         cache_cleanup_hours: u64,
         #[arg(long, default_value_t = 8, help = "全局 API 并发阈值")]

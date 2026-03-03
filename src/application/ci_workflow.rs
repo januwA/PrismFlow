@@ -1,10 +1,12 @@
 use std::{
     collections::HashSet,
+    fs,
     path::PathBuf,
     sync::{
         Arc,
         atomic::{AtomicUsize, Ordering},
     },
+    time::{SystemTime, UNIX_EPOCH},
 };
 
 use anyhow::{Context, Result, anyhow};
@@ -321,14 +323,17 @@ impl<'a> CiWorkflow<'a> {
         let cwd = self.fs.current_dir().unwrap_or_else(|_| PathBuf::from("."));
         let root = cwd.join(&self.options.clone_workspace_dir);
         self.fs.create_dir_all(&root)?;
-        let dir_name = format!(
+        let base_dir_name = format!(
             "{}_{}_pr{}_{}",
             owner.replace('/', "_"),
             repo.replace('/', "_"),
             pr_number,
             &head_sha.chars().take(12).collect::<String>()
         );
-        let target = root.join(dir_name);
+        let now_ts = now_unix_secs();
+        let refreshed_dir_name = format!("{base_dir_name}_{now_ts}");
+        let mut target = find_latest_timestamped_cache_dir(&root, &base_dir_name)
+            .unwrap_or_else(|| root.join(&refreshed_dir_name));
 
         let ctx = self
             .options
@@ -362,8 +367,56 @@ impl<'a> CiWorkflow<'a> {
             .await
             .context("git checkout failed")?;
 
+        let refreshed_target = root.join(refreshed_dir_name);
+        if target != refreshed_target && !self.fs.exists(&refreshed_target) {
+            if fs::rename(&target, &refreshed_target).is_ok() {
+                target = refreshed_target;
+            }
+        }
+
         Ok(target)
     }
+}
+
+fn now_unix_secs() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
+}
+
+fn find_latest_timestamped_cache_dir(root: &std::path::Path, base_name: &str) -> Option<PathBuf> {
+    let entries = fs::read_dir(root).ok()?;
+    let prefix = format!("{base_name}_");
+    let mut latest: Option<(u64, PathBuf)> = None;
+
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let file_type = match entry.file_type() {
+            Ok(v) => v,
+            Err(_) => continue,
+        };
+        if !file_type.is_dir() {
+            continue;
+        }
+        let name = match path.file_name().and_then(|v| v.to_str()) {
+            Some(v) => v,
+            None => continue,
+        };
+        if !name.starts_with(&prefix) {
+            continue;
+        }
+        let ts_part = &name[prefix.len()..];
+        let ts = match ts_part.parse::<u64>() {
+            Ok(v) => v,
+            Err(_) => continue,
+        };
+        if latest.as_ref().map(|(t, _)| ts > *t).unwrap_or(true) {
+            latest = Some((ts, path));
+        }
+    }
+
+    latest.map(|(_, path)| path)
 }
 
 #[derive(Debug, Clone)]
@@ -477,7 +530,10 @@ fn build_ci_payload(
 
 #[cfg(test)]
 mod tests {
+    use std::fs;
+    use std::path::PathBuf;
     use std::sync::Mutex;
+    use std::time::{SystemTime, UNIX_EPOCH};
 
     use anyhow::{Result, anyhow};
     use async_trait::async_trait;
@@ -761,6 +817,37 @@ mod tests {
         }
     }
 
+    struct TempFileSystem {
+        root: PathBuf,
+    }
+
+    impl FileSystem for TempFileSystem {
+        fn create_dir_all(&self, path: &std::path::Path) -> Result<()> {
+            fs::create_dir_all(path)?;
+            Ok(())
+        }
+        fn write(&self, path: &std::path::Path, content: &[u8]) -> Result<()> {
+            fs::write(path, content)?;
+            Ok(())
+        }
+        fn read_to_string(&self, path: &std::path::Path) -> Result<String> {
+            Ok(fs::read_to_string(path)?)
+        }
+        fn remove_file(&self, path: &std::path::Path) -> Result<()> {
+            fs::remove_file(path)?;
+            Ok(())
+        }
+        fn current_dir(&self) -> Result<std::path::PathBuf> {
+            Ok(self.root.clone())
+        }
+        fn config_dir(&self) -> Option<std::path::PathBuf> {
+            None
+        }
+        fn exists(&self, path: &std::path::Path) -> bool {
+            path.exists()
+        }
+    }
+
     struct MockGit;
     #[async_trait::async_trait]
     impl GitService for MockGit {
@@ -864,6 +951,16 @@ mod tests {
                 agents: vec![],
             }],
         }
+    }
+
+    fn make_temp_dir(tag: &str) -> PathBuf {
+        let stamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("duration")
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!("prismflow-ci-workflow-{tag}-{stamp}"));
+        fs::create_dir_all(&dir).expect("create temp dir");
+        dir
     }
 
     #[tokio::test]
@@ -986,5 +1083,55 @@ mod tests {
                 .to_string_lossy()
                 .contains("owner_repo_pr42_abc123")
         );
+    }
+
+    #[tokio::test]
+    async fn prepare_repo_checkout_refreshes_timestamped_cache_dir_name() {
+        let base = make_temp_dir("prepare_repo_checkout_refreshes_timestamp");
+        let workspace = ".prismflow/test-ci-cache-refresh";
+        let cache_root = base.join(workspace);
+        fs::create_dir_all(&cache_root).expect("create cache root");
+        let stale_dir = cache_root.join("owner_repo_pr42_abc123_1");
+        fs::create_dir_all(stale_dir.join(".git")).expect("create stale git dir");
+
+        let github = MinimalGitHub { prs: vec![] };
+        let config = InMemoryConfigRepo::new(config_with_repo());
+        let shell = MockShell;
+        let fs_adapter = TempFileSystem { root: base.clone() };
+        let git = RecordingGit::default();
+        let workflow = CiWorkflow::new(
+            &config,
+            &github,
+            &shell,
+            &fs_adapter,
+            &git,
+            CiWorkflowOptions {
+                clone_workspace_dir: workspace.to_string(),
+                clone_depth: 1,
+                ..CiWorkflowOptions::default()
+            },
+        );
+
+        let repo_dir = workflow
+            .prepare_repo_checkout(
+                "https://github.com/owner/repo.git",
+                "abc123",
+                "main",
+                "owner",
+                "repo",
+                42,
+            )
+            .await
+            .expect("prepare_repo_checkout should refresh timestamped dir");
+
+        let repo_dir_name = repo_dir
+            .file_name()
+            .and_then(|v| v.to_str())
+            .expect("repo dir name");
+        assert!(repo_dir_name.starts_with("owner_repo_pr42_abc123_"));
+        assert_ne!(repo_dir, stale_dir);
+        assert!(repo_dir.exists());
+        assert!(!stale_dir.exists());
+        let _ = fs::remove_dir_all(base);
     }
 }

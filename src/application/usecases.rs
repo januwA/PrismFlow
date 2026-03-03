@@ -1,7 +1,7 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::time::{Duration, SystemTime};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Result, anyhow};
 use serde::Serialize;
@@ -19,6 +19,7 @@ use crate::domain::ports::{
 };
 
 const CACHE_SCAN_DIRS: [&str; 2] = ["tmp-diffs", "tmp-ci"];
+const REPO_CACHE_DIRS: [&str; 2] = ["ci-repo-cache", "repo-cache"];
 
 pub async fn run_review_once(
     config_repo: &dyn ConfigRepository,
@@ -380,6 +381,10 @@ struct CacheCleanupStats {
     stale_files: usize,
     removed_files: usize,
     remove_failures: usize,
+    checked_repo_entries: usize,
+    stale_repo_entries: usize,
+    removed_repo_entries: usize,
+    repo_remove_failures: usize,
 }
 
 fn inspect_and_cleanup_stale_prismflow_cache(fs: &dyn FileSystem, cache_cleanup_hours: u64) {
@@ -390,15 +395,23 @@ fn inspect_and_cleanup_stale_prismflow_cache(fs: &dyn FileSystem, cache_cleanup_
     let stale_after =
         Duration::from_secs(cache_cleanup_hours.saturating_mul(60).saturating_mul(60));
     let stats = cleanup_stale_prismflow_cache_under(&cwd, stale_after, SystemTime::now());
-    if stats.stale_files > 0 || stats.remove_failures > 0 {
+    if stats.stale_files > 0
+        || stats.remove_failures > 0
+        || stats.stale_repo_entries > 0
+        || stats.repo_remove_failures > 0
+    {
         println!(
-            "cache_check root={} cleanup_hours={} checked_files={} stale_files={} removed_files={} remove_failures={}",
+            "cache_check root={} cleanup_hours={} checked_files={} stale_files={} removed_files={} remove_failures={} checked_repo_entries={} stale_repo_entries={} removed_repo_entries={} repo_remove_failures={}",
             cwd.join(".prismflow").display(),
             cache_cleanup_hours,
             stats.checked_files,
             stats.stale_files,
             stats.removed_files,
-            stats.remove_failures
+            stats.remove_failures,
+            stats.checked_repo_entries,
+            stats.stale_repo_entries,
+            stats.removed_repo_entries,
+            stats.repo_remove_failures
         );
     }
 }
@@ -413,7 +426,66 @@ fn cleanup_stale_prismflow_cache_under(
     for dir in CACHE_SCAN_DIRS {
         walk_and_cleanup_stale_files(&root.join(dir), stale_after, now, &mut stats);
     }
+    for dir in REPO_CACHE_DIRS {
+        cleanup_stale_repo_cache_entries(&root.join(dir), stale_after, now, &mut stats);
+    }
     stats
+}
+
+fn cleanup_stale_repo_cache_entries(
+    root: &Path,
+    stale_after: Duration,
+    now: SystemTime,
+    stats: &mut CacheCleanupStats,
+) {
+    let entries = match fs::read_dir(root) {
+        Ok(v) => v,
+        Err(_) => return,
+    };
+
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let file_type = match entry.file_type() {
+            Ok(v) => v,
+            Err(_) => continue,
+        };
+        if !(file_type.is_file() || file_type.is_dir()) {
+            continue;
+        }
+        stats.checked_repo_entries += 1;
+
+        let modified = cache_entry_timestamp(&path)
+            .or_else(|| entry.metadata().ok().and_then(|m| m.modified().ok()));
+        let Some(modified) = modified else {
+            continue;
+        };
+        let age = match now.duration_since(modified) {
+            Ok(v) => v,
+            Err(_) => continue,
+        };
+        if age < stale_after {
+            continue;
+        }
+
+        stats.stale_repo_entries += 1;
+        let removed = if file_type.is_dir() {
+            fs::remove_dir_all(&path).is_ok()
+        } else {
+            fs::remove_file(&path).is_ok()
+        };
+        if removed {
+            stats.removed_repo_entries += 1;
+        } else {
+            stats.repo_remove_failures += 1;
+        }
+    }
+}
+
+fn cache_entry_timestamp(path: &Path) -> Option<SystemTime> {
+    let name = path.file_name()?.to_str()?;
+    let (_, ts_part) = name.rsplit_once('_')?;
+    let ts = ts_part.parse::<u64>().ok()?;
+    UNIX_EPOCH.checked_add(Duration::from_secs(ts))
 }
 
 fn walk_and_cleanup_stale_files(
@@ -537,6 +609,94 @@ mod tests {
         assert_eq!(stats.stale_files, 0);
         assert_eq!(stats.removed_files, 0);
         assert!(recent_file.exists());
+        let _ = fs::remove_dir_all(base);
+    }
+
+    #[test]
+    fn cleanup_stale_prismflow_cache_removes_old_repo_cache_entry() {
+        let base = make_temp_dir("cleanup_removes_old_repo_cache_entry");
+        let root = base
+            .join(".prismflow")
+            .join("ci-repo-cache")
+            .join("owner_repo");
+        fs::create_dir_all(&root).expect("create repo cache dir");
+        let cached_file = root.join("README.md");
+        fs::write(&cached_file, b"old").expect("write repo cache file");
+
+        let stats =
+            cleanup_stale_prismflow_cache_under(&base, Duration::from_secs(0), SystemTime::now());
+
+        assert_eq!(stats.checked_repo_entries, 1);
+        assert_eq!(stats.stale_repo_entries, 1);
+        assert_eq!(stats.removed_repo_entries, 1);
+        assert!(!root.exists());
+        let _ = fs::remove_dir_all(base);
+    }
+
+    #[test]
+    fn cleanup_stale_prismflow_cache_keeps_recent_repo_cache_entry() {
+        let base = make_temp_dir("cleanup_keeps_recent_repo_cache_entry");
+        let root = base
+            .join(".prismflow")
+            .join("ci-repo-cache")
+            .join("owner_repo");
+        fs::create_dir_all(&root).expect("create repo cache dir");
+        let cached_file = root.join("README.md");
+        fs::write(&cached_file, b"recent").expect("write repo cache file");
+
+        let stats = cleanup_stale_prismflow_cache_under(
+            &base,
+            Duration::from_secs(24 * 60 * 60),
+            SystemTime::now(),
+        );
+
+        assert_eq!(stats.checked_repo_entries, 1);
+        assert_eq!(stats.stale_repo_entries, 0);
+        assert_eq!(stats.removed_repo_entries, 0);
+        assert!(root.exists());
+        let _ = fs::remove_dir_all(base);
+    }
+
+    #[test]
+    fn cleanup_stale_prismflow_cache_removes_old_legacy_repo_cache_entry() {
+        let base = make_temp_dir("cleanup_removes_old_legacy_repo_cache_entry");
+        let root = base
+            .join(".prismflow")
+            .join("repo-cache")
+            .join("owner_repo");
+        fs::create_dir_all(&root).expect("create legacy repo cache dir");
+        let cached_file = root.join("README.md");
+        fs::write(&cached_file, b"old").expect("write legacy repo cache file");
+
+        let stats =
+            cleanup_stale_prismflow_cache_under(&base, Duration::from_secs(0), SystemTime::now());
+
+        assert_eq!(stats.stale_repo_entries, 1);
+        assert_eq!(stats.removed_repo_entries, 1);
+        assert!(!root.exists());
+        let _ = fs::remove_dir_all(base);
+    }
+
+    #[test]
+    fn cleanup_stale_prismflow_cache_uses_repo_cache_dir_timestamp() {
+        let base = make_temp_dir("cleanup_uses_repo_cache_dir_timestamp");
+        let root = base.join(".prismflow").join("repo-cache");
+        fs::create_dir_all(&root).expect("create legacy repo cache root");
+        let stale = root.join("owner_repo_pr1_abc_10");
+        let fresh = root.join("owner_repo_pr1_abc_200");
+        fs::create_dir_all(&stale).expect("create stale cache dir");
+        fs::create_dir_all(&fresh).expect("create fresh cache dir");
+
+        let now = UNIX_EPOCH
+            .checked_add(Duration::from_secs(100))
+            .expect("build now");
+        let stats = cleanup_stale_prismflow_cache_under(&base, Duration::from_secs(50), now);
+
+        assert_eq!(stats.checked_repo_entries, 2);
+        assert_eq!(stats.stale_repo_entries, 1);
+        assert_eq!(stats.removed_repo_entries, 1);
+        assert!(!stale.exists());
+        assert!(fresh.exists());
         let _ = fs::remove_dir_all(base);
     }
 
