@@ -1,7 +1,7 @@
 use std::{
     collections::HashSet,
     fs,
-    path::PathBuf,
+    path::{Path, PathBuf},
     sync::{
         Arc,
         atomic::{AtomicBool, AtomicUsize, Ordering},
@@ -966,7 +966,7 @@ impl<'a> ReviewWorkflow<'a> {
             for base in &bases {
                 let path = base.join(&file_name);
                 checked.push(path.clone());
-                if self.fs.exists(&path) {
+                if self.fs.exists(&path) && file_name_matches_exact_case(&path) {
                     let content = self.fs.read_to_string(&path).map_err(|e| {
                         anyhow!("failed to read agent prompt file {}: {}", path.display(), e)
                     })?;
@@ -1705,6 +1705,25 @@ fn likely_unusable_shell_output(output: &str) -> bool {
     bad_hints.iter().any(|h| lower.contains(h))
 }
 
+fn file_name_matches_exact_case(path: &Path) -> bool {
+    let Some(parent) = path.parent() else {
+        return true;
+    };
+    let Some(target_name) = path.file_name() else {
+        return true;
+    };
+
+    let entries = match fs::read_dir(parent) {
+        Ok(entries) => entries,
+        // Keep compatibility for non-real filesystems used in tests/mocks.
+        Err(_) => return true,
+    };
+
+    entries
+        .filter_map(Result::ok)
+        .any(|entry| entry.file_name() == target_name)
+}
+
 pub fn ensure_agent_prompts_available(
     fs: &dyn FileSystem,
     agents: &[String],
@@ -1742,7 +1761,7 @@ fn load_agent_prompts_shim(
         for base in &bases {
             let path = base.join(&file_name);
             checked.push(path.clone());
-            if fs.exists(&path) {
+            if fs.exists(&path) && file_name_matches_exact_case(&path) {
                 let content = fs.read_to_string(&path).map_err(|e| {
                     anyhow!("failed to read agent prompt file {}: {}", path.display(), e)
                 })?;
@@ -2460,6 +2479,31 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("prismflow-review-workflow-{tag}-{stamp}"));
         fs::create_dir_all(&dir).expect("create temp dir");
         dir
+    }
+
+    #[test]
+    fn ensure_agent_prompts_available_requires_exact_case_file_name() {
+        let root = make_temp_dir("agent-case-sensitive-miss");
+        fs::write(root.join("DEBUG.md"), "debug uppercase").expect("write prompt");
+        let fs_adapter = TempFileSystem { root: root.clone() };
+        let dirs = vec![root.to_string_lossy().to_string()];
+        let agents = vec!["debug".to_string()];
+
+        let err = ensure_agent_prompts_available(&fs_adapter, &agents, &dirs).expect_err("missing");
+        assert!(err.to_string().contains("agent prompt file missing"));
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn ensure_agent_prompts_available_accepts_exact_case_file_name() {
+        let root = make_temp_dir("agent-case-sensitive-hit");
+        fs::write(root.join("DEBUG.md"), "debug uppercase").expect("write prompt");
+        let fs_adapter = TempFileSystem { root: root.clone() };
+        let dirs = vec![root.to_string_lossy().to_string()];
+        let agents = vec!["DEBUG".to_string()];
+
+        ensure_agent_prompts_available(&fs_adapter, &agents, &dirs).expect("found");
+        let _ = fs::remove_dir_all(root);
     }
 
     fn workflow<'a>(
