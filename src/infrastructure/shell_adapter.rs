@@ -4,6 +4,7 @@ use anyhow::{Context, Result};
 use async_trait::async_trait;
 use sha2::{Digest, Sha256};
 use std::fs;
+use std::io::Read;
 use std::io::Write;
 use std::path::Path;
 use std::path::PathBuf;
@@ -220,6 +221,16 @@ impl ShellAdapter for CommandShellAdapter {
             );
         }
 
+        if is_empty_output_file(stdout_capture.full_output_path.as_ref())
+            && is_non_empty_output_file(stderr_capture.full_output_path.as_ref())
+        {
+            let stderr_excerpt = read_output_excerpt(stderr_capture.full_output_path.as_ref(), 2000);
+            anyhow::bail!(
+                "command line produced empty stdout but non-empty stderr: {}",
+                stderr_excerpt
+            );
+        }
+
         if let Some(path) = &stdout_capture.full_output_path {
             return Ok(format!("{STDOUT_FILE_MARKER_PREFIX}{}", path.display()));
         }
@@ -279,6 +290,43 @@ fn prepare_stream_output_path(command_fp: &str, stream_name: &str) -> Option<Pat
         "engine-{}-{}-{}.log",
         stamp, command_fp, stream_name
     )))
+}
+
+fn is_empty_output_file(path: Option<&PathBuf>) -> bool {
+    match path.and_then(|p| fs::metadata(p).ok()) {
+        Some(meta) => meta.len() == 0,
+        None => true,
+    }
+}
+
+fn is_non_empty_output_file(path: Option<&PathBuf>) -> bool {
+    match path.and_then(|p| fs::metadata(p).ok()) {
+        Some(meta) => meta.len() > 0,
+        None => false,
+    }
+}
+
+fn read_output_excerpt(path: Option<&PathBuf>, max_chars: usize) -> String {
+    let Some(path) = path else {
+        return "stderr output file unavailable".to_string();
+    };
+    let mut file = match fs::File::open(path) {
+        Ok(v) => v,
+        Err(_) => return format!("stderr file exists but cannot be read: {}", path.display()),
+    };
+    let mut text = String::new();
+    if file.read_to_string(&mut text).is_err() {
+        return format!("stderr file exists but cannot decode as UTF-8: {}", path.display());
+    }
+    if text.len() <= max_chars {
+        text
+    } else {
+        let mut cut = max_chars;
+        while cut > 0 && !text.is_char_boundary(cut) {
+            cut -= 1;
+        }
+        format!("{}...[truncated]", &text[..cut])
+    }
 }
 
 fn command_fingerprint(command_line: &str) -> String {
