@@ -465,37 +465,6 @@ impl<'a> ReviewWorkflow<'a> {
             }
         }
 
-        let selected_engine = match self.pick_engine_for_pr() {
-            Ok(v) => v,
-            Err(err) => {
-                return match classify_error(&err) {
-                    ErrorClass::Retryable => PrReviewOutcome::FailedRetryable(err.to_string()),
-                    ErrorClass::Fatal => PrReviewOutcome::FailedFatal(err.to_string()),
-                };
-            }
-        };
-        let selected_engine_fingerprint = selected_engine.fingerprint.as_str();
-
-        let processing_body = format!(
-            "{}\nPrismFlow started review for `{}` with engine `{}`.",
-            processing_anchor(&key),
-            pr.head_sha,
-            selected_engine_fingerprint
-        );
-
-        if let Err(err) = self
-            .with_retry(|| {
-                self.github
-                    .create_issue_comment(owner, repo, pr.number, &processing_body)
-            })
-            .await
-        {
-            return match classify_error(&err) {
-                ErrorClass::Retryable => PrReviewOutcome::FailedRetryable(err.to_string()),
-                ErrorClass::Fatal => PrReviewOutcome::FailedFatal(err.to_string()),
-            };
-        }
-
         let files = match self
             .github
             .list_pull_request_files(owner, repo, pr.number)
@@ -592,26 +561,109 @@ impl<'a> ReviewWorkflow<'a> {
             .html_url
             .clone()
             .unwrap_or_else(|| format!("https://github.com/{owner}/{repo}/pull/{}", pr.number));
+        let engine_attempts = self.options.engine_specs.len();
+        if engine_attempts == 0 {
+            return PrReviewOutcome::FailedFatal(
+                "shell engine selected but no engine command is configured".to_string(),
+            );
+        }
 
-        let analysis = match self
-            .analyze_review(
-                owner,
-                repo,
-                pr.number,
-                &pr.title,
-                &pr_url,
-                &pr.head_sha,
-                &commit_messages,
-                &files,
-                agents,
-                &selected_engine,
-                repo_dir_for_shell.as_deref(),
-                &repo_head_ref_for_shell,
-            )
-            .await
-        {
-            Ok(v) => v,
-            Err(err) => {
+        let mut selected_engine_fingerprint = String::new();
+        let mut analysis_opt: Option<ReviewAnalysis> = None;
+        let mut last_engine_err: Option<anyhow::Error> = None;
+        for attempt_idx in 0..engine_attempts {
+            let selected_engine = match self.pick_engine_for_pr() {
+                Ok(v) => v,
+                Err(err) => {
+                    return match classify_error(&err) {
+                        ErrorClass::Retryable => PrReviewOutcome::FailedRetryable(err.to_string()),
+                        ErrorClass::Fatal => PrReviewOutcome::FailedFatal(err.to_string()),
+                    };
+                }
+            };
+            let fingerprint = selected_engine.fingerprint.clone();
+            let processing_marker = processing_anchor(&key);
+            let processing_body = format!(
+                "{}\nPrismFlow started review for `{}` with engine `{}`.",
+                processing_marker, pr.head_sha, fingerprint
+            );
+            if let Err(err) = self
+                .with_retry(|| {
+                    self.github
+                        .create_issue_comment(owner, repo, pr.number, &processing_body)
+                })
+                .await
+            {
+                return match classify_error(&err) {
+                    ErrorClass::Retryable => PrReviewOutcome::FailedRetryable(err.to_string()),
+                    ErrorClass::Fatal => PrReviewOutcome::FailedFatal(err.to_string()),
+                };
+            }
+
+            match self
+                .analyze_review(
+                    owner,
+                    repo,
+                    pr.number,
+                    &pr.title,
+                    &pr_url,
+                    &pr.head_sha,
+                    &commit_messages,
+                    &files,
+                    agents,
+                    &selected_engine,
+                    repo_dir_for_shell.as_deref(),
+                    &repo_head_ref_for_shell,
+                )
+                .await
+            {
+                Ok(analysis) => {
+                    selected_engine_fingerprint = fingerprint;
+                    analysis_opt = Some(analysis);
+                    break;
+                }
+                Err(err) => {
+                    let err_text = err.to_string();
+                    eprintln!(
+                        "engine_failed repo={}/{} pr={} engine={} attempt={}/{} error={}",
+                        owner,
+                        repo,
+                        pr.number,
+                        fingerprint,
+                        attempt_idx + 1,
+                        engine_attempts,
+                        err_text
+                    );
+                    self.emit_status(format!(
+                        "repo={}/{} pr={} stage=EngineFailed engine={} attempt={}/{} error={}",
+                        owner,
+                        repo,
+                        pr.number,
+                        fingerprint,
+                        attempt_idx + 1,
+                        engine_attempts,
+                        err_text
+                    ));
+
+                    let removed = self
+                        .cleanup_processing_comment(owner, repo, pr.number, &processing_marker)
+                        .await;
+                    if let Err(clean_err) = removed {
+                        eprintln!(
+                            "engine_failed_cleanup_error repo={}/{} pr={} engine={} error={}",
+                            owner, repo, pr.number, fingerprint, clean_err
+                        );
+                    }
+                    last_engine_err = Some(err);
+                }
+            }
+        }
+
+        let analysis = match analysis_opt {
+            Some(v) => v,
+            None => {
+                let err = last_engine_err
+                    .unwrap_or_else(|| anyhow!("engine execution failed without detailed context"));
                 return match classify_error(&err) {
                     ErrorClass::Retryable => PrReviewOutcome::FailedRetryable(err.to_string()),
                     ErrorClass::Fatal => PrReviewOutcome::FailedFatal(err.to_string()),
@@ -668,7 +720,7 @@ impl<'a> ReviewWorkflow<'a> {
                 used_fallback = true;
                 let fallback = build_fallback_summary(
                     &pr.head_sha,
-                    selected_engine_fingerprint,
+                    &selected_engine_fingerprint,
                     &analysis.inline_comments,
                     &summary_with_outdated,
                 );
@@ -851,6 +903,32 @@ impl<'a> ReviewWorkflow<'a> {
             .await?;
         }
         Ok(())
+    }
+
+    async fn cleanup_processing_comment(
+        &self,
+        owner: &str,
+        repo: &str,
+        issue_number: u64,
+        processing_marker: &str,
+    ) -> Result<usize> {
+        let comments = self
+            .with_retry(|| self.github.list_issue_comments(owner, repo, issue_number))
+            .await?;
+        let mut removed = 0usize;
+        for comment in comments {
+            if !comment.body.contains(processing_marker) {
+                continue;
+            }
+            if self
+                .with_retry(|| self.github.delete_issue_comment(owner, repo, comment.id))
+                .await
+                .is_ok()
+            {
+                removed += 1;
+            }
+        }
+        Ok(removed)
     }
 
     fn emit_status(&self, msg: String) {
@@ -2052,8 +2130,19 @@ mod tests {
             &self,
             _owner: &str,
             _repo: &str,
-            _comment_id: u64,
+            comment_id: u64,
         ) -> Result<()> {
+            if comment_id == 0 {
+                return Ok(());
+            }
+            let idx = (comment_id - 1) as usize;
+            let mut map = self.issue_comments.lock().expect("lock");
+            for comments in map.values_mut() {
+                if idx < comments.len() {
+                    comments.remove(idx);
+                    return Ok(());
+                }
+            }
             Ok(())
         }
 
@@ -2369,6 +2458,42 @@ mod tests {
             ctx: Option<&dyn CommandContext>,
         ) -> Result<String> {
             self.run_command_line("", ctx).await
+        }
+    }
+
+    #[derive(Default)]
+    struct FallbackEngineShell {
+        calls: Mutex<Vec<String>>,
+    }
+
+    #[async_trait::async_trait]
+    impl ShellAdapter for FallbackEngineShell {
+        fn run_capture(&self, _program: &str, _args: &[&str]) -> Result<String> {
+            Ok(String::new())
+        }
+
+        async fn run_command_line(
+            &self,
+            command_line: &str,
+            _ctx: Option<&dyn CommandContext>,
+        ) -> Result<String> {
+            self.calls
+                .lock()
+                .expect("lock calls")
+                .push(command_line.to_string());
+            if command_line.contains("engine-a") {
+                return Err(anyhow!("temporary timeout while running engine-a"));
+            }
+            Ok("src/lib.rs:2: fallback engine review".to_string())
+        }
+
+        async fn run_command_line_in_dir(
+            &self,
+            command_line: &str,
+            _workdir: Option<&str>,
+            ctx: Option<&dyn CommandContext>,
+        ) -> Result<String> {
+            self.run_command_line(command_line, ctx).await
         }
     }
 
@@ -3211,5 +3336,66 @@ mod tests {
         let merged = comments.join("\n");
         assert!(merged.contains("prismflow:processing:"));
         assert!(!merged.contains("prismflow:completed:"));
+    }
+
+    #[tokio::test]
+    async fn engine_failure_cleans_processing_anchor_and_falls_back_to_next_engine() {
+        let github = MockGitHub {
+            prs: vec![PullRequestSummary {
+                number: 1,
+                title: "t".to_string(),
+                head_sha: "abc123".to_string(),
+                html_url: None,
+                author_login: Some("mock-user".to_string()),
+            }],
+            files: HashMap::from([(
+                1,
+                vec![PullRequestFilePatch {
+                    path: "src/lib.rs".to_string(),
+                    patch: Some("@@ -1,1 +1,2 @@\n line\n+let x = 1;".to_string()),
+                }],
+            )]),
+            ..Default::default()
+        };
+        let config = InMemoryConfigRepo::new(config_with_repo());
+        let shell = FallbackEngineShell::default();
+        let opts = ReviewWorkflowOptions {
+            engine_specs: vec![
+                EngineSpec {
+                    fingerprint: "engine-a".to_string(),
+                    command: "engine-a {diff_file}".to_string(),
+                },
+                EngineSpec {
+                    fingerprint: "engine-b".to_string(),
+                    command: "engine-b {diff_file}".to_string(),
+                },
+            ],
+            ..ReviewWorkflowOptions::default()
+        };
+
+        let stats = workflow_with_shell(&config, &github, &shell, opts)
+            .review_once()
+            .await
+            .expect("review_once");
+        assert_eq!(stats[0].processed, 1);
+        assert_eq!(stats[0].failed_retryable, 0);
+        assert_eq!(stats[0].failed_fatal, 0);
+
+        let calls = shell.calls.lock().expect("lock calls").clone();
+        assert_eq!(calls.len(), 2);
+        assert!(calls[0].contains("engine-a"));
+        assert!(calls[1].contains("engine-b"));
+
+        let comments = github
+            .issue_comments
+            .lock()
+            .expect("lock")
+            .get(&1)
+            .cloned()
+            .unwrap_or_default();
+        let merged = comments.join("\n");
+        assert!(!merged.contains("engine `engine-a`"));
+        assert!(merged.contains("engine `engine-b`"));
+        assert!(merged.contains("prismflow:completed:"));
     }
 }
