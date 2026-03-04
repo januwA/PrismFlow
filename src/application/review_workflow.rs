@@ -3,7 +3,7 @@ use std::{
     fs,
     path::PathBuf,
     sync::{
-        Arc,
+        Arc, Mutex,
         atomic::{AtomicBool, AtomicUsize, Ordering},
     },
     time::{Duration, SystemTime, UNIX_EPOCH},
@@ -35,6 +35,34 @@ const DEFAULT_RETRY_ATTEMPTS: usize = 3;
 const DEFAULT_RETRY_BACKOFF_MS: u64 = 300;
 const PROCESSING_TTL_SECS: i64 = 30 * 60;
 const ADHOC_COOLDOWN_SECS: i64 = 10 * 60;
+
+struct RuntimePrLockGuard {
+    lock_store: Arc<Mutex<HashSet<String>>>,
+    key: String,
+}
+
+impl Drop for RuntimePrLockGuard {
+    fn drop(&mut self) {
+        let mut locks = self.lock_store.lock().expect("runtime lock poisoned");
+        locks.remove(&self.key);
+    }
+}
+
+fn try_acquire_runtime_pr_lock(
+    lock_store: Arc<Mutex<HashSet<String>>>,
+    key: &str,
+) -> Option<RuntimePrLockGuard> {
+    {
+        let mut locks = lock_store.lock().expect("runtime lock poisoned");
+        if !locks.insert(key.to_string()) {
+            return None;
+        }
+    }
+    Some(RuntimePrLockGuard {
+        lock_store,
+        key: key.to_string(),
+    })
+}
 
 #[derive(Debug, Clone)]
 pub struct ScanPrReport {
@@ -90,6 +118,7 @@ pub struct ReviewWorkflowOptions {
     pub status_tx: Option<broadcast::Sender<String>>,
     pub skip_flag: Option<Arc<AtomicBool>>,
     pub task_context: Option<Arc<TaskContext>>,
+    pub runtime_pr_locks: Arc<Mutex<HashSet<String>>>,
 }
 
 impl Default for ReviewWorkflowOptions {
@@ -116,6 +145,7 @@ impl Default for ReviewWorkflowOptions {
             status_tx: None,
             skip_flag: None,
             task_context: None,
+            runtime_pr_locks: Arc::new(Mutex::new(HashSet::new())),
         }
     }
 }
@@ -412,6 +442,19 @@ impl<'a> ReviewWorkflow<'a> {
             &pr.head_sha,
             &self.engine_fingerprint,
         );
+        let _runtime_pr_lock = match try_acquire_runtime_pr_lock(
+            self.options.runtime_pr_locks.clone(),
+            &key,
+        ) {
+            Some(v) => v,
+            None => {
+                self.emit_status(format!(
+                    "repo={}/{} pr={} stage=Skipped reason=runtime-lock-held",
+                    owner, repo, pr.number
+                ));
+                return PrReviewOutcome::SkippedProcessing;
+            }
+        };
         let processing_prefix = processing_anchor_prefix(&key);
         let completed_anchor = completed_anchor(&key);
 
@@ -571,6 +614,16 @@ impl<'a> ReviewWorkflow<'a> {
         let mut selected_engine_fingerprint = String::new();
         let mut analysis_opt: Option<ReviewAnalysis> = None;
         let mut last_engine_err: Option<anyhow::Error> = None;
+        let processing_owner_token = processing_owner_token(
+            self.options
+                .task_context
+                .as_ref()
+                .map(|ctx| ctx.run_id())
+                .unwrap_or("n/a"),
+            &pr.head_sha,
+        );
+        let processing_marker = processing_anchor(&key);
+        let mut processing_written = false;
         for attempt_idx in 0..engine_attempts {
             let selected_engine = match self.pick_engine_for_pr() {
                 Ok(v) => v,
@@ -582,22 +635,24 @@ impl<'a> ReviewWorkflow<'a> {
                 }
             };
             let fingerprint = selected_engine.fingerprint.clone();
-            let processing_marker = processing_anchor(&key);
-            let processing_body = format!(
-                "{}\nPrismFlow started review for `{}` with engine `{}`.",
-                processing_marker, pr.head_sha, fingerprint
-            );
-            if let Err(err) = self
-                .with_retry(|| {
-                    self.github
-                        .create_issue_comment(owner, repo, pr.number, &processing_body)
-                })
-                .await
-            {
-                return match classify_error(&err) {
-                    ErrorClass::Retryable => PrReviewOutcome::FailedRetryable(err.to_string()),
-                    ErrorClass::Fatal => PrReviewOutcome::FailedFatal(err.to_string()),
-                };
+            if !processing_written {
+                let processing_body = format!(
+                    "{}\n<!-- prismflow:processing-owner:{} -->\nPrismFlow started review for `{}` with engine `{}`.",
+                    processing_marker, processing_owner_token, pr.head_sha, fingerprint
+                );
+                if let Err(err) = self
+                    .with_retry(|| {
+                        self.github
+                            .create_issue_comment(owner, repo, pr.number, &processing_body)
+                    })
+                    .await
+                {
+                    return match classify_error(&err) {
+                        ErrorClass::Retryable => PrReviewOutcome::FailedRetryable(err.to_string()),
+                        ErrorClass::Fatal => PrReviewOutcome::FailedFatal(err.to_string()),
+                    };
+                }
+                processing_written = true;
             }
 
             match self
@@ -645,14 +700,21 @@ impl<'a> ReviewWorkflow<'a> {
                         err_text
                     ));
 
-                    let removed = self
-                        .cleanup_processing_comment(owner, repo, pr.number, &processing_marker)
-                        .await;
-                    if let Err(clean_err) = removed {
-                        eprintln!(
-                            "engine_failed_cleanup_error repo={}/{} pr={} engine={} error={}",
-                            owner, repo, pr.number, fingerprint, clean_err
-                        );
+                    if attempt_idx + 1 == engine_attempts {
+                        let removed = self
+                            .cleanup_processing_comment(
+                                owner,
+                                repo,
+                                pr.number,
+                                &processing_owner_token,
+                            )
+                            .await;
+                        if let Err(clean_err) = removed {
+                            eprintln!(
+                                "engine_failed_cleanup_error repo={}/{} pr={} engine={} error={}",
+                                owner, repo, pr.number, fingerprint, clean_err
+                            );
+                        }
                     }
                     last_engine_err = Some(err);
                 }
@@ -910,14 +972,14 @@ impl<'a> ReviewWorkflow<'a> {
         owner: &str,
         repo: &str,
         issue_number: u64,
-        processing_marker: &str,
+        processing_owner_token: &str,
     ) -> Result<usize> {
         let comments = self
             .with_retry(|| self.github.list_issue_comments(owner, repo, issue_number))
             .await?;
         let mut removed = 0usize;
         for comment in comments {
-            if !comment.body.contains(processing_marker) {
+            if !comment.body.contains(processing_owner_token) {
                 continue;
             }
             if self
@@ -1470,6 +1532,14 @@ fn processing_anchor(key: &str) -> String {
         key,
         now_unix_secs()
     )
+}
+
+fn processing_owner_token(run_id: &str, head_sha: &str) -> String {
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    format!("{run_id}:{head_sha}:{nanos}")
 }
 
 fn completed_anchor(key: &str) -> String {
@@ -3334,7 +3404,7 @@ mod tests {
             .cloned()
             .unwrap_or_default();
         let merged = comments.join("\n");
-        assert!(merged.contains("prismflow:processing:"));
+        assert!(!merged.contains("prismflow:processing:"));
         assert!(!merged.contains("prismflow:completed:"));
     }
 
@@ -3394,8 +3464,20 @@ mod tests {
             .cloned()
             .unwrap_or_default();
         let merged = comments.join("\n");
-        assert!(!merged.contains("engine `engine-a`"));
-        assert!(merged.contains("engine `engine-b`"));
+        assert!(merged.contains("engine `engine-a`"));
         assert!(merged.contains("prismflow:completed:"));
+    }
+
+    #[test]
+    fn runtime_lock_prevents_duplicate_acquire_for_same_key() {
+        let key = format!("runtime-lock-test-{}", now_unix_secs());
+        let lock_store = Arc::new(Mutex::new(HashSet::new()));
+        let first = try_acquire_runtime_pr_lock(lock_store.clone(), &key);
+        assert!(first.is_some());
+        let second = try_acquire_runtime_pr_lock(lock_store.clone(), &key);
+        assert!(second.is_none());
+        drop(first);
+        let third = try_acquire_runtime_pr_lock(lock_store, &key);
+        assert!(third.is_some());
     }
 }
