@@ -1,5 +1,4 @@
 use std::collections::HashMap;
-use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::{
     Arc,
@@ -7,7 +6,7 @@ use std::sync::{
 };
 
 use anyhow::{Context, Result};
-use tokio::sync::{Mutex, Notify, broadcast, mpsc};
+use tokio::sync::{Notify, broadcast};
 use tokio::time::{Duration, sleep};
 
 use crate::application::{
@@ -26,7 +25,6 @@ use crate::interface::cli::{
     AuthSubcommand, CiSubcommand, Commands, RepoAgentSubcommand, RepoSubcommand, ReviewSubcommand,
     ScanSubcommand,
 };
-use crate::interface::web::{UiCommand, UiState, run_ui_server};
 
 const SHUTDOWN_GRACE_SECS: u64 = 8;
 
@@ -465,9 +463,6 @@ pub async fn dispatch(
             }
             ReviewSubcommand::Daemon {
                 interval_secs,
-                ui,
-                ui_bind,
-                ui_token,
                 engines,
                 engine_prompt,
                 engine_prompt_file,
@@ -509,53 +504,22 @@ pub async fn dispatch(
                     ..ReviewWorkflowOptions::default()
                 };
                 let (status_tx, mut status_rx) = broadcast::channel::<String>(256);
-                let status_log = Arc::new(Mutex::new(Vec::<String>::new()));
-                let status_log_for_task = status_log.clone();
                 let skip_flag = Arc::new(AtomicBool::new(false));
-                let (ui_cmd_tx, mut ui_cmd_rx) = mpsc::unbounded_channel::<UiCommand>();
-                let ui_notify = Arc::new(Notify::new());
+                let wake_notify = Arc::new(Notify::new());
                 let status_task = tokio::spawn(async move {
                     while let Ok(msg) = status_rx.recv().await {
                         println!("[STATUS] {msg}");
-                        let mut log = status_log_for_task.lock().await;
-                        log.push(msg);
-                        if log.len() > 200 {
-                            let drop_n = log.len().saturating_sub(200);
-                            log.drain(0..drop_n);
-                        }
                     }
                 });
-                let mut ui_task = None;
-                if ui {
-                    let addr: SocketAddr = ui_bind
-                        .parse()
-                        .with_context(|| format!("invalid --ui-bind address: {ui_bind}"))?;
-                    let ui_state = UiState {
-                        token: ui_token.clone(),
-                        status_log: status_log.clone(),
-                        command_tx: ui_cmd_tx.clone(),
-                        notify: ui_notify.clone(),
-                        config_repo: config_repo.clone(),
-                    };
-                    println!("ui started: http://{addr}/");
-                    if let Some(token) = &ui_token {
-                        println!("ui token required: append ?token={token} in URL");
-                    }
-                    ui_task = Some(tokio::spawn(async move {
-                        if let Err(err) = run_ui_server(addr, ui_state).await {
-                            eprintln!("ui server stopped: {err:#}");
-                        }
-                    }));
-                }
                 let skip_flag_for_input = skip_flag.clone();
-                let ui_notify_for_input = ui_notify.clone();
+                let wake_notify_for_input = wake_notify.clone();
                 let input_task = tokio::task::spawn_blocking(move || {
                     use std::io::{self, BufRead};
                     let stdin = io::stdin();
                     for line in stdin.lock().lines().map_while(|v| v.ok()) {
                         if line.trim().eq_ignore_ascii_case("skip") {
                             skip_flag_for_input.store(true, Ordering::Relaxed);
-                            ui_notify_for_input.notify_one();
+                            wake_notify_for_input.notify_one();
                             println!("[CONTROL] skip received; next pending PR will be skipped");
                         }
                     }
@@ -575,125 +539,6 @@ pub async fn dispatch(
                     cycle_engine_start = cycle_engine_start.wrapping_add(1);
                     if let Ok(dirs) = repo_manager.list_agent_prompt_dirs() {
                         options.agent_prompt_dirs = dirs;
-                    }
-                    let mut run_now = false;
-                    while let Ok(cmd) = ui_cmd_rx.try_recv() {
-                        match cmd {
-                            UiCommand::TriggerReviewNow => run_now = true,
-                            UiCommand::TriggerSkip => {
-                                skip_flag.store(true, Ordering::Relaxed);
-                            }
-                            UiCommand::AdHoc(pr_url) => {
-                                let _ = status_tx.send(format!("ui:adhoc requested url={pr_url}"));
-                                match parse_github_pr_url(&pr_url) {
-                                    Ok((owner, repo, pr_number)) => {
-                                        let mut adhoc_opts = options.clone();
-                                        adhoc_opts.status_tx = Some(status_tx.clone());
-                                        let adhoc_ctx = Arc::new(TaskContext::new("review-adhoc"));
-                                        if let Err(err) = run_review_ad_hoc(
-                                            config_repo.as_ref(),
-                                            github.as_ref(),
-                                            shell,
-                                            fs,
-                                            git,
-                                            owner,
-                                            repo,
-                                            pr_number,
-                                            adhoc_opts,
-                                            adhoc_ctx,
-                                            cache_cleanup_hours,
-                                        )
-                                        .await
-                                        {
-                                            let _ = status_tx
-                                                .send(format!("ui:adhoc failed error={err:#}"));
-                                        } else {
-                                            let _ = status_tx.send("ui:adhoc done".to_string());
-                                        }
-                                    }
-                                    Err(err) => {
-                                        let _ = status_tx
-                                            .send(format!("ui:adhoc invalid_url error={err:#}"));
-                                    }
-                                }
-                            }
-                            UiCommand::RepoAdd(repo) => match repo_manager.add_repo(&repo) {
-                                Ok(v) => {
-                                    let _ = status_tx.send(format!("ui:repo added {v}"));
-                                }
-                                Err(err) => {
-                                    let _ =
-                                        status_tx.send(format!("ui:repo add failed error={err:#}"));
-                                }
-                            },
-                            UiCommand::RepoRemove(repo) => match repo_manager.remove_repo(&repo) {
-                                Ok(_) => {
-                                    let _ = status_tx.send(format!("ui:repo removed {repo}"));
-                                }
-                                Err(err) => {
-                                    let _ = status_tx
-                                        .send(format!("ui:repo remove failed error={err:#}"));
-                                }
-                            },
-                            UiCommand::AgentAdd { repo, agent } => {
-                                match repo_manager.add_agent(&repo, &agent) {
-                                    Ok(_) => {
-                                        let _ = status_tx.send(format!(
-                                            "ui:agent added repo={repo} agent={agent}"
-                                        ));
-                                    }
-                                    Err(err) => {
-                                        let _ = status_tx
-                                            .send(format!("ui:agent add failed error={err:#}"));
-                                    }
-                                }
-                            }
-                            UiCommand::AgentRemove { repo, agent } => {
-                                match repo_manager.remove_agent(&repo, &agent) {
-                                    Ok(_) => {
-                                        let _ = status_tx.send(format!(
-                                            "ui:agent removed repo={repo} agent={agent}"
-                                        ));
-                                    }
-                                    Err(err) => {
-                                        let _ = status_tx
-                                            .send(format!("ui:agent remove failed error={err:#}"));
-                                    }
-                                }
-                            }
-                            UiCommand::DirAdd(dir) => {
-                                match repo_manager.add_agent_prompt_dir(&dir) {
-                                    Ok(_) => {
-                                        if let Ok(dirs) = repo_manager.list_agent_prompt_dirs() {
-                                            options.agent_prompt_dirs = dirs;
-                                        }
-                                        let _ =
-                                            status_tx.send(format!("ui:global dir added {dir}"));
-                                    }
-                                    Err(err) => {
-                                        let _ = status_tx.send(format!(
-                                            "ui:global dir add failed error={err:#}"
-                                        ));
-                                    }
-                                }
-                            }
-                            UiCommand::DirRemove(dir) => {
-                                match repo_manager.remove_agent_prompt_dir(&dir) {
-                                    Ok(_) => {
-                                        if let Ok(dirs) = repo_manager.list_agent_prompt_dirs() {
-                                            options.agent_prompt_dirs = dirs;
-                                        }
-                                        let _ =
-                                            status_tx.send(format!("ui:global dir removed {dir}"));
-                                    }
-                                    Err(err) => {
-                                        let _ = status_tx.send(format!(
-                                            "ui:global dir remove failed error={err:#}"
-                                        ));
-                                    }
-                                }
-                            }
-                        }
                     }
                     let _ = status_tx.send("cycle:start".to_string());
                     let cycle_ctx = Arc::new(TaskContext::new("review-daemon-cycle"));
@@ -740,17 +585,12 @@ pub async fn dispatch(
                         break;
                     }
 
-                    if run_now {
-                        let _ = status_tx.send("ui:triggered immediate next cycle".to_string());
-                        continue;
-                    }
-
                     tokio::select! {
                         _ = sleep(Duration::from_secs(interval_secs)) => {
                             let _ = status_tx.send("daemon:sleep_done".to_string());
                         }
-                        _ = ui_notify.notified() => {
-                            let _ = status_tx.send("ui:wakeup".to_string());
+                        _ = wake_notify.notified() => {
+                            let _ = status_tx.send("control:wakeup".to_string());
                         }
                         _ = wait_for_shutdown_signal() => {
                             println!("received Ctrl+C, exiting daemon");
@@ -761,9 +601,6 @@ pub async fn dispatch(
                 drop(status_tx);
                 let _ = status_task.await;
                 input_task.abort();
-                if let Some(task) = ui_task {
-                    task.abort();
-                }
             }
             ReviewSubcommand::AdHoc {
                 pr_url,

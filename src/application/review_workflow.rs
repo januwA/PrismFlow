@@ -1,7 +1,7 @@
 use std::{
     collections::{HashMap, HashSet},
     fs,
-    path::{Path, PathBuf},
+    path::PathBuf,
     sync::{
         Arc,
         atomic::{AtomicBool, AtomicUsize, Ordering},
@@ -16,7 +16,10 @@ use sha2::{Digest, Sha256};
 use tokio::sync::broadcast;
 use tokio::time::sleep;
 
-use crate::application::context::TaskContext;
+use crate::application::{
+    agent_service::{AgentPromptService, FileSystemAgentPromptService},
+    context::TaskContext,
+};
 use crate::domain::{
     entities::{
         AppConfig, MonitoredRepo, PullRequestFilePatch, PullRequestSummary, ReviewComment,
@@ -884,7 +887,9 @@ impl<'a> ReviewWorkflow<'a> {
             sections.push(p.clone());
         }
 
-        let loaded = self.load_agent_prompts(agents, &self.options.agent_prompt_dirs)?;
+        let loaded =
+            FileSystemAgentPromptService::new(self.fs, self.options.agent_prompt_dirs.clone())
+                .load_agents(agents)?;
         if !loaded.is_empty() {
             sections.push(loaded);
         }
@@ -894,57 +899,6 @@ impl<'a> ReviewWorkflow<'a> {
         } else {
             Ok(Some(sections.join("\n\n")))
         }
-    }
-
-    fn load_agent_prompts(&self, agents: &[String], extra_dirs: &[String]) -> Result<String> {
-        if agents.is_empty() {
-            return Ok(String::new());
-        }
-
-        let mut bases: Vec<PathBuf> = extra_dirs
-            .iter()
-            .map(|d| PathBuf::from(d.trim()))
-            .filter(|p| !p.as_os_str().is_empty())
-            .collect();
-        let cwd = self.fs.current_dir().unwrap_or_else(|_| PathBuf::from("."));
-        bases.push(cwd.join(".prismflow").join("prompts"));
-        if let Some(config_dir) = self.fs.config_dir() {
-            bases.push(config_dir.join("pr-reviewer").join("prompts"));
-        }
-
-        let mut sections = Vec::new();
-        for agent in agents {
-            let file_name = format!("{agent}.md");
-            let mut checked: Vec<PathBuf> = Vec::new();
-            let mut loaded = None;
-            for base in &bases {
-                let path = base.join(&file_name);
-                checked.push(path.clone());
-                if self.fs.exists(&path) && file_name_matches_exact_case(&path) {
-                    let content = self.fs.read_to_string(&path).map_err(|e| {
-                        anyhow!("failed to read agent prompt file {}: {}", path.display(), e)
-                    })?;
-                    loaded = Some(content);
-                    break;
-                }
-            }
-            match loaded {
-                Some(content) => sections.push(format!("# Agent: {agent}\n{content}")),
-                None => {
-                    let checked_str = checked
-                        .iter()
-                        .map(|p| p.display().to_string())
-                        .collect::<Vec<_>>()
-                        .join(" ; ");
-                    return Err(anyhow!(
-                        "agent prompt file missing: checked {}",
-                        checked_str
-                    ));
-                }
-            }
-        }
-
-        Ok(sections.join("\n\n"))
     }
 
     async fn analyze_review(
@@ -1701,89 +1655,6 @@ fn likely_unusable_shell_output(output: &str) -> bool {
     bad_hints.iter().any(|h| lower.contains(h))
 }
 
-fn file_name_matches_exact_case(path: &Path) -> bool {
-    let Some(parent) = path.parent() else {
-        return true;
-    };
-    let Some(target_name) = path.file_name() else {
-        return true;
-    };
-
-    let entries = match fs::read_dir(parent) {
-        Ok(entries) => entries,
-        // Keep compatibility for non-real filesystems used in tests/mocks.
-        Err(_) => return true,
-    };
-
-    entries
-        .filter_map(Result::ok)
-        .any(|entry| entry.file_name() == target_name)
-}
-
-pub fn ensure_agent_prompts_available(
-    fs: &dyn FileSystem,
-    agents: &[String],
-    extra_dirs: &[String],
-) -> Result<()> {
-    let _ = load_agent_prompts_shim(fs, agents, extra_dirs)?;
-    Ok(())
-}
-
-fn load_agent_prompts_shim(
-    fs: &dyn FileSystem,
-    agents: &[String],
-    extra_dirs: &[String],
-) -> Result<String> {
-    if agents.is_empty() {
-        return Ok(String::new());
-    }
-
-    let mut bases: Vec<PathBuf> = extra_dirs
-        .iter()
-        .map(|d| PathBuf::from(d.trim()))
-        .filter(|p| !p.as_os_str().is_empty())
-        .collect();
-    let cwd = fs.current_dir().unwrap_or_else(|_| PathBuf::from("."));
-    bases.push(cwd.join(".prismflow").join("prompts"));
-    if let Some(config_dir) = fs.config_dir() {
-        bases.push(config_dir.join("pr-reviewer").join("prompts"));
-    }
-
-    let mut sections = Vec::new();
-    for agent in agents {
-        let file_name = format!("{agent}.md");
-        let mut checked: Vec<PathBuf> = Vec::new();
-        let mut loaded = None;
-        for base in &bases {
-            let path = base.join(&file_name);
-            checked.push(path.clone());
-            if fs.exists(&path) && file_name_matches_exact_case(&path) {
-                let content = fs.read_to_string(&path).map_err(|e| {
-                    anyhow!("failed to read agent prompt file {}: {}", path.display(), e)
-                })?;
-                loaded = Some(content);
-                break;
-            }
-        }
-        match loaded {
-            Some(content) => sections.push(format!("# Agent: {agent}\n{content}")),
-            None => {
-                let checked_str = checked
-                    .iter()
-                    .map(|p| p.display().to_string())
-                    .collect::<Vec<_>>()
-                    .join(" ; ");
-                return Err(anyhow!(
-                    "agent prompt file missing: checked {}",
-                    checked_str
-                ));
-            }
-        }
-    }
-
-    Ok(sections.join("\n\n"))
-}
-
 fn apply_repo_file_filter(
     files: &[PullRequestFilePatch],
     filter: &ReviewFilterConfig,
@@ -2475,31 +2346,6 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("prismflow-review-workflow-{tag}-{stamp}"));
         fs::create_dir_all(&dir).expect("create temp dir");
         dir
-    }
-
-    #[test]
-    fn ensure_agent_prompts_available_requires_exact_case_file_name() {
-        let root = make_temp_dir("agent-case-sensitive-miss");
-        fs::write(root.join("DEBUG.md"), "debug uppercase").expect("write prompt");
-        let fs_adapter = TempFileSystem { root: root.clone() };
-        let dirs = vec![root.to_string_lossy().to_string()];
-        let agents = vec!["debug".to_string()];
-
-        let err = ensure_agent_prompts_available(&fs_adapter, &agents, &dirs).expect_err("missing");
-        assert!(err.to_string().contains("agent prompt file missing"));
-        let _ = fs::remove_dir_all(root);
-    }
-
-    #[test]
-    fn ensure_agent_prompts_available_accepts_exact_case_file_name() {
-        let root = make_temp_dir("agent-case-sensitive-hit");
-        fs::write(root.join("DEBUG.md"), "debug uppercase").expect("write prompt");
-        let fs_adapter = TempFileSystem { root: root.clone() };
-        let dirs = vec![root.to_string_lossy().to_string()];
-        let agents = vec!["DEBUG".to_string()];
-
-        ensure_agent_prompts_available(&fs_adapter, &agents, &dirs).expect("found");
-        let _ = fs::remove_dir_all(root);
     }
 
     fn workflow<'a>(
