@@ -1,7 +1,11 @@
 pub mod agent_preflight;
+pub mod agent_service;
 pub mod auth_manager;
+pub mod cache_service;
 pub mod ci_workflow;
 pub mod context;
 pub mod repo_manager;
+pub mod report_service;
+pub mod review_orchestrator;
 pub mod review_workflow;
 pub mod usecases;
