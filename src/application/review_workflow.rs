@@ -22,6 +22,7 @@ use crate::application::{
     context::TaskContext,
 };
 use crate::domain::{
+    engine_output::{extract_stdout_file_marker, strip_stdout_file_marker},
     entities::{
         AppConfig, MonitoredRepo, PullRequestFilePatch, PullRequestSummary, ReviewFilterConfig,
     },
@@ -34,7 +35,6 @@ const DEFAULT_RETRY_ATTEMPTS: usize = 3;
 const DEFAULT_RETRY_BACKOFF_MS: u64 = 300;
 const PROCESSING_TTL_SECS: i64 = 30 * 60;
 const ADHOC_COOLDOWN_SECS: i64 = 10 * 60;
-const STDOUT_FILE_MARKER_PREFIX: &str = "__PRISMFLOW_STDOUT_FILE__=";
 const MAX_REVIEW_COMMENT_CHARS: usize = 60_000;
 
 struct RuntimePrLockGuard {
@@ -962,9 +962,13 @@ impl<'a> ReviewWorkflow<'a> {
             {
                 Ok(()) => return Ok(()),
                 Err(err) => {
-                    eprintln!(
+                    tracing::warn!(
                         "post_summary_from_file_failed repo={}/{} issue={} path={} error={}",
-                        owner, repo, issue_number, path, err
+                        owner,
+                        repo,
+                        issue_number,
+                        path,
+                        err
                     );
                     let fallback_summary = if cleaned_summary.trim().is_empty() {
                         "Shell engine returned stdout file marker, but PrismFlow failed to read that file."
@@ -1673,40 +1677,6 @@ fn parse_processing_ts(body: &str, prefix: &str) -> Option<i64> {
     let tail = &body[start..];
     let end = tail.find(" -->")?;
     tail[..end].trim().parse::<i64>().ok()
-}
-
-fn extract_stdout_file_marker(output: &str) -> Option<String> {
-    stdout_marker_span(output).map(|(path, _, _)| path)
-}
-
-fn strip_stdout_file_marker(output: &str) -> String {
-    if let Some((_, start, end)) = stdout_marker_span(output) {
-        let mut out = String::with_capacity(output.len().saturating_sub(end - start));
-        out.push_str(&output[..start]);
-        out.push_str(&output[end..]);
-        return out.trim().to_string();
-    }
-    output.to_string()
-}
-
-fn stdout_marker_span(output: &str) -> Option<(String, usize, usize)> {
-    let start = output.find(STDOUT_FILE_MARKER_PREFIX)?;
-    let path_start = start + STDOUT_FILE_MARKER_PREFIX.len();
-    let mut end = output.len();
-    for (offset, ch) in output[path_start..].char_indices() {
-        if ch.is_whitespace() {
-            end = path_start + offset;
-            break;
-        }
-    }
-    if end <= path_start {
-        return None;
-    }
-    let path = output[path_start..end].trim().to_string();
-    if path.is_empty() {
-        return None;
-    }
-    Some((path, start, end))
 }
 
 #[derive(Debug, Clone)]
@@ -3439,7 +3409,7 @@ mod tests {
     fn stdout_marker_helpers_support_prefixed_text() {
         let text = format!(
             "Previous review for `111111111111` is outdated.\n\n{}D:/tmp/out.log",
-            STDOUT_FILE_MARKER_PREFIX
+            crate::domain::engine_output::STDOUT_FILE_MARKER_PREFIX
         );
         let path = extract_stdout_file_marker(&text).expect("marker path");
         assert_eq!(path, "D:/tmp/out.log");
@@ -3457,7 +3427,11 @@ mod tests {
         )
         .expect("write stdout file");
         let marker_shell = MarkerShell {
-            output: format!("{}{}", STDOUT_FILE_MARKER_PREFIX, stdout_file.display()),
+            output: format!(
+                "{}{}",
+                crate::domain::engine_output::STDOUT_FILE_MARKER_PREFIX,
+                stdout_file.display()
+            ),
         };
 
         let old_sha = "111111111111";
@@ -3504,7 +3478,7 @@ mod tests {
         let merged = comments.join("\n\n");
         assert!(merged.contains("Previous review for `111111111111` is outdated."));
         assert!(merged.contains("loading state should remain visible"));
-        assert!(!merged.contains(STDOUT_FILE_MARKER_PREFIX));
+        assert!(!merged.contains(crate::domain::engine_output::STDOUT_FILE_MARKER_PREFIX));
         let _ = fs::remove_dir_all(tmp);
     }
 
@@ -3515,7 +3489,11 @@ mod tests {
             .to_string_lossy()
             .to_string();
         let marker_shell = MarkerShell {
-            output: format!("{}{}", STDOUT_FILE_MARKER_PREFIX, missing),
+            output: format!(
+                "{}{}",
+                crate::domain::engine_output::STDOUT_FILE_MARKER_PREFIX,
+                missing
+            ),
         };
 
         let github = MockGitHub {
@@ -3556,7 +3534,7 @@ mod tests {
             .unwrap_or_default();
         let merged = comments.join("\n\n");
         assert!(merged.contains("failed to read that file"));
-        assert!(!merged.contains(STDOUT_FILE_MARKER_PREFIX));
+        assert!(!merged.contains(crate::domain::engine_output::STDOUT_FILE_MARKER_PREFIX));
     }
 
     #[test]

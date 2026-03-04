@@ -1,3 +1,4 @@
+use crate::domain::engine_output::STDOUT_FILE_MARKER_PREFIX;
 use crate::domain::errors::DomainError;
 use crate::domain::ports::{CommandContext, ShellAdapter};
 use anyhow::{Context, Result};
@@ -21,7 +22,6 @@ pub struct CommandShellAdapter {
 }
 
 const COMMAND_TIMEOUT_SECS: u64 = 10 * 60;
-const STDOUT_FILE_MARKER_PREFIX: &str = "__PRISMFLOW_STDOUT_FILE__=";
 
 impl CommandShellAdapter {
     pub fn new(shell_override: Option<String>) -> Self {
@@ -342,7 +342,8 @@ mod tests {
     use std::fs;
     use std::sync::Arc;
 
-    use super::{CommandShellAdapter, STDOUT_FILE_MARKER_PREFIX};
+    use super::CommandShellAdapter;
+    use crate::domain::engine_output::STDOUT_FILE_MARKER_PREFIX;
     use crate::domain::ports::{CommandContext, ShellAdapter};
     use async_trait::async_trait;
     use std::time::{Duration, Instant};

@@ -17,6 +17,7 @@ use serde::Serialize;
 use crate::{
     application::context::TaskContext,
     domain::{
+        engine_output::{extract_stdout_file_marker, strip_stdout_file_marker},
         entities::{AppConfig, CiFailure, MonitoredRepo},
         ports::{
             CommandContext, ConfigRepository, FileSystem, GitHubRepository, GitService,
@@ -26,7 +27,6 @@ use crate::{
 };
 
 use super::review_workflow::EngineSpec;
-const STDOUT_FILE_MARKER_PREFIX: &str = "__PRISMFLOW_STDOUT_FILE__=";
 
 #[derive(Debug, Clone, Default, Serialize)]
 pub struct RepoCiStats {
@@ -488,7 +488,7 @@ fn workflow_engine_fingerprint(engine_specs: &[EngineSpec]) -> String {
 }
 
 fn read_shell_output_text(output: &str) -> String {
-    let Some(path) = output.strip_prefix(STDOUT_FILE_MARKER_PREFIX) else {
+    let Some(path) = extract_stdout_file_marker(output) else {
         return output.to_string();
     };
     let mut file = match fs::File::open(path.trim()) {
@@ -497,7 +497,12 @@ fn read_shell_output_text(output: &str) -> String {
     };
     let mut text = String::new();
     if file.read_to_string(&mut text).is_ok() {
-        text
+        let prefix = strip_stdout_file_marker(output);
+        if prefix.trim().is_empty() {
+            text
+        } else {
+            format!("{}\n\n{}", prefix.trim(), text)
+        }
     } else {
         output.to_string()
     }
