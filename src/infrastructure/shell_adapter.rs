@@ -8,11 +8,15 @@ use std::process::Command;
 use std::process::Stdio;
 use tokio::io::AsyncReadExt;
 use tokio::process::Command as TokioCommand;
+use tokio::time::{Duration, sleep};
 
 #[derive(Debug, Clone, Default)]
 pub struct CommandShellAdapter {
     shell_override: Option<String>,
 }
+
+const MAX_CAPTURE_BYTES: usize = 1024 * 1024;
+const COMMAND_TIMEOUT_SECS: u64 = 10 * 60;
 
 impl CommandShellAdapter {
     pub fn new(shell_override: Option<String>) -> Self {
@@ -140,16 +144,12 @@ impl ShellAdapter for CommandShellAdapter {
         let pid = child.id();
         let stdout_reader = child.stdout.take().map(|mut out| {
             tokio::spawn(async move {
-                let mut buf = Vec::new();
-                let _ = out.read_to_end(&mut buf).await;
-                buf
+                read_limited(&mut out, MAX_CAPTURE_BYTES).await
             })
         });
         let stderr_reader = child.stderr.take().map(|mut err| {
             tokio::spawn(async move {
-                let mut buf = Vec::new();
-                let _ = err.read_to_end(&mut buf).await;
-                buf
+                read_limited(&mut err, MAX_CAPTURE_BYTES).await
             })
         });
         if let (Some(task_ctx), Some(pid)) = (ctx, pid) {
@@ -174,32 +174,82 @@ impl ShellAdapter for CommandShellAdapter {
                     }
                     anyhow::bail!(DomainError::CancelledBySignal);
                 }
+                _ = sleep(Duration::from_secs(COMMAND_TIMEOUT_SECS)) => {
+                    let _ = child.kill().await;
+                    if let (Some(task_ctx), Some(pid)) = (ctx, pid) {
+                        task_ctx.unregister_child(pid).await;
+                    }
+                    anyhow::bail!("command line timed out after {}s", COMMAND_TIMEOUT_SECS);
+                }
             }?
         } else {
-            child.wait().await?
+            tokio::select! {
+                out = child.wait() => out?,
+                _ = sleep(Duration::from_secs(COMMAND_TIMEOUT_SECS)) => {
+                    let _ = child.kill().await;
+                    anyhow::bail!("command line timed out after {}s", COMMAND_TIMEOUT_SECS);
+                }
+            }
         };
-        let stdout_buf = match stdout_reader {
+        let (stdout_buf, stdout_truncated) = match stdout_reader {
             Some(handle) => handle.await.unwrap_or_default(),
-            None => Vec::new(),
+            None => (Vec::new(), false),
         };
-        let stderr_buf = match stderr_reader {
+        let (stderr_buf, stderr_truncated) = match stderr_reader {
             Some(handle) => handle.await.unwrap_or_default(),
-            None => Vec::new(),
+            None => (Vec::new(), false),
         };
         if let (Some(task_ctx), Some(pid)) = (ctx, pid) {
             task_ctx.unregister_child(pid).await;
         }
 
+        let stderr_text = maybe_truncated_text(&stderr_buf, stderr_truncated);
         if !status.success() {
             anyhow::bail!(
                 "command line exited with status {}: {}",
                 status,
-                String::from_utf8_lossy(&stderr_buf)
+                stderr_text
             );
         }
 
-        Ok(String::from_utf8_lossy(&stdout_buf).trim().to_string())
+        let stdout_text = maybe_truncated_text(&stdout_buf, stdout_truncated);
+        Ok(stdout_text.trim().to_string())
     }
+}
+
+async fn read_limited<R: tokio::io::AsyncRead + Unpin>(
+    reader: &mut R,
+    limit: usize,
+) -> (Vec<u8>, bool) {
+    let mut out = Vec::<u8>::new();
+    let mut truncated = false;
+    let mut chunk = [0u8; 8192];
+    loop {
+        let n = match reader.read(&mut chunk).await {
+            Ok(0) => break,
+            Ok(v) => v,
+            Err(_) => break,
+        };
+        if out.len() < limit {
+            let remaining = limit - out.len();
+            let to_copy = remaining.min(n);
+            out.extend_from_slice(&chunk[..to_copy]);
+            if to_copy < n {
+                truncated = true;
+            }
+        } else {
+            truncated = true;
+        }
+    }
+    (out, truncated)
+}
+
+fn maybe_truncated_text(buf: &[u8], truncated: bool) -> String {
+    let mut text = String::from_utf8_lossy(buf).into_owned();
+    if truncated {
+        text.push_str("\n[truncated output]");
+    }
+    text
 }
 
 fn command_fingerprint(command_line: &str) -> String {

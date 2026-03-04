@@ -1,4 +1,4 @@
-use std::path::PathBuf;
+use std::{fs, path::PathBuf};
 
 use anyhow::Result;
 use chrono::Utc;
@@ -58,9 +58,11 @@ impl<'a> ReviewReportService<'a> {
 
         if self.should_archive(stats, archive_on_failure_only) {
             self.fs.write(&timestamped, raw.as_bytes())?;
+            self.cleanup_old_archives(&root, 200);
             return Ok(timestamped);
         }
 
+        self.cleanup_old_archives(&root, 200);
         Ok(latest)
     }
 
@@ -72,6 +74,38 @@ impl<'a> ReviewReportService<'a> {
         stats
             .iter()
             .any(|s| s.failed_retryable > 0 || s.failed_fatal > 0)
+    }
+
+    fn cleanup_old_archives(&self, root: &std::path::Path, keep_latest: usize) {
+        let entries = match fs::read_dir(root) {
+            Ok(v) => v,
+            Err(_) => return,
+        };
+        let mut archived = entries
+            .flatten()
+            .filter_map(|entry| {
+                let path = entry.path();
+                let name = path.file_name()?.to_str()?;
+                if !name.starts_with("review-report-") || !name.ends_with(".json") {
+                    return None;
+                }
+                let modified = entry
+                    .metadata()
+                    .ok()
+                    .and_then(|m| m.modified().ok())
+                    .unwrap_or(std::time::SystemTime::UNIX_EPOCH);
+                Some((modified, path))
+            })
+            .collect::<Vec<_>>();
+
+        if archived.len() <= keep_latest {
+            return;
+        }
+
+        archived.sort_by(|a, b| b.0.cmp(&a.0));
+        for (_, path) in archived.into_iter().skip(keep_latest) {
+            let _ = fs::remove_file(path);
+        }
     }
 }
 
