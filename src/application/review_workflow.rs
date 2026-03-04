@@ -43,7 +43,10 @@ struct RuntimePrLockGuard {
 
 impl Drop for RuntimePrLockGuard {
     fn drop(&mut self) {
-        let mut locks = self.lock_store.lock().expect("runtime lock poisoned");
+        let mut locks = self
+            .lock_store
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         locks.remove(&self.key);
     }
 }
@@ -53,7 +56,9 @@ fn try_acquire_runtime_pr_lock(
     key: &str,
 ) -> Option<RuntimePrLockGuard> {
     {
-        let mut locks = lock_store.lock().expect("runtime lock poisoned");
+        let mut locks = lock_store
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         if !locks.insert(key.to_string()) {
             return None;
         }
@@ -1132,13 +1137,27 @@ impl<'a> ReviewWorkflow<'a> {
         };
         command = render_runtime_template(&command, &command_ctx)?;
         let command_line = command;
+        let cmd_fingerprint = command_line_fingerprint(&command_line);
+        let cmd_len = command_line.len();
         println!(
-            "[ENGINE] repo={}/{} pr={} pr_url={} engine={} command_line={}",
-            owner, repo, pr_number, pr_url, selected_engine.fingerprint, command_line
+            "[ENGINE] repo={}/{} pr={} pr_url={} engine={} command_fingerprint={} command_len={}",
+            owner,
+            repo,
+            pr_number,
+            pr_url,
+            selected_engine.fingerprint,
+            cmd_fingerprint,
+            cmd_len
         );
         self.emit_status(format!(
-            "repo={}/{} pr={} pr_url={} stage=EngineCommand engine={} command_line={}",
-            owner, repo, pr_number, pr_url, selected_engine.fingerprint, command_line
+            "repo={}/{} pr={} pr_url={} stage=EngineCommand engine={} command_fingerprint={} command_len={}",
+            owner,
+            repo,
+            pr_number,
+            pr_url,
+            selected_engine.fingerprint,
+            cmd_fingerprint,
+            cmd_len
         ));
         let output = match shell
             .run_command_line(
@@ -1493,6 +1512,13 @@ fn dedupe_key(repo: &str, pr: u64, head_sha: &str, engine_fingerprint: &str) -> 
     hasher.update(engine_fingerprint.as_bytes());
     let digest = hasher.finalize();
     hex::encode(digest)
+}
+
+fn command_line_fingerprint(command_line: &str) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(command_line.as_bytes());
+    let hex = hex::encode(hasher.finalize());
+    hex.chars().take(12).collect()
 }
 
 fn workflow_engine_fingerprint(engine_specs: &[EngineSpec]) -> String {
