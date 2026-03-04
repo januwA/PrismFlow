@@ -1882,37 +1882,6 @@ mod tests {
             })
         }
 
-        async fn get_pull_request_metrics(
-            &self,
-            _owner: &str,
-            _repo: &str,
-            pull_number: u64,
-        ) -> Result<crate::domain::entities::PullRequestMetrics> {
-            let files = self.files.get(&pull_number).cloned().unwrap_or_default();
-            let mut additions = 0u64;
-            let mut deletions = 0u64;
-            for f in files {
-                if let Some(patch) = f.patch {
-                    for line in patch.lines() {
-                        if line.starts_with('+') && !line.starts_with("+++") {
-                            additions += 1;
-                        } else if line.starts_with('-') && !line.starts_with("---") {
-                            deletions += 1;
-                        }
-                    }
-                }
-            }
-            Ok(crate::domain::entities::PullRequestMetrics {
-                changed_files: self
-                    .files
-                    .get(&pull_number)
-                    .map(|v| v.len() as u64)
-                    .unwrap_or(0),
-                additions,
-                deletions,
-            })
-        }
-
         async fn get_pull_request_ci_snapshot(
             &self,
             _owner: &str,
@@ -2186,9 +2155,6 @@ mod tests {
         fn read_to_string(&self, _path: &std::path::Path) -> Result<String> {
             Ok(String::new())
         }
-        fn remove_file(&self, _path: &std::path::Path) -> Result<()> {
-            Ok(())
-        }
         fn current_dir(&self) -> Result<std::path::PathBuf> {
             Ok(std::path::PathBuf::from("."))
         }
@@ -2215,10 +2181,6 @@ mod tests {
         }
         fn read_to_string(&self, path: &std::path::Path) -> Result<String> {
             Ok(fs::read_to_string(path)?)
-        }
-        fn remove_file(&self, path: &std::path::Path) -> Result<()> {
-            fs::remove_file(path)?;
-            Ok(())
         }
         fn current_dir(&self) -> Result<std::path::PathBuf> {
             Ok(self.root.clone())

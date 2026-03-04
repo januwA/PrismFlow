@@ -64,13 +64,6 @@ pub struct PullRequestSummary {
     pub author_login: Option<String>,
 }
 
-#[derive(Debug, Clone, Default)]
-pub struct PullRequestMetrics {
-    pub changed_files: u64,
-    pub additions: u64,
-    pub deletions: u64,
-}
-
 #[derive(Debug, Clone)]
 pub struct CiFailure {
     pub source: String,

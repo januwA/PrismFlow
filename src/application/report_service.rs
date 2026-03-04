@@ -109,10 +109,6 @@ mod tests {
             Ok(String::new())
         }
 
-        fn remove_file(&self, _path: &Path) -> Result<()> {
-            Ok(())
-        }
-
         fn current_dir(&self) -> Result<PathBuf> {
             Ok(self.current_dir.clone())
         }

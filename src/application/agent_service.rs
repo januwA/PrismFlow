@@ -178,10 +178,6 @@ mod tests {
                 .ok_or_else(|| anyhow!("file not found: {}", path.display()))
         }
 
-        fn remove_file(&self, _path: &Path) -> Result<()> {
-            Ok(())
-        }
-
         fn current_dir(&self) -> Result<PathBuf> {
             Ok(PathBuf::from("/test"))
         }
@@ -243,11 +239,6 @@ mod tests {
 
         fn read_to_string(&self, path: &Path) -> Result<String> {
             Ok(fs::read_to_string(path)?)
-        }
-
-        fn remove_file(&self, path: &Path) -> Result<()> {
-            fs::remove_file(path)?;
-            Ok(())
         }
 
         fn current_dir(&self) -> Result<PathBuf> {

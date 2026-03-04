@@ -5,7 +5,7 @@ use async_trait::async_trait;
 
 use crate::domain::entities::{
     AppConfig, PullRequestCiSnapshot, PullRequestFilePatch, PullRequestGitContext,
-    PullRequestMetrics, PullRequestSummary, ReviewComment, SimpleComment, SimplePullReview,
+    PullRequestSummary, ReviewComment, SimpleComment, SimplePullReview,
 };
 
 pub trait ConfigRepository: Send + Sync {
@@ -76,12 +76,6 @@ pub trait GitHubRepository: Send + Sync {
         repo: &str,
         pull_number: u64,
     ) -> Result<PullRequestGitContext>;
-    async fn get_pull_request_metrics(
-        &self,
-        owner: &str,
-        repo: &str,
-        pull_number: u64,
-    ) -> Result<PullRequestMetrics>;
     async fn get_pull_request_ci_snapshot(
         &self,
         owner: &str,
@@ -189,7 +183,6 @@ pub trait FileSystem: Send + Sync {
     fn create_dir_all(&self, path: &Path) -> Result<()>;
     fn write(&self, path: &Path, content: &[u8]) -> Result<()>;
     fn read_to_string(&self, path: &Path) -> Result<String>;
-    fn remove_file(&self, path: &Path) -> Result<()>;
     fn current_dir(&self) -> Result<PathBuf>;
     fn config_dir(&self) -> Option<PathBuf>;
     fn exists(&self, path: &Path) -> bool;

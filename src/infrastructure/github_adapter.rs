@@ -10,7 +10,7 @@ use tokio::sync::Semaphore;
 use crate::domain::{
     entities::{
         CiFailure, PullRequestCiSnapshot, PullRequestFilePatch, PullRequestGitContext,
-        PullRequestMetrics, PullRequestSummary, ReviewComment, SimpleComment, SimplePullReview,
+        PullRequestSummary, ReviewComment, SimpleComment, SimplePullReview,
     },
     ports::GitHubRepository,
 };
@@ -133,29 +133,6 @@ impl GitHubRepository for OctocrabGitHubRepository {
             head_sha: pr.head.sha,
             head_ref: pr.head.head_ref,
             head_clone_url: clone_url,
-        })
-    }
-
-    async fn get_pull_request_metrics(
-        &self,
-        owner: &str,
-        repo: &str,
-        pull_number: u64,
-    ) -> Result<PullRequestMetrics> {
-        #[derive(Debug, Deserialize)]
-        struct PullDto {
-            changed_files: Option<u64>,
-            additions: Option<u64>,
-            deletions: Option<u64>,
-        }
-
-        let _permit = self.acquire_api_permit().await?;
-        let route = format!("/repos/{owner}/{repo}/pulls/{pull_number}");
-        let pr: PullDto = self.client.get(route, None::<&()>).await?;
-        Ok(PullRequestMetrics {
-            changed_files: pr.changed_files.unwrap_or(0),
-            additions: pr.additions.unwrap_or(0),
-            deletions: pr.deletions.unwrap_or(0),
         })
     }
 

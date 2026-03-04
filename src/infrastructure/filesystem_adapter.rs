@@ -25,10 +25,6 @@ impl FileSystem for StdFileSystemAdapter {
         fs::read_to_string(path).with_context(|| format!("failed to read file: {}", path.display()))
     }
 
-    fn remove_file(&self, path: &Path) -> Result<()> {
-        fs::remove_file(path).with_context(|| format!("failed to remove file: {}", path.display()))
-    }
-
     fn current_dir(&self) -> Result<PathBuf> {
         std::env::current_dir().context("failed to get current dir")
     }

@@ -542,7 +542,7 @@ mod tests {
     use crate::application::context::TaskContext;
     use crate::domain::entities::{
         AppConfig, MonitoredRepo, PullRequestCiSnapshot, PullRequestFilePatch,
-        PullRequestGitContext, PullRequestMetrics, PullRequestSummary, ReviewFilterConfig,
+        PullRequestGitContext, PullRequestSummary, ReviewFilterConfig,
     };
     use crate::domain::ports::{
         CommandContext, ConfigRepository, FileSystem, GitHubRepository, GitService, ShellAdapter,
@@ -609,15 +609,6 @@ mod tests {
             _repo: &str,
             _pull_number: u64,
         ) -> Result<PullRequestGitContext> {
-            panic!("unexpected call")
-        }
-
-        async fn get_pull_request_metrics(
-            &self,
-            _owner: &str,
-            _repo: &str,
-            _pull_number: u64,
-        ) -> Result<PullRequestMetrics> {
             panic!("unexpected call")
         }
 
@@ -803,9 +794,6 @@ mod tests {
         fn read_to_string(&self, _path: &std::path::Path) -> Result<String> {
             Ok(String::new())
         }
-        fn remove_file(&self, _path: &std::path::Path) -> Result<()> {
-            Ok(())
-        }
         fn current_dir(&self) -> Result<std::path::PathBuf> {
             Ok(std::path::PathBuf::from("."))
         }
@@ -832,10 +820,6 @@ mod tests {
         }
         fn read_to_string(&self, path: &std::path::Path) -> Result<String> {
             Ok(fs::read_to_string(path)?)
-        }
-        fn remove_file(&self, path: &std::path::Path) -> Result<()> {
-            fs::remove_file(path)?;
-            Ok(())
         }
         fn current_dir(&self) -> Result<std::path::PathBuf> {
             Ok(self.root.clone())
