@@ -1,3 +1,4 @@
+use crate::domain::engine_output::STDOUT_FILE_MARKER_PREFIX;
 use crate::domain::errors::DomainError;
 use crate::domain::ports::{CommandContext, ShellAdapter};
 use anyhow::{Context, Result};
@@ -21,7 +22,6 @@ pub struct CommandShellAdapter {
 }
 
 const COMMAND_TIMEOUT_SECS: u64 = 10 * 60;
-const STDOUT_FILE_MARKER_PREFIX: &str = "__PRISMFLOW_STDOUT_FILE__=";
 
 impl CommandShellAdapter {
     pub fn new(shell_override: Option<String>) -> Self {
@@ -152,15 +152,11 @@ impl ShellAdapter for CommandShellAdapter {
         let pid = child.id();
         let stdout_reader = child.stdout.take().map(|mut out| {
             let path = stdout_path.clone();
-            tokio::spawn(async move {
-                read_stream_capture(&mut out, path).await
-            })
+            tokio::spawn(async move { read_stream_capture(&mut out, path).await })
         });
         let stderr_reader = child.stderr.take().map(|mut err| {
             let path = stderr_path.clone();
-            tokio::spawn(async move {
-                read_stream_capture(&mut err, path).await
-            })
+            tokio::spawn(async move { read_stream_capture(&mut err, path).await })
         });
         if let (Some(task_ctx), Some(pid)) = (ctx, pid) {
             task_ctx
@@ -224,7 +220,8 @@ impl ShellAdapter for CommandShellAdapter {
         if is_empty_output_file(stdout_capture.full_output_path.as_ref())
             && is_non_empty_output_file(stderr_capture.full_output_path.as_ref())
         {
-            let stderr_excerpt = read_output_excerpt(stderr_capture.full_output_path.as_ref(), 2000);
+            let stderr_excerpt =
+                read_output_excerpt(stderr_capture.full_output_path.as_ref(), 2000);
             anyhow::bail!(
                 "command line produced empty stdout but non-empty stderr: {}",
                 stderr_excerpt
@@ -316,7 +313,10 @@ fn read_output_excerpt(path: Option<&PathBuf>, max_chars: usize) -> String {
     };
     let mut text = String::new();
     if file.read_to_string(&mut text).is_err() {
-        return format!("stderr file exists but cannot decode as UTF-8: {}", path.display());
+        return format!(
+            "stderr file exists but cannot decode as UTF-8: {}",
+            path.display()
+        );
     }
     if text.len() <= max_chars {
         text
@@ -342,7 +342,8 @@ mod tests {
     use std::fs;
     use std::sync::Arc;
 
-    use super::{CommandShellAdapter, STDOUT_FILE_MARKER_PREFIX};
+    use super::CommandShellAdapter;
+    use crate::domain::engine_output::STDOUT_FILE_MARKER_PREFIX;
     use crate::domain::ports::{CommandContext, ShellAdapter};
     use async_trait::async_trait;
     use std::time::{Duration, Instant};

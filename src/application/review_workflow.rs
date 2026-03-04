@@ -22,6 +22,7 @@ use crate::application::{
     context::TaskContext,
 };
 use crate::domain::{
+    engine_output::{extract_stdout_file_marker, strip_stdout_file_marker},
     entities::{
         AppConfig, MonitoredRepo, PullRequestFilePatch, PullRequestSummary, ReviewFilterConfig,
     },
@@ -34,7 +35,6 @@ const DEFAULT_RETRY_ATTEMPTS: usize = 3;
 const DEFAULT_RETRY_BACKOFF_MS: u64 = 300;
 const PROCESSING_TTL_SECS: i64 = 30 * 60;
 const ADHOC_COOLDOWN_SECS: i64 = 10 * 60;
-const STDOUT_FILE_MARKER_PREFIX: &str = "__PRISMFLOW_STDOUT_FILE__=";
 const MAX_REVIEW_COMMENT_CHARS: usize = 60_000;
 
 struct RuntimePrLockGuard {
@@ -278,8 +278,7 @@ impl<'a> ReviewWorkflow<'a> {
             .await;
         match outcome {
             PrReviewOutcome::Processed {
-                recovered_stale,
-                ..
+                recovered_stale, ..
             } => {
                 stats.processed += 1;
                 if recovered_stale {
@@ -437,19 +436,17 @@ impl<'a> ReviewWorkflow<'a> {
             &pr.head_sha,
             &self.engine_fingerprint,
         );
-        let _runtime_pr_lock = match try_acquire_runtime_pr_lock(
-            self.options.runtime_pr_locks.clone(),
-            &key,
-        ) {
-            Some(v) => v,
-            None => {
-                self.emit_status(format!(
-                    "repo={}/{} pr={} stage=Skipped reason=runtime-lock-held",
-                    owner, repo, pr.number
-                ));
-                return PrReviewOutcome::SkippedProcessing;
-            }
-        };
+        let _runtime_pr_lock =
+            match try_acquire_runtime_pr_lock(self.options.runtime_pr_locks.clone(), &key) {
+                Some(v) => v,
+                None => {
+                    self.emit_status(format!(
+                        "repo={}/{} pr={} stage=Skipped reason=runtime-lock-held",
+                        owner, repo, pr.number
+                    ));
+                    return PrReviewOutcome::SkippedProcessing;
+                }
+            };
         let processing_prefix = processing_anchor_prefix(&key);
         let completed_anchor = completed_anchor(&key);
 
@@ -738,14 +735,18 @@ impl<'a> ReviewWorkflow<'a> {
 
         let review_header = format!(
             "PrismFlow review summary for `{}`\n\n- Engine: `{}`\n- Analyzer: `{}`\n\n",
-            pr.head_sha,
-            selected_engine_fingerprint,
-            analysis.source,
+            pr.head_sha, selected_engine_fingerprint, analysis.source,
         );
 
         self.mark_stage(ReviewStage::PostingReview, full_repo_name, pr.number);
         if let Err(err) = self
-            .post_review_summary(owner, repo, pr.number, &review_header, &summary_with_outdated)
+            .post_review_summary(
+                owner,
+                repo,
+                pr.number,
+                &review_header,
+                &summary_with_outdated,
+            )
             .await
         {
             return match classify_error(&err) {
@@ -954,9 +955,38 @@ impl<'a> ReviewWorkflow<'a> {
         summary: &str,
     ) -> Result<()> {
         if let Some(path) = extract_stdout_file_marker(summary) {
-            return self
-                .post_summary_from_file(owner, repo, issue_number, header, &path)
-                .await;
+            let cleaned_summary = strip_stdout_file_marker(summary);
+            match self
+                .post_summary_from_file(owner, repo, issue_number, header, &cleaned_summary, &path)
+                .await
+            {
+                Ok(()) => return Ok(()),
+                Err(err) => {
+                    tracing::warn!(
+                        "post_summary_from_file_failed repo={}/{} issue={} path={} error={}",
+                        owner,
+                        repo,
+                        issue_number,
+                        path,
+                        err
+                    );
+                    let fallback_summary = if cleaned_summary.trim().is_empty() {
+                        "Shell engine returned stdout file marker, but PrismFlow failed to read that file."
+                            .to_string()
+                    } else {
+                        cleaned_summary
+                    };
+                    return self
+                        .post_chunked_comment_text(
+                            owner,
+                            repo,
+                            issue_number,
+                            header,
+                            &fallback_summary,
+                        )
+                        .await;
+                }
+            }
         }
         self.post_chunked_comment_text(owner, repo, issue_number, header, summary)
             .await
@@ -968,13 +998,18 @@ impl<'a> ReviewWorkflow<'a> {
         repo: &str,
         issue_number: u64,
         header: &str,
+        summary_prefix: &str,
         path: &str,
     ) -> Result<()> {
         let mut file = fs::File::open(path)
             .with_context(|| format!("failed to open engine stdout file: {path}"))?;
         let mut buf = [0u8; 8192];
         let mut current = header.to_string();
-        let mut has_body = false;
+        if !summary_prefix.trim().is_empty() {
+            current.push_str(summary_prefix.trim());
+            current.push_str("\n\n");
+        }
+        let mut has_body = !summary_prefix.trim().is_empty();
 
         loop {
             let n = file
@@ -1215,13 +1250,7 @@ impl<'a> ReviewWorkflow<'a> {
         let cmd_len = command_line.len();
         println!(
             "[ENGINE] repo={}/{} pr={} pr_url={} engine={} command_fingerprint={} command_len={}",
-            owner,
-            repo,
-            pr_number,
-            pr_url,
-            selected_engine.fingerprint,
-            cmd_fingerprint,
-            cmd_len
+            owner, repo, pr_number, pr_url, selected_engine.fingerprint, cmd_fingerprint, cmd_len
         );
         self.emit_status(format!(
             "repo={}/{} pr={} pr_url={} stage=EngineCommand engine={} command_fingerprint={} command_len={}",
@@ -1453,10 +1482,7 @@ struct RepoReviewReport {
 
 #[derive(Debug)]
 enum PrReviewOutcome {
-    Processed {
-        sha: String,
-        recovered_stale: bool,
-    },
+    Processed { sha: String, recovered_stale: bool },
     SkippedCompleted,
     SkippedProcessing,
     SkippedFiltered,
@@ -1651,13 +1677,6 @@ fn parse_processing_ts(body: &str, prefix: &str) -> Option<i64> {
     let tail = &body[start..];
     let end = tail.find(" -->")?;
     tail[..end].trim().parse::<i64>().ok()
-}
-
-fn extract_stdout_file_marker(output: &str) -> Option<String> {
-    output
-        .strip_prefix(STDOUT_FILE_MARKER_PREFIX)
-        .map(|v| v.trim().to_string())
-        .filter(|v| !v.is_empty())
 }
 
 #[derive(Debug, Clone)]
@@ -2492,6 +2511,34 @@ mod tests {
             ctx: Option<&dyn CommandContext>,
         ) -> Result<String> {
             self.run_command_line(command_line, ctx).await
+        }
+    }
+
+    struct MarkerShell {
+        output: String,
+    }
+
+    #[async_trait::async_trait]
+    impl ShellAdapter for MarkerShell {
+        fn run_capture(&self, _program: &str, _args: &[&str]) -> Result<String> {
+            Ok(String::new())
+        }
+
+        async fn run_command_line(
+            &self,
+            _command_line: &str,
+            _ctx: Option<&dyn CommandContext>,
+        ) -> Result<String> {
+            Ok(self.output.clone())
+        }
+
+        async fn run_command_line_in_dir(
+            &self,
+            _command_line: &str,
+            _workdir: Option<&str>,
+            _ctx: Option<&dyn CommandContext>,
+        ) -> Result<String> {
+            Ok(self.output.clone())
         }
     }
 
@@ -3356,6 +3403,138 @@ mod tests {
         let merged = comments.join("\n");
         assert!(merged.contains("engine `engine-a`"));
         assert!(merged.contains("prismflow:completed:"));
+    }
+
+    #[test]
+    fn stdout_marker_helpers_support_prefixed_text() {
+        let text = format!(
+            "Previous review for `111111111111` is outdated.\n\n{}D:/tmp/out.log",
+            crate::domain::engine_output::STDOUT_FILE_MARKER_PREFIX
+        );
+        let path = extract_stdout_file_marker(&text).expect("marker path");
+        assert_eq!(path, "D:/tmp/out.log");
+        let stripped = strip_stdout_file_marker(&text);
+        assert_eq!(stripped, "Previous review for `111111111111` is outdated.");
+    }
+
+    #[tokio::test]
+    async fn marker_summary_keeps_outdated_notice_and_uses_stdout_file_content() {
+        let tmp = make_temp_dir("marker-summary");
+        let stdout_file = tmp.join("engine.stdout.log");
+        fs::write(
+            &stdout_file,
+            "src/pages/Home/index.tsx:197: loading state should remain visible",
+        )
+        .expect("write stdout file");
+        let marker_shell = MarkerShell {
+            output: format!(
+                "{}{}",
+                crate::domain::engine_output::STDOUT_FILE_MARKER_PREFIX,
+                stdout_file.display()
+            ),
+        };
+
+        let old_sha = "111111111111";
+        let github = MockGitHub {
+            prs: vec![PullRequestSummary {
+                number: 1,
+                title: "t".to_string(),
+                head_sha: "abc123".to_string(),
+                html_url: None,
+                author_login: Some("mock-user".to_string()),
+            }],
+            files: HashMap::from([(
+                1,
+                vec![PullRequestFilePatch {
+                    path: "src/lib.rs".to_string(),
+                    patch: Some("@@ -1,1 +1,2 @@\n line\n+let x = y.unwrap();".to_string()),
+                }],
+            )]),
+            issue_labels: Mutex::new(HashMap::from([(
+                1,
+                vec![format!("pr-reviewer:reviewed:{old_sha}")],
+            )])),
+            ..Default::default()
+        };
+        let config = InMemoryConfigRepo::new(config_with_repo());
+        let stats = workflow_with_shell(
+            &config,
+            &github,
+            &marker_shell,
+            ReviewWorkflowOptions::default(),
+        )
+        .review_once()
+        .await
+        .expect("review_once");
+        assert_eq!(stats[0].processed, 1);
+
+        let comments = github
+            .issue_comments
+            .lock()
+            .expect("lock")
+            .get(&1)
+            .cloned()
+            .unwrap_or_default();
+        let merged = comments.join("\n\n");
+        assert!(merged.contains("Previous review for `111111111111` is outdated."));
+        assert!(merged.contains("loading state should remain visible"));
+        assert!(!merged.contains(crate::domain::engine_output::STDOUT_FILE_MARKER_PREFIX));
+        let _ = fs::remove_dir_all(tmp);
+    }
+
+    #[tokio::test]
+    async fn marker_summary_falls_back_without_leaking_marker_when_file_is_missing() {
+        let missing = std::env::temp_dir()
+            .join(format!("prismflow-missing-{}.log", now_unix_secs()))
+            .to_string_lossy()
+            .to_string();
+        let marker_shell = MarkerShell {
+            output: format!(
+                "{}{}",
+                crate::domain::engine_output::STDOUT_FILE_MARKER_PREFIX,
+                missing
+            ),
+        };
+
+        let github = MockGitHub {
+            prs: vec![PullRequestSummary {
+                number: 1,
+                title: "t".to_string(),
+                head_sha: "abc123".to_string(),
+                html_url: None,
+                author_login: Some("mock-user".to_string()),
+            }],
+            files: HashMap::from([(
+                1,
+                vec![PullRequestFilePatch {
+                    path: "src/lib.rs".to_string(),
+                    patch: Some("@@ -1,1 +1,2 @@\n line\n+let x = y.unwrap();".to_string()),
+                }],
+            )]),
+            ..Default::default()
+        };
+        let config = InMemoryConfigRepo::new(config_with_repo());
+        let stats = workflow_with_shell(
+            &config,
+            &github,
+            &marker_shell,
+            ReviewWorkflowOptions::default(),
+        )
+        .review_once()
+        .await
+        .expect("review_once");
+        assert_eq!(stats[0].processed, 1);
+
+        let comments = github
+            .issue_comments
+            .lock()
+            .expect("lock")
+            .get(&1)
+            .cloned()
+            .unwrap_or_default();
+        let merged = comments.join("\n\n");
+        assert!(merged.contains("failed to read that file"));
+        assert!(!merged.contains(crate::domain::engine_output::STDOUT_FILE_MARKER_PREFIX));
     }
 
     #[test]
