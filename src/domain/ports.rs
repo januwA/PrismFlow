@@ -5,7 +5,7 @@ use async_trait::async_trait;
 
 use crate::domain::entities::{
     AppConfig, PullRequestCiSnapshot, PullRequestFilePatch, PullRequestGitContext,
-    PullRequestSummary, ReviewComment, SimpleComment, SimplePullReview,
+    PullRequestSummary, SimpleComment, SimplePullReview,
 };
 
 pub trait ConfigRepository: Send + Sync {
@@ -114,14 +114,6 @@ pub trait GitHubRepository: Send + Sync {
         repo: &str,
         issue_number: u64,
         body: &str,
-    ) -> Result<()>;
-    async fn submit_inline_review(
-        &self,
-        owner: &str,
-        repo: &str,
-        pull_number: u64,
-        body: &str,
-        comments: &[ReviewComment],
     ) -> Result<()>;
     async fn list_issue_labels(
         &self,

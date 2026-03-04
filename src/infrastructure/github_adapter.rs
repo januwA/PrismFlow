@@ -10,7 +10,7 @@ use tokio::sync::Semaphore;
 use crate::domain::{
     entities::{
         CiFailure, PullRequestCiSnapshot, PullRequestFilePatch, PullRequestGitContext,
-        PullRequestSummary, ReviewComment, SimpleComment, SimplePullReview,
+        PullRequestSummary, SimpleComment, SimplePullReview,
     },
     ports::GitHubRepository,
 };
@@ -359,38 +359,6 @@ impl GitHubRepository for OctocrabGitHubRepository {
             .issues(owner, repo)
             .create_comment(issue_number, body)
             .await?;
-        Ok(())
-    }
-
-    async fn submit_inline_review(
-        &self,
-        owner: &str,
-        repo: &str,
-        pull_number: u64,
-        body: &str,
-        comments: &[ReviewComment],
-    ) -> Result<()> {
-        let _permit = self.acquire_api_permit().await?;
-        let route = format!("/repos/{owner}/{repo}/pulls/{pull_number}/reviews");
-        let comments = comments
-            .iter()
-            .map(|c| {
-                json!({
-                    "path": c.path,
-                    "line": c.line,
-                    "side": "RIGHT",
-                    "body": c.body,
-                })
-            })
-            .collect::<Vec<_>>();
-
-        let payload = json!({
-            "body": body,
-            "event": "COMMENT",
-            "comments": comments,
-        });
-
-        let _: serde_json::Value = self.client.post(route, Some(&payload)).await?;
         Ok(())
     }
 

@@ -1,6 +1,7 @@
 use std::{
     collections::HashSet,
     fs,
+    io::Read,
     path::PathBuf,
     sync::{
         Arc,
@@ -25,6 +26,7 @@ use crate::{
 };
 
 use super::review_workflow::EngineSpec;
+const STDOUT_FILE_MARKER_PREFIX: &str = "__PRISMFLOW_STDOUT_FILE__=";
 
 #[derive(Debug, Clone, Default, Serialize)]
 pub struct RepoCiStats {
@@ -267,7 +269,7 @@ impl<'a> CiWorkflow<'a> {
                 .await;
 
             let analysis = match output {
-                Ok(v) => v,
+                Ok(v) => read_shell_output_text(&v),
                 Err(_) => {
                     stats.failed += 1;
                     continue;
@@ -485,6 +487,22 @@ fn workflow_engine_fingerprint(engine_specs: &[EngineSpec]) -> String {
     out
 }
 
+fn read_shell_output_text(output: &str) -> String {
+    let Some(path) = output.strip_prefix(STDOUT_FILE_MARKER_PREFIX) else {
+        return output.to_string();
+    };
+    let mut file = match fs::File::open(path.trim()) {
+        Ok(v) => v,
+        Err(_) => return output.to_string(),
+    };
+    let mut text = String::new();
+    if file.read_to_string(&mut text).is_ok() {
+        text
+    } else {
+        output.to_string()
+    }
+}
+
 fn ci_completed_anchor(key: &str) -> String {
     format!("<!-- prismflow:ci-completed:{} -->", key)
 }
@@ -654,17 +672,6 @@ mod tests {
             _repo: &str,
             _issue_number: u64,
             _body: &str,
-        ) -> Result<()> {
-            panic!("unexpected call")
-        }
-
-        async fn submit_inline_review(
-            &self,
-            _owner: &str,
-            _repo: &str,
-            _pull_number: u64,
-            _body: &str,
-            _comments: &[crate::domain::entities::ReviewComment],
         ) -> Result<()> {
             panic!("unexpected call")
         }

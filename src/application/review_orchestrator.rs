@@ -166,7 +166,7 @@ impl<'a> ReviewOrchestrator<'a> {
             }
 
             println!(
-                "repo={} processed={} skipped_completed={} skipped_processing={} skipped_filtered={} skipped_by_author={} skipped_by_operator={} recovered_stale_processing={} fallback_general={} failed_retryable={} failed_fatal={} last_retryable_error={:?} last_fatal_error={:?}",
+                "repo={} processed={} skipped_completed={} skipped_processing={} skipped_filtered={} skipped_by_author={} skipped_by_operator={} recovered_stale_processing={} failed_retryable={} failed_fatal={} last_retryable_error={:?} last_fatal_error={:?}",
                 item.repo,
                 item.processed,
                 item.skipped_completed,
@@ -175,7 +175,6 @@ impl<'a> ReviewOrchestrator<'a> {
                 item.skipped_by_author,
                 item.skipped_by_operator,
                 item.recovered_stale_processing,
-                item.fallback_general,
                 item.failed_retryable,
                 item.failed_fatal,
                 item.last_retryable_error,
@@ -186,7 +185,7 @@ impl<'a> ReviewOrchestrator<'a> {
 
     fn print_single_review_result(&self, item: &RepoReviewStats) {
         println!(
-            "repo={} processed={} skipped_completed={} skipped_processing={} skipped_filtered={} skipped_by_author={} skipped_by_operator={} recovered_stale_processing={} fallback_general={} failed_retryable={} failed_fatal={} last_retryable_error={:?} last_fatal_error={:?}",
+            "repo={} processed={} skipped_completed={} skipped_processing={} skipped_filtered={} skipped_by_author={} skipped_by_operator={} recovered_stale_processing={} failed_retryable={} failed_fatal={} last_retryable_error={:?} last_fatal_error={:?}",
             item.repo,
             item.processed,
             item.skipped_completed,
@@ -195,7 +194,6 @@ impl<'a> ReviewOrchestrator<'a> {
             item.skipped_by_author,
             item.skipped_by_operator,
             item.recovered_stale_processing,
-            item.fallback_general,
             item.failed_retryable,
             item.failed_fatal,
             item.last_retryable_error,

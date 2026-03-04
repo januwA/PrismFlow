@@ -3,9 +3,13 @@ use crate::domain::ports::{CommandContext, ShellAdapter};
 use anyhow::{Context, Result};
 use async_trait::async_trait;
 use sha2::{Digest, Sha256};
+use std::fs;
+use std::io::Write;
 use std::path::Path;
+use std::path::PathBuf;
 use std::process::Command;
 use std::process::Stdio;
+use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::io::AsyncReadExt;
 use tokio::process::Command as TokioCommand;
 use tokio::time::{Duration, sleep};
@@ -15,8 +19,8 @@ pub struct CommandShellAdapter {
     shell_override: Option<String>,
 }
 
-const MAX_CAPTURE_BYTES: usize = 1024 * 1024;
 const COMMAND_TIMEOUT_SECS: u64 = 10 * 60;
+const STDOUT_FILE_MARKER_PREFIX: &str = "__PRISMFLOW_STDOUT_FILE__=";
 
 impl CommandShellAdapter {
     pub fn new(shell_override: Option<String>) -> Self {
@@ -121,6 +125,9 @@ impl ShellAdapter for CommandShellAdapter {
         if ctx.map(|task_ctx| task_ctx.is_cancelled()).unwrap_or(false) {
             anyhow::bail!(DomainError::CancelledBySignal);
         }
+        let command_fp = command_fingerprint(command_line);
+        let stdout_path = prepare_stream_output_path(&command_fp, "stdout");
+        let stderr_path = prepare_stream_output_path(&command_fp, "stderr");
         let shell_program = self.resolve_shell_program();
         let mut cmd = TokioCommand::new(&shell_program);
         match shell_kind(&shell_program) {
@@ -143,13 +150,15 @@ impl ShellAdapter for CommandShellAdapter {
             .with_context(|| format!("failed to execute command line via {}", shell_program))?;
         let pid = child.id();
         let stdout_reader = child.stdout.take().map(|mut out| {
+            let path = stdout_path.clone();
             tokio::spawn(async move {
-                read_limited(&mut out, MAX_CAPTURE_BYTES).await
+                read_stream_capture(&mut out, path).await
             })
         });
         let stderr_reader = child.stderr.take().map(|mut err| {
+            let path = stderr_path.clone();
             tokio::spawn(async move {
-                read_limited(&mut err, MAX_CAPTURE_BYTES).await
+                read_stream_capture(&mut err, path).await
             })
         });
         if let (Some(task_ctx), Some(pid)) = (ctx, pid) {
@@ -158,8 +167,7 @@ impl ShellAdapter for CommandShellAdapter {
                     pid,
                     format!(
                         "command_fingerprint={} command={}",
-                        command_fingerprint(command_line),
-                        command_line
+                        command_fp, command_line
                     ),
                 )
                 .await;
@@ -191,19 +199,19 @@ impl ShellAdapter for CommandShellAdapter {
                 }
             }
         };
-        let (stdout_buf, stdout_truncated) = match stdout_reader {
+        let stdout_capture = match stdout_reader {
             Some(handle) => handle.await.unwrap_or_default(),
-            None => (Vec::new(), false),
+            None => StreamCapture::default(),
         };
-        let (stderr_buf, stderr_truncated) = match stderr_reader {
+        let stderr_capture = match stderr_reader {
             Some(handle) => handle.await.unwrap_or_default(),
-            None => (Vec::new(), false),
+            None => StreamCapture::default(),
         };
         if let (Some(task_ctx), Some(pid)) = (ctx, pid) {
             task_ctx.unregister_child(pid).await;
         }
 
-        let stderr_text = maybe_truncated_text(&stderr_buf, stderr_truncated);
+        let stderr_text = format_stream_for_error(&stderr_capture);
         if !status.success() {
             anyhow::bail!(
                 "command line exited with status {}: {}",
@@ -212,17 +220,30 @@ impl ShellAdapter for CommandShellAdapter {
             );
         }
 
-        let stdout_text = maybe_truncated_text(&stdout_buf, stdout_truncated);
-        Ok(stdout_text.trim().to_string())
+        if let Some(path) = &stdout_capture.full_output_path {
+            return Ok(format!("{STDOUT_FILE_MARKER_PREFIX}{}", path.display()));
+        }
+        Ok(String::new())
     }
 }
 
-async fn read_limited<R: tokio::io::AsyncRead + Unpin>(
+#[derive(Debug, Default)]
+struct StreamCapture {
+    full_output_path: Option<PathBuf>,
+}
+
+async fn read_stream_capture<R: tokio::io::AsyncRead + Unpin>(
     reader: &mut R,
-    limit: usize,
-) -> (Vec<u8>, bool) {
-    let mut out = Vec::<u8>::new();
-    let mut truncated = false;
+    output_path: Option<PathBuf>,
+) -> StreamCapture {
+    let mut output_file = None::<fs::File>;
+    let mut full_output_path = None::<PathBuf>;
+    if let Some(path) = output_path {
+        if let Ok(file) = fs::File::create(&path) {
+            output_file = Some(file);
+            full_output_path = Some(path);
+        }
+    }
     let mut chunk = [0u8; 8192];
     loop {
         let n = match reader.read(&mut chunk).await {
@@ -230,26 +251,34 @@ async fn read_limited<R: tokio::io::AsyncRead + Unpin>(
             Ok(v) => v,
             Err(_) => break,
         };
-        if out.len() < limit {
-            let remaining = limit - out.len();
-            let to_copy = remaining.min(n);
-            out.extend_from_slice(&chunk[..to_copy]);
-            if to_copy < n {
-                truncated = true;
-            }
-        } else {
-            truncated = true;
+        if let Some(file) = output_file.as_mut() {
+            let _ = file.write_all(&chunk[..n]);
         }
     }
-    (out, truncated)
+    StreamCapture { full_output_path }
 }
 
-fn maybe_truncated_text(buf: &[u8], truncated: bool) -> String {
-    let mut text = String::from_utf8_lossy(buf).into_owned();
-    if truncated {
-        text.push_str("\n[truncated output]");
+fn format_stream_for_error(capture: &StreamCapture) -> String {
+    if let Some(path) = &capture.full_output_path {
+        return format!("see stderr file: {}", path.display());
     }
-    text
+    "stderr output file unavailable".to_string()
+}
+
+fn prepare_stream_output_path(command_fp: &str, stream_name: &str) -> Option<PathBuf> {
+    let cwd = std::env::current_dir().ok()?;
+    let root = cwd.join(".prismflow").join("tmp-diffs");
+    if fs::create_dir_all(&root).is_err() {
+        return None;
+    }
+    let stamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .ok()?
+        .as_nanos();
+    Some(root.join(format!(
+        "engine-{}-{}-{}.log",
+        stamp, command_fp, stream_name
+    )))
 }
 
 fn command_fingerprint(command_line: &str) -> String {
@@ -262,9 +291,10 @@ fn command_fingerprint(command_line: &str) -> String {
 #[cfg(test)]
 mod tests {
     use std::collections::HashMap;
+    use std::fs;
     use std::sync::Arc;
 
-    use super::CommandShellAdapter;
+    use super::{CommandShellAdapter, STDOUT_FILE_MARKER_PREFIX};
     use crate::domain::ports::{CommandContext, ShellAdapter};
     use async_trait::async_trait;
     use std::time::{Duration, Instant};
@@ -337,7 +367,10 @@ mod tests {
             .run_command_line("echo prismflow", None)
             .await
             .expect("command should succeed");
-        assert!(output.to_ascii_lowercase().contains("prismflow"));
+        assert!(output.starts_with(STDOUT_FILE_MARKER_PREFIX));
+        let path = output.trim_start_matches(STDOUT_FILE_MARKER_PREFIX);
+        let raw = fs::read_to_string(path).expect("read stdout file");
+        assert!(raw.to_ascii_lowercase().contains("prismflow"));
     }
 
     #[tokio::test]
@@ -356,6 +389,9 @@ mod tests {
         .expect("command should not hang")
         .expect("command should succeed");
 
-        assert!(result.contains("prismflow"));
+        assert!(result.starts_with(STDOUT_FILE_MARKER_PREFIX));
+        let path = result.trim_start_matches(STDOUT_FILE_MARKER_PREFIX);
+        let raw = fs::read_to_string(path).expect("read stdout file");
+        assert!(raw.contains("prismflow"));
     }
 }
