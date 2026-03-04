@@ -248,7 +248,7 @@ pub enum ScanSubcommand {
 
 #[derive(Debug, Args)]
 #[command(
-    after_long_help = "说明：\n  review 会向 GitHub 提交评论。\n  review 固定使用 shell 模式，本地命令支持 {diff_file} 与 {agents_file} 占位符。\n  启用 --clone-repo 后，可额外使用 {repo_dir}、{repo_head_sha}、{repo_head_ref} 占位符。\n  --clone-depth 控制 clone/fetch 深度，默认 2。\n  当 clone 到的仓库历史仅有 1 个提交时，会跳过该 PR（常见于首次脚手架提交）。\n  {diff_file} 包含 PR 元信息（标题/URL/SHA/commit 列表）与 diff 内容；{agents_file} 包含 --engine-prompt/--engine-prompt-file 与 Agent 汇总内容。\n  也支持 PF 语法：{PF|name}（路径/标量）与 {PF%name}（文件内容）；支持变量：diff_file、agents_file、repo_dir、repo_head_sha、repo_head_ref、pr_url、repo_full_name、pr_number。\n  还支持用户自定义模板变量：--tmpl-var key value，可通过 {PF:key} 引用。\n  --engine-prompt 和 --engine-prompt-file 不能同时使用。\n  --prompt-template 可定义统一模板，并在 --engine 命令中通过 {prompt_template} 或 {prompt} 引用（模板本身支持上述占位符与 PF 语法）。\n  --engine 可重复传入，每次必须给两个参数：<fingerprint> <command>，按 PR 轮询使用。\n  --repo 非空时仅处理指定仓库；可重复传入。\n  --author 非空时仅处理指定作者（GitHub login）；可重复传入。\n  --exclude-author 可排除指定作者（优先级高于 --author）。\n  --agent 会先按全局 agent 目录配置查找；再回退到 当前目录/.prismflow/prompts 与系统配置目录 pr-reviewer/prompts。\n  --ui 启动本地 HTTP 管理页面；若开放局域网访问，建议同时设置 --ui-token。\n  审查生成的 diff 与 agents 临时文件会保留到 .prismflow/tmp-diffs。\n\n示例：\n  cargo run -- review once --clone-repo --clone-depth 2 --engine qwen-v1 \"qwen -y \\\"diff={diff_file} agents={agents_file} repo={repo_dir} sha={repo_head_sha}\\\"\" --engine-prompt-file prompts/bug-only.txt --agent logic --repo owner/repo-a --author teammate-a\n  cargo run -- review ad-hoc https://github.com/owner/repo/pull/123 --engine ollama:qwen2.5:1.5b \"cat {diff_file} {agents_file} | ollama run qwen2.5:1.5b\" --engine-prompt-file prompts/bug-only.txt --tmpl-var lang zh-CN --agent security\n  cargo run -- review daemon --ui --ui-bind 0.0.0.0:8787 --ui-token mysecret --interval-secs 30 --clone-repo --clone-depth 2 --engine qwen-v1 \"qwen -y \\\"diff: {PF|diff_file} agents: {PF|agents_file} lang: {PF:lang}\\\"\" --max-concurrent-repos 3 --max-concurrent-prs 6 --max-concurrent-api 12 --repo owner/repo-a --repo owner/repo-b --exclude-author bot-user"
+    after_long_help = "说明：\n  review 会向 GitHub 提交评论。\n  review 固定使用 shell 模式，本地命令支持 {diff_file} 与 {agents_file} 占位符。\n  启用 --clone-repo 后，可额外使用 {repo_dir}、{repo_head_sha}、{repo_head_ref} 占位符。\n  --clone-depth 控制 clone/fetch 深度，默认 2。\n  当 clone 到的仓库历史仅有 1 个提交时，会跳过该 PR（常见于首次脚手架提交）。\n  {diff_file} 包含 PR 元信息（标题/URL/SHA/commit 列表）与 diff 内容；{agents_file} 包含 --engine-prompt/--engine-prompt-file 与 Agent 汇总内容。\n  也支持 PF 语法：{PF|name}（路径/标量）与 {PF%name}（文件内容）；支持变量：diff_file、agents_file、repo_dir、repo_head_sha、repo_head_ref、pr_url、repo_full_name、pr_number。\n  还支持用户自定义模板变量：--tmpl-var key value，可通过 {PF:key} 引用。\n  --engine-prompt 和 --engine-prompt-file 不能同时使用。\n  --prompt-template 可定义统一模板，并在 --engine 命令中通过 {prompt_template} 或 {prompt} 引用（模板本身支持上述占位符与 PF 语法）。\n  --engine 可重复传入，每次必须给两个参数：<fingerprint> <command>，按 PR 轮询使用。\n  --repo 非空时仅处理指定仓库；可重复传入。\n  --author 非空时仅处理指定作者（GitHub login）；可重复传入。\n  --exclude-author 可排除指定作者（优先级高于 --author）。\n  --agent 会先按全局 agent 目录配置查找；再回退到 当前目录/.prismflow/prompts 与系统配置目录 pr-reviewer/prompts。\n  审查生成的 diff 与 agents 临时文件会保留到 .prismflow/tmp-diffs。\n\n示例：\n  cargo run -- review once --clone-repo --clone-depth 2 --engine qwen-v1 \"qwen -y \\\"diff={diff_file} agents={agents_file} repo={repo_dir} sha={repo_head_sha}\\\"\" --engine-prompt-file prompts/bug-only.txt --agent logic --repo owner/repo-a --author teammate-a\n  cargo run -- review ad-hoc https://github.com/owner/repo/pull/123 --engine ollama:qwen2.5:1.5b \"cat {diff_file} {agents_file} | ollama run qwen2.5:1.5b\" --engine-prompt-file prompts/bug-only.txt --tmpl-var lang zh-CN --agent security\n  cargo run -- review daemon --interval-secs 30 --clone-repo --clone-depth 2 --engine qwen-v1 \"qwen -y \\\"diff: {PF|diff_file} agents: {PF|agents_file} lang: {PF:lang}\\\"\" --max-concurrent-repos 3 --max-concurrent-prs 6 --max-concurrent-api 12 --repo owner/repo-a --repo owner/repo-b --exclude-author bot-user"
 )]
 pub struct ReviewCommand {
     #[command(subcommand)]
@@ -353,16 +353,6 @@ pub enum ReviewSubcommand {
     Daemon {
         #[arg(long, default_value_t = 60, help = "轮询间隔（秒）")]
         interval_secs: u64,
-        #[arg(long, default_value_t = false, help = "启用本地 HTTP 管理页面")]
-        ui: bool,
-        #[arg(
-            long,
-            default_value = "127.0.0.1:8787",
-            help = "UI 监听地址，例如 127.0.0.1:8787 或 0.0.0.0:8787"
-        )]
-        ui_bind: String,
-        #[arg(long, help = "UI 访问口令（建议在局域网访问时设置）")]
-        ui_token: Option<String>,
         #[arg(
             long = "engine",
             num_args = 2,
