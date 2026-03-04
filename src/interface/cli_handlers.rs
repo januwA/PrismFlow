@@ -1,4 +1,3 @@
-use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::{
     Arc,
@@ -390,7 +389,6 @@ pub async fn dispatch(
                 engine_prompt,
                 engine_prompt_file,
                 prompt_template,
-                tmpl_vars,
                 agents,
                 clone_repo,
                 clone_workspace_dir,
@@ -406,14 +404,12 @@ pub async fn dispatch(
             } => {
                 let resolved_prompt = resolve_engine_prompt(fs, engine_prompt, engine_prompt_file)?;
                 let resolved_engines = resolve_engine_specs(engines)?;
-                let resolved_tmpl_vars = resolve_template_vars(tmpl_vars)?;
                 print_review_engine_list(&resolved_engines, prompt_template.as_deref());
                 let once_ctx = Arc::new(TaskContext::new("review-once"));
                 let options = ReviewWorkflowOptions {
                     engine_specs: resolved_engines,
                     engine_prompt: resolved_prompt,
                     prompt_template,
-                    custom_template_vars: resolved_tmpl_vars,
                     agent_prompt_dirs: repo_manager.list_agent_prompt_dirs()?,
                     cli_agents: agents,
                     clone_repo_enabled: clone_repo,
@@ -467,7 +463,6 @@ pub async fn dispatch(
                 engine_prompt,
                 engine_prompt_file,
                 prompt_template,
-                tmpl_vars,
                 agents,
                 clone_repo,
                 clone_workspace_dir,
@@ -483,13 +478,11 @@ pub async fn dispatch(
             } => {
                 let resolved_prompt = resolve_engine_prompt(fs, engine_prompt, engine_prompt_file)?;
                 let resolved_engines = resolve_engine_specs(engines)?;
-                let resolved_tmpl_vars = resolve_template_vars(tmpl_vars)?;
                 print_review_engine_list(&resolved_engines, prompt_template.as_deref());
                 let mut options = ReviewWorkflowOptions {
                     engine_specs: resolved_engines,
                     engine_prompt: resolved_prompt,
                     prompt_template,
-                    custom_template_vars: resolved_tmpl_vars,
                     agent_prompt_dirs: repo_manager.list_agent_prompt_dirs()?,
                     cli_agents: agents,
                     clone_repo_enabled: clone_repo,
@@ -608,7 +601,6 @@ pub async fn dispatch(
                 engine_prompt,
                 engine_prompt_file,
                 prompt_template,
-                tmpl_vars,
                 agents,
                 clone_repo,
                 clone_workspace_dir,
@@ -620,14 +612,12 @@ pub async fn dispatch(
                     .with_context(|| format!("invalid GitHub PR URL: {pr_url}"))?;
                 let resolved_prompt = resolve_engine_prompt(fs, engine_prompt, engine_prompt_file)?;
                 let resolved_engines = resolve_engine_specs(engines)?;
-                let resolved_tmpl_vars = resolve_template_vars(tmpl_vars)?;
                 print_review_engine_list(&resolved_engines, prompt_template.as_deref());
                 let adhoc_ctx = Arc::new(TaskContext::new("review-adhoc"));
                 let options = ReviewWorkflowOptions {
                     engine_specs: resolved_engines,
                     engine_prompt: resolved_prompt,
                     prompt_template,
-                    custom_template_vars: resolved_tmpl_vars,
                     agent_prompt_dirs: repo_manager.list_agent_prompt_dirs()?,
                     cli_agents: agents,
                     clone_repo_enabled: clone_repo,
@@ -816,31 +806,6 @@ fn resolve_engine_specs(engines: Vec<String>) -> Result<Vec<EngineSpec>> {
             fingerprint: fingerprint.to_string(),
             command: command.to_string(),
         });
-    }
-    Ok(out)
-}
-
-fn resolve_template_vars(tmpl_vars: Vec<String>) -> Result<HashMap<String, String>> {
-    if tmpl_vars.is_empty() {
-        return Ok(HashMap::new());
-    }
-    if tmpl_vars.len() % 2 != 0 {
-        anyhow::bail!("--tmpl-var requires pairs: <key> <value>");
-    }
-    let mut out = HashMap::new();
-    for pair in tmpl_vars.chunks_exact(2) {
-        let key = pair[0].trim();
-        let value = pair[1].trim();
-        if key.is_empty() {
-            anyhow::bail!("--tmpl-var key cannot be empty");
-        }
-        if !key
-            .chars()
-            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_')
-        {
-            anyhow::bail!("--tmpl-var key must match [a-z0-9_]+ for PF token compatibility: {key}");
-        }
-        out.insert(key.to_string(), value.to_string());
     }
     Ok(out)
 }
