@@ -1,6 +1,7 @@
 use std::{
     collections::HashSet,
     fs,
+    io::Read,
     path::PathBuf,
     sync::{
         Arc, Mutex,
@@ -22,19 +23,19 @@ use crate::application::{
 };
 use crate::domain::{
     entities::{
-        AppConfig, MonitoredRepo, PullRequestFilePatch, PullRequestSummary, ReviewComment,
-        ReviewFilterConfig,
+        AppConfig, MonitoredRepo, PullRequestFilePatch, PullRequestSummary, ReviewFilterConfig,
     },
     ports::{
         CommandContext, ConfigRepository, FileSystem, GitHubRepository, GitService, ShellAdapter,
     },
 };
 
-const MAX_INLINE_COMMENTS: usize = 20;
 const DEFAULT_RETRY_ATTEMPTS: usize = 3;
 const DEFAULT_RETRY_BACKOFF_MS: u64 = 300;
 const PROCESSING_TTL_SECS: i64 = 30 * 60;
 const ADHOC_COOLDOWN_SECS: i64 = 10 * 60;
+const STDOUT_FILE_MARKER_PREFIX: &str = "__PRISMFLOW_STDOUT_FILE__=";
+const MAX_REVIEW_COMMENT_CHARS: usize = 60_000;
 
 struct RuntimePrLockGuard {
     lock_store: Arc<Mutex<HashSet<String>>>,
@@ -91,7 +92,6 @@ pub struct RepoReviewStats {
     pub skipped_processing: usize,
     pub skipped_by_author: usize,
     pub recovered_stale_processing: usize,
-    pub fallback_general: usize,
     pub failed_retryable: usize,
     pub failed_fatal: usize,
     pub skipped_filtered: usize,
@@ -278,14 +278,10 @@ impl<'a> ReviewWorkflow<'a> {
             .await;
         match outcome {
             PrReviewOutcome::Processed {
-                used_fallback,
                 recovered_stale,
                 ..
             } => {
                 stats.processed += 1;
-                if used_fallback {
-                    stats.fallback_general += 1;
-                }
                 if recovered_stale {
                     stats.recovered_stale_processing += 1;
                 }
@@ -382,13 +378,9 @@ impl<'a> ReviewWorkflow<'a> {
             match outcome {
                 PrReviewOutcome::Processed {
                     sha,
-                    used_fallback,
                     recovered_stale,
                 } => {
                     stats.processed += 1;
-                    if used_fallback {
-                        stats.fallback_general += 1;
-                    }
                     if recovered_stale {
                         stats.recovered_stale_processing += 1;
                     }
@@ -744,64 +736,22 @@ impl<'a> ReviewWorkflow<'a> {
             None => analysis.summary.clone(),
         };
 
-        let review_body = format!(
-            "PrismFlow review summary for `{}`\n\n- Engine: `{}`\n- Analyzer: `{}`\n- Inline findings: {}\n\n{}",
+        let review_header = format!(
+            "PrismFlow review summary for `{}`\n\n- Engine: `{}`\n- Analyzer: `{}`\n\n",
             pr.head_sha,
             selected_engine_fingerprint,
             analysis.source,
-            analysis.inline_comments.len(),
-            summary_with_outdated
         );
 
-        let mut used_fallback = false;
         self.mark_stage(ReviewStage::PostingReview, full_repo_name, pr.number);
-        if analysis.inline_comments.is_empty() {
-            if let Err(err) = self
-                .with_retry(|| {
-                    self.github
-                        .create_issue_comment(owner, repo, pr.number, &review_body)
-                })
-                .await
-            {
-                return match classify_error(&err) {
-                    ErrorClass::Retryable => PrReviewOutcome::FailedRetryable(err.to_string()),
-                    ErrorClass::Fatal => PrReviewOutcome::FailedFatal(err.to_string()),
-                };
-            }
-        } else {
-            let inline_submit = self
-                .with_retry(|| {
-                    self.github.submit_inline_review(
-                        owner,
-                        repo,
-                        pr.number,
-                        &review_body,
-                        &analysis.inline_comments,
-                    )
-                })
-                .await;
-
-            if inline_submit.is_err() {
-                used_fallback = true;
-                let fallback = build_fallback_summary(
-                    &pr.head_sha,
-                    &selected_engine_fingerprint,
-                    &analysis.inline_comments,
-                    &summary_with_outdated,
-                );
-                if let Err(err) = self
-                    .with_retry(|| {
-                        self.github
-                            .create_issue_comment(owner, repo, pr.number, &fallback)
-                    })
-                    .await
-                {
-                    return match classify_error(&err) {
-                        ErrorClass::Retryable => PrReviewOutcome::FailedRetryable(err.to_string()),
-                        ErrorClass::Fatal => PrReviewOutcome::FailedFatal(err.to_string()),
-                    };
-                }
-            }
+        if let Err(err) = self
+            .post_review_summary(owner, repo, pr.number, &review_header, &summary_with_outdated)
+            .await
+        {
+            return match classify_error(&err) {
+                ErrorClass::Retryable => PrReviewOutcome::FailedRetryable(err.to_string()),
+                ErrorClass::Fatal => PrReviewOutcome::FailedFatal(err.to_string()),
+            };
         }
 
         let completed_body = format!(
@@ -835,7 +785,6 @@ impl<'a> ReviewWorkflow<'a> {
 
         PrReviewOutcome::Processed {
             sha: pr.head_sha,
-            used_fallback,
             recovered_stale: newest_processing_ts(&comments, &processing_prefix).is_some(),
         }
     }
@@ -994,6 +943,131 @@ impl<'a> ReviewWorkflow<'a> {
             }
         }
         Ok(removed)
+    }
+
+    async fn post_review_summary(
+        &self,
+        owner: &str,
+        repo: &str,
+        issue_number: u64,
+        header: &str,
+        summary: &str,
+    ) -> Result<()> {
+        if let Some(path) = extract_stdout_file_marker(summary) {
+            return self
+                .post_summary_from_file(owner, repo, issue_number, header, &path)
+                .await;
+        }
+        self.post_chunked_comment_text(owner, repo, issue_number, header, summary)
+            .await
+    }
+
+    async fn post_summary_from_file(
+        &self,
+        owner: &str,
+        repo: &str,
+        issue_number: u64,
+        header: &str,
+        path: &str,
+    ) -> Result<()> {
+        let mut file = fs::File::open(path)
+            .with_context(|| format!("failed to open engine stdout file: {path}"))?;
+        let mut buf = [0u8; 8192];
+        let mut current = header.to_string();
+        let mut has_body = false;
+
+        loop {
+            let n = file
+                .read(&mut buf)
+                .with_context(|| format!("failed to read engine stdout file: {path}"))?;
+            if n == 0 {
+                break;
+            }
+            has_body = true;
+            let mut piece = String::from_utf8_lossy(&buf[..n]).into_owned();
+            while !piece.is_empty() {
+                let available = MAX_REVIEW_COMMENT_CHARS.saturating_sub(current.len());
+                if available == 0 {
+                    self.post_single_comment(owner, repo, issue_number, &current)
+                        .await?;
+                    current = "PrismFlow review output (continued)\n\n".to_string();
+                    continue;
+                }
+                let mut take = available.min(piece.len());
+                while take > 0 && !piece.is_char_boundary(take) {
+                    take -= 1;
+                }
+                if take == 0 {
+                    self.post_single_comment(owner, repo, issue_number, &current)
+                        .await?;
+                    current = "PrismFlow review output (continued)\n\n".to_string();
+                    continue;
+                }
+                current.push_str(&piece[..take]);
+                piece = piece[take..].to_string();
+            }
+        }
+
+        if !has_body && current.trim().is_empty() {
+            current = "Shell engine returned empty output.".to_string();
+        }
+        if !current.trim().is_empty() {
+            self.post_single_comment(owner, repo, issue_number, &current)
+                .await?;
+        }
+        Ok(())
+    }
+
+    async fn post_chunked_comment_text(
+        &self,
+        owner: &str,
+        repo: &str,
+        issue_number: u64,
+        header: &str,
+        text: &str,
+    ) -> Result<()> {
+        let mut remaining = text.to_string();
+        let mut current = header.to_string();
+        while !remaining.is_empty() {
+            let available = MAX_REVIEW_COMMENT_CHARS.saturating_sub(current.len());
+            if available == 0 {
+                self.post_single_comment(owner, repo, issue_number, &current)
+                    .await?;
+                current = "PrismFlow review output (continued)\n\n".to_string();
+                continue;
+            }
+            let mut take = available.min(remaining.len());
+            while take > 0 && !remaining.is_char_boundary(take) {
+                take -= 1;
+            }
+            if take == 0 {
+                self.post_single_comment(owner, repo, issue_number, &current)
+                    .await?;
+                current = "PrismFlow review output (continued)\n\n".to_string();
+                continue;
+            }
+            current.push_str(&remaining[..take]);
+            remaining = remaining[take..].to_string();
+        }
+        if !current.trim().is_empty() {
+            self.post_single_comment(owner, repo, issue_number, &current)
+                .await?;
+        }
+        Ok(())
+    }
+
+    async fn post_single_comment(
+        &self,
+        owner: &str,
+        repo: &str,
+        issue_number: u64,
+        body: &str,
+    ) -> Result<()> {
+        self.with_retry(|| {
+            self.github
+                .create_issue_comment(owner, repo, issue_number, body)
+        })
+        .await
     }
 
     fn emit_status(&self, msg: String) {
@@ -1175,23 +1249,15 @@ impl<'a> ReviewWorkflow<'a> {
             }
         };
 
-        let mut inline_comments = parse_shell_inline_comments(&output);
-        let mut summary = if output.trim().is_empty() {
+        let summary = if output.trim().is_empty() {
             "Shell engine returned empty output.".to_string()
         } else {
             output
         };
 
-        if inline_comments.is_empty() && likely_unusable_shell_output(&summary) {
-            let builtin_comments = analyze_files_for_inline_comments(files);
-            inline_comments = builtin_comments;
-            summary = "Shell engine returned non-review conversational output; PrismFlow auto-fell back to builtin analyzer.".to_string();
-        }
-
         Ok(ReviewAnalysis {
             source: format!("shell:{}", selected_engine.fingerprint),
             summary,
-            inline_comments,
         })
     }
 
@@ -1389,7 +1455,6 @@ struct RepoReviewReport {
 enum PrReviewOutcome {
     Processed {
         sha: String,
-        used_fallback: bool,
         recovered_stale: bool,
     },
     SkippedCompleted,
@@ -1588,33 +1653,17 @@ fn parse_processing_ts(body: &str, prefix: &str) -> Option<i64> {
     tail[..end].trim().parse::<i64>().ok()
 }
 
+fn extract_stdout_file_marker(output: &str) -> Option<String> {
+    output
+        .strip_prefix(STDOUT_FILE_MARKER_PREFIX)
+        .map(|v| v.trim().to_string())
+        .filter(|v| !v.is_empty())
+}
+
 #[derive(Debug, Clone)]
 struct ReviewAnalysis {
     source: String,
     summary: String,
-    inline_comments: Vec<ReviewComment>,
-}
-
-fn build_fallback_summary(
-    head_sha: &str,
-    engine: &str,
-    comments: &[ReviewComment],
-    summary: &str,
-) -> String {
-    let mut out = String::new();
-    out.push_str("PrismFlow fallback summary (Inline review unavailable)\n\n");
-    out.push_str(&format!("- SHA: `{}`\n", head_sha));
-    out.push_str(&format!("- Engine: `{}`\n", engine));
-    out.push_str("- Reason: Inline comment publish failed after retries.\n\n");
-    out.push_str("Analyzer summary:\n");
-    out.push_str(summary);
-    out.push_str("\n\n");
-
-    for c in comments.iter().take(10) {
-        out.push_str(&format!("- `{}`:{} -> {}\n", c.path, c.line, c.body));
-    }
-
-    out
 }
 
 #[derive(Clone, Copy)]
@@ -1781,40 +1830,6 @@ fn build_patch_dump(
     out
 }
 
-fn parse_shell_inline_comments(output: &str) -> Vec<ReviewComment> {
-    let mut comments = Vec::new();
-    for line in output.lines() {
-        let line = line.trim();
-        let mut parts = line.splitn(3, ':');
-        let path = parts.next().unwrap_or_default().trim();
-        let line_num = parts.next().unwrap_or_default().trim();
-        let body = parts.next().unwrap_or_default().trim();
-        if path.is_empty() || line_num.is_empty() || body.is_empty() {
-            continue;
-        }
-        if let Ok(n) = line_num.parse::<u32>() {
-            comments.push(ReviewComment {
-                path: path.to_string(),
-                line: n,
-                body: body.to_string(),
-            });
-        }
-    }
-    comments
-}
-
-fn likely_unusable_shell_output(output: &str) -> bool {
-    let lower = output.to_ascii_lowercase();
-    let bad_hints = [
-        "could you clarify",
-        "different project",
-        "doesn't appear to match",
-        "do you want me to",
-        "i notice two issues",
-    ];
-    bad_hints.iter().any(|h| lower.contains(h))
-}
-
 fn apply_repo_file_filter(
     files: &[PullRequestFilePatch],
     filter: &ReviewFilterConfig,
@@ -1855,89 +1870,6 @@ fn should_review_file(path: &str, has_patch: bool, filter: &ReviewFilterConfig) 
     }
 
     true
-}
-
-fn analyze_files_for_inline_comments(files: &[PullRequestFilePatch]) -> Vec<ReviewComment> {
-    let mut out = Vec::new();
-
-    for file in files {
-        let Some(patch) = &file.patch else {
-            continue;
-        };
-
-        let mut new_line: u32 = 0;
-
-        for raw in patch.lines() {
-            if let Some(line_start) = parse_hunk_new_start(raw) {
-                new_line = line_start;
-                continue;
-            }
-
-            if raw.starts_with('+') && !raw.starts_with("+++") {
-                let content = raw.trim_start_matches('+');
-                if let Some(body) = detect_risky_pattern(content) {
-                    out.push(ReviewComment {
-                        path: file.path.clone(),
-                        line: new_line,
-                        body,
-                    });
-                    if out.len() >= MAX_INLINE_COMMENTS {
-                        return out;
-                    }
-                }
-                new_line = new_line.saturating_add(1);
-                continue;
-            }
-
-            if raw.starts_with(' ') {
-                new_line = new_line.saturating_add(1);
-            }
-        }
-    }
-
-    out
-}
-
-fn parse_hunk_new_start(line: &str) -> Option<u32> {
-    if !line.starts_with("@@") {
-        return None;
-    }
-
-    let plus_pos = line.find(" +")?;
-    let tail = &line[(plus_pos + 2)..];
-    let mut digits = String::new();
-    for ch in tail.chars() {
-        if ch.is_ascii_digit() {
-            digits.push(ch);
-        } else {
-            break;
-        }
-    }
-
-    digits.parse::<u32>().ok()
-}
-
-fn detect_risky_pattern(content: &str) -> Option<String> {
-    let lower = content.to_ascii_lowercase();
-    if lower.contains("todo") || lower.contains("fixme") {
-        return Some(
-            "TODO/FIXME found in added code; confirm task is tracked or remove before merge."
-                .to_string(),
-        );
-    }
-    if content.contains("unwrap()") {
-        return Some(
-            "Added `unwrap()` may panic in production paths; prefer explicit error handling."
-                .to_string(),
-        );
-    }
-    if content.contains("panic!") {
-        return Some(
-            "Added `panic!` detected; prefer recoverable error flow unless this is a strict invariant."
-                .to_string(),
-        );
-    }
-    None
 }
 
 #[cfg(test)]
@@ -1989,7 +1921,6 @@ mod tests {
         files: HashMap<u64, Vec<PullRequestFilePatch>>,
         issue_comments: Mutex<HashMap<u64, Vec<String>>>,
         issue_labels: Mutex<HashMap<u64, Vec<String>>>,
-        inline_fail: bool,
         list_pr_fail_msg: Option<String>,
         create_comment_failures_before_success: Mutex<usize>,
     }
@@ -2127,21 +2058,6 @@ mod tests {
             let mut map = self.issue_comments.lock().expect("lock");
             map.entry(issue_number).or_default().push(body.to_string());
             Ok(())
-        }
-
-        async fn submit_inline_review(
-            &self,
-            _owner: &str,
-            _repo: &str,
-            _pull_number: u64,
-            _body: &str,
-            _comments: &[ReviewComment],
-        ) -> Result<()> {
-            if self.inline_fail {
-                Err(anyhow!("inline failed"))
-            } else {
-                Ok(())
-            }
         }
 
         async fn list_issue_labels(
@@ -2916,38 +2832,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn falls_back_to_general_comment_when_inline_fails() {
-        let sha = "abc123";
-        let github = MockGitHub {
-            prs: vec![PullRequestSummary {
-                number: 1,
-                title: "t".to_string(),
-                head_sha: sha.to_string(),
-                html_url: None,
-                author_login: Some("mock-user".to_string()),
-            }],
-            files: HashMap::from([(
-                1,
-                vec![PullRequestFilePatch {
-                    path: "src/lib.rs".to_string(),
-                    patch: Some("@@ -1,1 +1,2 @@\n line\n+// TODO: improve".to_string()),
-                }],
-            )]),
-            inline_fail: true,
-            ..Default::default()
-        };
-
-        let config = InMemoryConfigRepo::new(config_with_repo());
-        let stats = workflow(&config, &github, ReviewWorkflowOptions::default())
-            .review_once()
-            .await
-            .expect("review_once");
-
-        assert_eq!(stats[0].fallback_general, 1);
-        assert_eq!(stats[0].processed, 1);
-    }
-
-    #[tokio::test]
     async fn classifies_repo_failure_retryable() {
         let github = MockGitHub {
             list_pr_fail_msg: Some("rate limit exceeded".to_string()),
@@ -3109,7 +2993,6 @@ mod tests {
                 1,
                 vec![format!("pr-reviewer:reviewed:{old_sha}")],
             )])),
-            inline_fail: true,
             ..Default::default()
         };
         let config = InMemoryConfigRepo::new(config_with_repo());

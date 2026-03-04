@@ -257,7 +257,7 @@ pub struct ReviewCommand {
 
 #[derive(Debug, Subcommand)]
 pub enum ReviewSubcommand {
-    #[command(about = "执行一次审查（会尝试提交 inline 评论或降级总结评论）")]
+    #[command(about = "执行一次审查（将 engine 输出作为总结评论发布）")]
     Once {
         #[arg(
             long = "engine",
