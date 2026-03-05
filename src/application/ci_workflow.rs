@@ -943,8 +943,6 @@ mod tests {
             agent_prompt_dirs: vec![],
             repos: vec![MonitoredRepo {
                 full_name: "owner/repo".to_string(),
-                added_at: "2026-01-01T00:00:00Z".to_string(),
-                last_sha: None,
                 review_filter: ReviewFilterConfig::default(),
                 agents: vec![],
             }],

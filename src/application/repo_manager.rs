@@ -1,5 +1,3 @@
-use chrono::Utc;
-
 use anyhow::{Result, bail};
 
 use crate::domain::{
@@ -27,8 +25,6 @@ impl<'a> RepoManager<'a> {
 
         cfg.repos.push(MonitoredRepo {
             full_name: full_name.clone(),
-            added_at: Utc::now().to_rfc3339(),
-            last_sha: None,
             review_filter: ReviewFilterConfig::default(),
             agents: vec![],
         });

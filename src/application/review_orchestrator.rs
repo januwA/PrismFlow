@@ -1,4 +1,3 @@
-use std::path::PathBuf;
 use std::sync::Arc;
 
 use anyhow::{Result, anyhow};
@@ -13,7 +12,6 @@ use super::{
     agent_preflight::{panic_if_cli_agents_missing, panic_if_required_agents_missing},
     agent_service::FileSystemAgentPromptService,
     cache_service::CacheCleanupService,
-    report_service::ReviewReportService,
     review_workflow::{RepoReviewStats, ReviewWorkflow, ReviewWorkflowOptions},
 };
 
@@ -22,7 +20,6 @@ pub struct ReviewOrchestrator<'a> {
     config_repo: &'a dyn ConfigRepository,
     fs: &'a dyn FileSystem,
     cache_service: CacheCleanupService<'a>,
-    report_service: ReviewReportService<'a>,
 }
 
 impl<'a> ReviewOrchestrator<'a> {
@@ -31,7 +28,6 @@ impl<'a> ReviewOrchestrator<'a> {
             config_repo,
             fs,
             cache_service: CacheCleanupService::new(fs),
-            report_service: ReviewReportService::new(fs),
         }
     }
 
@@ -44,7 +40,7 @@ impl<'a> ReviewOrchestrator<'a> {
         mut options: ReviewWorkflowOptions,
         ctx: Arc<TaskContext>,
         cache_cleanup_hours: u64,
-        archive_report_on_failure_only: bool,
+        _archive_report_on_failure_only: bool,
         status_tx: Option<&tokio::sync::broadcast::Sender<String>>,
     ) -> Result<Vec<RepoReviewStats>> {
         // 1. 检查取消
@@ -77,15 +73,8 @@ impl<'a> ReviewOrchestrator<'a> {
         let workflow = ReviewWorkflow::new(self.config_repo, github, shell, self.fs, git, options);
         let stats = run_with_heartbeat("review-once", workflow.review_once(), &ctx).await?;
 
-        // 6. 生成报告
-        let report_path = self.report_service.write_review_report(
-            "review-once",
-            &stats,
-            archive_report_on_failure_only,
-        )?;
-
-        // 7. 输出结果
-        self.print_review_results(&stats, &report_path, status_tx, &ctx);
+        // 6. 输出结果
+        self.print_review_results(&stats, status_tx, &ctx);
 
         Ok(stats)
     }
@@ -122,12 +111,6 @@ impl<'a> ReviewOrchestrator<'a> {
         )
         .await?;
 
-        let report_path = self.report_service.write_review_report(
-            "review-ad-hoc",
-            std::slice::from_ref(&stats),
-            false,
-        )?;
-        println!("report_file={}", report_path.display());
         self.print_single_review_result(&stats);
         Ok(stats)
     }
@@ -135,7 +118,6 @@ impl<'a> ReviewOrchestrator<'a> {
     fn print_review_results(
         &self,
         stats: &[RepoReviewStats],
-        report_path: &PathBuf,
         status_tx: Option<&tokio::sync::broadcast::Sender<String>>,
         ctx: &TaskContext,
     ) {
@@ -143,8 +125,6 @@ impl<'a> ReviewOrchestrator<'a> {
             println!("no repositories configured");
             return;
         }
-
-        println!("report_file={}", report_path.display());
 
         for item in stats {
             if let Some(tx) = status_tx {
@@ -165,39 +145,31 @@ impl<'a> ReviewOrchestrator<'a> {
                 ));
             }
 
-            println!(
-                "repo={} processed={} skipped_completed={} skipped_processing={} skipped_filtered={} skipped_by_author={} skipped_by_operator={} recovered_stale_processing={} failed_retryable={} failed_fatal={} last_retryable_error={:?} last_fatal_error={:?}",
-                item.repo,
-                item.processed,
-                item.skipped_completed,
-                item.skipped_processing,
-                item.skipped_filtered,
-                item.skipped_by_author,
-                item.skipped_by_operator,
-                item.recovered_stale_processing,
-                item.failed_retryable,
-                item.failed_fatal,
-                item.last_retryable_error,
-                item.last_fatal_error
-            );
+            log_repo_review_stats(item);
         }
     }
 
     fn print_single_review_result(&self, item: &RepoReviewStats) {
-        println!(
-            "repo={} processed={} skipped_completed={} skipped_processing={} skipped_filtered={} skipped_by_author={} skipped_by_operator={} recovered_stale_processing={} failed_retryable={} failed_fatal={} last_retryable_error={:?} last_fatal_error={:?}",
-            item.repo,
-            item.processed,
-            item.skipped_completed,
-            item.skipped_processing,
-            item.skipped_filtered,
-            item.skipped_by_author,
-            item.skipped_by_operator,
-            item.recovered_stale_processing,
-            item.failed_retryable,
-            item.failed_fatal,
-            item.last_retryable_error,
-            item.last_fatal_error
+        log_repo_review_stats(item);
+    }
+}
+
+fn log_repo_review_stats(item: &RepoReviewStats) {
+    if item.failed_fatal > 0 || item.failed_retryable > 0 {
+        tracing::error!(
+            repo = %item.repo,
+            processed = item.processed,
+            skipped_completed = item.skipped_completed,
+            skipped_processing = item.skipped_processing,
+            skipped_filtered = item.skipped_filtered,
+            skipped_by_author = item.skipped_by_author,
+            skipped_by_operator = item.skipped_by_operator,
+            recovered_stale_processing = item.recovered_stale_processing,
+            failed_retryable = item.failed_retryable,
+            failed_fatal = item.failed_fatal,
+            last_retryable_error = ?item.last_retryable_error,
+            last_fatal_error = ?item.last_fatal_error,
+            "review repo failed summary"
         );
     }
 }

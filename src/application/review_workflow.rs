@@ -224,7 +224,7 @@ impl<'a> ReviewWorkflow<'a> {
     }
 
     pub async fn review_once(&self) -> Result<Vec<RepoReviewStats>> {
-        let mut cfg: AppConfig = self.config_repo.load_config()?;
+        let cfg: AppConfig = self.config_repo.load_config()?;
         let selector = RepoSelector::from_options(&self.options);
         let repos = cfg
             .repos
@@ -247,16 +247,10 @@ impl<'a> ReviewWorkflow<'a> {
         results.sort_by_key(|(idx, _)| *idx);
 
         let mut stats = Vec::new();
-        for (idx, report) in results {
-            if let Some(last_sha) = report.last_processed_sha {
-                if let Some(repo) = cfg.repos.get_mut(idx) {
-                    repo.last_sha = Some(last_sha);
-                }
-            }
+        for (_idx, report) in results {
             stats.push(report.stats);
         }
 
-        self.config_repo.save_config(&cfg)?;
         Ok(stats)
     }
 
@@ -277,9 +271,7 @@ impl<'a> ReviewWorkflow<'a> {
             .review_single_pr(owner, repo, &stats.repo, &filter, &agents, pr, true)
             .await;
         match outcome {
-            PrReviewOutcome::Processed {
-                recovered_stale, ..
-            } => {
+            PrReviewOutcome::Processed { recovered_stale } => {
                 stats.processed += 1;
                 if recovered_stale {
                     stats.recovered_stale_processing += 1;
@@ -311,10 +303,7 @@ impl<'a> ReviewWorkflow<'a> {
             Ok(v) => v,
             Err(_) => {
                 stats.failed_fatal += 1;
-                return RepoReviewReport {
-                    stats,
-                    last_processed_sha: None,
-                };
+                return RepoReviewReport { stats };
             }
         };
 
@@ -325,10 +314,7 @@ impl<'a> ReviewWorkflow<'a> {
                     ErrorClass::Retryable => stats.failed_retryable += 1,
                     ErrorClass::Fatal => stats.failed_fatal += 1,
                 }
-                return RepoReviewReport {
-                    stats,
-                    last_processed_sha: None,
-                };
+                return RepoReviewReport { stats };
             }
         };
         let author_selector = AuthorSelector::from_options(&self.options);
@@ -375,18 +361,13 @@ impl<'a> ReviewWorkflow<'a> {
             .collect::<Vec<_>>()
             .await;
 
-        let mut last_sha: Option<String> = None;
         for outcome in outcomes {
             match outcome {
-                PrReviewOutcome::Processed {
-                    sha,
-                    recovered_stale,
-                } => {
+                PrReviewOutcome::Processed { recovered_stale } => {
                     stats.processed += 1;
                     if recovered_stale {
                         stats.recovered_stale_processing += 1;
                     }
-                    last_sha = Some(sha);
                 }
                 PrReviewOutcome::SkippedCompleted => stats.skipped_completed += 1,
                 PrReviewOutcome::SkippedProcessing => stats.skipped_processing += 1,
@@ -403,10 +384,7 @@ impl<'a> ReviewWorkflow<'a> {
             }
         }
 
-        RepoReviewReport {
-            stats,
-            last_processed_sha: last_sha,
-        }
+        RepoReviewReport { stats }
     }
 
     async fn review_single_pr(
@@ -767,7 +745,6 @@ impl<'a> ReviewWorkflow<'a> {
         self.mark_stage(ReviewStage::Done, &pr_url);
 
         PrReviewOutcome::Processed {
-            sha: pr.head_sha,
             recovered_stale: newest_processing_ts(&comments, &processing_prefix).is_some(),
         }
     }
@@ -1455,12 +1432,11 @@ fn parse_github_repo_like_url(input: &str) -> Option<String> {
 #[derive(Debug)]
 struct RepoReviewReport {
     stats: RepoReviewStats,
-    last_processed_sha: Option<String>,
 }
 
 #[derive(Debug)]
 enum PrReviewOutcome {
-    Processed { sha: String, recovered_stale: bool },
+    Processed { recovered_stale: bool },
     SkippedCompleted,
     SkippedProcessing,
     SkippedFiltered,
@@ -2177,8 +2153,6 @@ mod tests {
             agent_prompt_dirs: vec![],
             repos: vec![MonitoredRepo {
                 full_name: "owner/repo".to_string(),
-                added_at: "2026-01-01T00:00:00Z".to_string(),
-                last_sha: None,
                 review_filter: ReviewFilterConfig::default(),
                 agents: vec![],
             }],
@@ -2192,8 +2166,6 @@ mod tests {
                 .iter()
                 .map(|name| MonitoredRepo {
                     full_name: (*name).to_string(),
-                    added_at: "2026-01-01T00:00:00Z".to_string(),
-                    last_sha: None,
                     review_filter: ReviewFilterConfig::default(),
                     agents: vec![],
                 })

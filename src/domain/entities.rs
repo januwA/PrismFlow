@@ -10,8 +10,6 @@ pub struct AppConfig {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MonitoredRepo {
     pub full_name: String,
-    pub added_at: String,
-    pub last_sha: Option<String>,
     #[serde(default)]
     pub review_filter: ReviewFilterConfig,
     #[serde(default)]

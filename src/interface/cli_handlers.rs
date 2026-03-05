@@ -85,12 +85,7 @@ pub async fn dispatch(
                     println!("no repositories configured");
                 } else {
                     for item in repos {
-                        println!(
-                            "{} | added_at={} | last_sha={}",
-                            item.full_name,
-                            item.added_at,
-                            item.last_sha.unwrap_or_else(|| "-".to_string())
-                        );
+                        println!("{}", item.full_name);
                     }
                 }
             }

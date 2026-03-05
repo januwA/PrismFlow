@@ -25,7 +25,7 @@ pub async fn run_review_once(
     options: ReviewWorkflowOptions,
     ctx: Arc<TaskContext>,
     cache_cleanup_hours: u64,
-    archive_report_on_failure_only: bool,
+    _archive_report_on_failure_only: bool,
     status_tx: Option<&broadcast::Sender<String>>,
 ) -> Result<()> {
     let orchestrator = ReviewOrchestrator::new(config_repo, fs);
@@ -37,7 +37,7 @@ pub async fn run_review_once(
             options,
             ctx,
             cache_cleanup_hours,
-            archive_report_on_failure_only,
+            _archive_report_on_failure_only,
             status_tx,
         )
         .await?;
