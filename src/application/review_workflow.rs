@@ -338,7 +338,10 @@ impl<'a> ReviewWorkflow<'a> {
                 selected_prs.push(pr);
             } else {
                 stats.skipped_by_author += 1;
-                self.mark_stage(ReviewStage::Skipped, &monitored.full_name, pr.number);
+                let pr_url = pr.html_url.clone().unwrap_or_else(|| {
+                    format!("https://github.com/{owner}/{repo}/pull/{}", pr.number)
+                });
+                self.mark_stage(ReviewStage::Skipped, &pr_url);
             }
         }
 
@@ -416,6 +419,10 @@ impl<'a> ReviewWorkflow<'a> {
         pr: PullRequestSummary,
         force_run: bool,
     ) -> PrReviewOutcome {
+        let pr_url = pr
+            .html_url
+            .clone()
+            .unwrap_or_else(|| format!("https://github.com/{owner}/{repo}/pull/{}", pr.number));
         if self
             .options
             .task_context
@@ -426,10 +433,10 @@ impl<'a> ReviewWorkflow<'a> {
             return PrReviewOutcome::FailedRetryable("task cancelled".to_string());
         }
         if self.consume_skip_by_operator() {
-            self.mark_stage(ReviewStage::Skipped, full_repo_name, pr.number);
+            self.mark_stage(ReviewStage::Skipped, &pr_url);
             return PrReviewOutcome::SkippedByOperator;
         }
-        self.mark_stage(ReviewStage::Queued, full_repo_name, pr.number);
+        self.mark_stage(ReviewStage::Queued, &pr_url);
         let key = dedupe_key(
             full_repo_name,
             pr.number,
@@ -441,8 +448,8 @@ impl<'a> ReviewWorkflow<'a> {
                 Some(v) => v,
                 None => {
                     self.emit_status(format!(
-                        "repo={}/{} pr={} stage=Skipped reason=runtime-lock-held",
-                        owner, repo, pr.number
+                        "pr_url={} stage=Skipped reason=runtime-lock-held",
+                        pr_url
                     ));
                     return PrReviewOutcome::SkippedProcessing;
                 }
@@ -450,7 +457,7 @@ impl<'a> ReviewWorkflow<'a> {
         let processing_prefix = processing_anchor_prefix(&key);
         let completed_anchor = completed_anchor(&key);
 
-        self.mark_stage(ReviewStage::Fetching, full_repo_name, pr.number);
+        self.mark_stage(ReviewStage::Fetching, &pr_url);
         let comments = match self
             .github
             .list_issue_comment_bodies(owner, repo, pr.number)
@@ -509,7 +516,7 @@ impl<'a> ReviewWorkflow<'a> {
             }
         };
         let files = apply_repo_file_filter(&files, filter);
-        self.mark_stage(ReviewStage::Analyzing, full_repo_name, pr.number);
+        self.mark_stage(ReviewStage::Analyzing, &pr_url);
         if files.is_empty() {
             let completed_body = format!(
                 "{}\nPrismFlow completed review for `{}` (all files filtered by repo rules).",
@@ -566,10 +573,10 @@ impl<'a> ReviewWorkflow<'a> {
                     if let Ok(commit_count) = self.git.commit_count(&repo_dir, cmd_ctx).await {
                         if commit_count <= 1 {
                             self.emit_status(format!(
-                                "repo={}/{} pr={} stage=Skipped reason=single-commit-history",
-                                owner, repo, pr.number
+                                "pr_url={} stage=Skipped reason=single-commit-history",
+                                pr_url
                             ));
-                            self.mark_stage(ReviewStage::Skipped, full_repo_name, pr.number);
+                            self.mark_stage(ReviewStage::Skipped, &pr_url);
                             return PrReviewOutcome::SkippedFiltered;
                         }
                     }
@@ -587,10 +594,6 @@ impl<'a> ReviewWorkflow<'a> {
             Ok(v) => v,
             Err(_) => Vec::new(),
         };
-        let pr_url = pr
-            .html_url
-            .clone()
-            .unwrap_or_else(|| format!("https://github.com/{owner}/{repo}/pull/{}", pr.number));
         let engine_attempts = self.options.engine_specs.len();
         if engine_attempts == 0 {
             return PrReviewOutcome::FailedFatal(
@@ -666,21 +669,17 @@ impl<'a> ReviewWorkflow<'a> {
                 }
                 Err(err) => {
                     let err_text = err.to_string();
-                    eprintln!(
-                        "engine_failed repo={}/{} pr={} engine={} attempt={}/{} error={}",
-                        owner,
-                        repo,
-                        pr.number,
-                        fingerprint,
-                        attempt_idx + 1,
-                        engine_attempts,
-                        err_text
+                    tracing::warn!(
+                        pr_url = %pr_url,
+                        engine = %fingerprint,
+                        attempt = attempt_idx + 1,
+                        max_attempts = engine_attempts,
+                        error = %err_text,
+                        "engine attempt failed"
                     );
                     self.emit_status(format!(
-                        "repo={}/{} pr={} stage=EngineFailed engine={} attempt={}/{} error={}",
-                        owner,
-                        repo,
-                        pr.number,
+                        "pr_url={} stage=EngineFailed engine={} attempt={}/{} error={}",
+                        pr_url,
                         fingerprint,
                         attempt_idx + 1,
                         engine_attempts,
@@ -697,9 +696,11 @@ impl<'a> ReviewWorkflow<'a> {
                             )
                             .await;
                         if let Err(clean_err) = removed {
-                            eprintln!(
-                                "engine_failed_cleanup_error repo={}/{} pr={} engine={} error={}",
-                                owner, repo, pr.number, fingerprint, clean_err
+                            tracing::warn!(
+                                pr_url = %pr_url,
+                                engine = %fingerprint,
+                                error = %clean_err,
+                                "failed to cleanup processing marker after engine failure"
                             );
                         }
                     }
@@ -720,21 +721,14 @@ impl<'a> ReviewWorkflow<'a> {
             }
         };
 
-
         let review_header = format!(
             "PrismFlow review summary for `{}`\n\n- Engine: `{}`\n- Analyzer: `{}`\n\n",
             pr.head_sha, selected_engine_fingerprint, analysis.source,
         );
 
-        self.mark_stage(ReviewStage::PostingReview, full_repo_name, pr.number);
+        self.mark_stage(ReviewStage::PostingReview, &pr_url);
         if let Err(err) = self
-            .post_review_summary(
-                owner,
-                repo,
-                pr.number,
-                &review_header,
-                &analysis.summary,
-            )
+            .post_review_summary(owner, repo, pr.number, &review_header, &analysis.summary)
             .await
         {
             return match classify_error(&err) {
@@ -760,7 +754,7 @@ impl<'a> ReviewWorkflow<'a> {
                 ErrorClass::Fatal => PrReviewOutcome::FailedFatal(err.to_string()),
             };
         }
-        self.mark_stage(ReviewStage::Labeling, full_repo_name, pr.number);
+        self.mark_stage(ReviewStage::Labeling, &pr_url);
         if let Err(err) = self
             .sync_reviewed_labels(owner, repo, pr.number, &reviewed_label)
             .await
@@ -770,7 +764,7 @@ impl<'a> ReviewWorkflow<'a> {
                 ErrorClass::Fatal => PrReviewOutcome::FailedFatal(err.to_string()),
             };
         }
-        self.mark_stage(ReviewStage::Done, full_repo_name, pr.number);
+        self.mark_stage(ReviewStage::Done, &pr_url);
 
         PrReviewOutcome::Processed {
             sha: pr.head_sha,
@@ -950,13 +944,12 @@ impl<'a> ReviewWorkflow<'a> {
             {
                 Ok(()) => return Ok(()),
                 Err(err) => {
+                    let pr_url = format!("https://github.com/{owner}/{repo}/pull/{issue_number}");
                     tracing::warn!(
-                        "post_summary_from_file_failed repo={}/{} issue={} path={} error={}",
-                        owner,
-                        repo,
-                        issue_number,
-                        path,
-                        err
+                        pr_url = %pr_url,
+                        path = %path,
+                        error = %err,
+                        "post_summary_from_file_failed"
                     );
                     let fallback_summary = if cleaned_summary.trim().is_empty() {
                         "Shell engine returned stdout file marker, but PrismFlow failed to read that file."
@@ -1107,7 +1100,7 @@ impl<'a> ReviewWorkflow<'a> {
             .unwrap_or(false)
     }
 
-    fn mark_stage(&self, stage: ReviewStage, repo: &str, pr_number: u64) {
+    fn mark_stage(&self, stage: ReviewStage, pr_url: &str) {
         let run_id = self
             .options
             .task_context
@@ -1115,8 +1108,8 @@ impl<'a> ReviewWorkflow<'a> {
             .map(|ctx| ctx.run_id().to_string())
             .unwrap_or_else(|| "n/a".to_string());
         self.emit_status(format!(
-            "run_id={} stage={:?} repo={} pr={}",
-            run_id, stage, repo, pr_number
+            "run_id={} stage={:?} pr_url={}",
+            run_id, stage, pr_url
         ));
     }
 
@@ -1236,19 +1229,16 @@ impl<'a> ReviewWorkflow<'a> {
         let command_line = command;
         let cmd_fingerprint = command_line_fingerprint(&command_line);
         let cmd_len = command_line.len();
-        println!(
-            "[ENGINE] repo={}/{} pr={} pr_url={} engine={} command_fingerprint={} command_len={}",
-            owner, repo, pr_number, pr_url, selected_engine.fingerprint, cmd_fingerprint, cmd_len
+        tracing::info!(
+            pr_url = %pr_url,
+            engine = %selected_engine.fingerprint,
+            command_fingerprint = %cmd_fingerprint,
+            command_len = cmd_len,
+            "running review engine"
         );
         self.emit_status(format!(
-            "repo={}/{} pr={} pr_url={} stage=EngineCommand engine={} command_fingerprint={} command_len={}",
-            owner,
-            repo,
-            pr_number,
-            pr_url,
-            selected_engine.fingerprint,
-            cmd_fingerprint,
-            cmd_len
+            "pr_url={} stage=EngineCommand engine={} command_fingerprint={} command_len={}",
+            pr_url, selected_engine.fingerprint, cmd_fingerprint, cmd_len
         ));
         let output = match shell
             .run_command_line(
@@ -3005,7 +2995,6 @@ mod tests {
         assert_eq!(stats.skipped_processing, 1);
         assert_eq!(stats.processed, 0);
     }
-
 
     #[tokio::test]
     async fn review_once_filters_with_include_repos() {

@@ -220,7 +220,7 @@ where
             }
             _ = interval.tick() => {
                 let secs = started.elapsed().as_secs();
-                println!("[WORKING] {tag} is still running... elapsed={}s", secs);
+                tracing::info!(tag = tag, elapsed_secs = secs, "task is still running");
             }
             _ = ctx.cancelled() => {
                 return Err(anyhow!(DomainError::CancelledBySignal).context(format!("{tag} cancelled")));

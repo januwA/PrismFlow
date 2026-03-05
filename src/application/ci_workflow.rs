@@ -252,9 +252,11 @@ impl<'a> CiWorkflow<'a> {
                 .html_url
                 .clone()
                 .unwrap_or_else(|| format!("https://github.com/{owner}/{repo}/pull/{}", pr.number));
-            println!(
-                "[ENGINE] repo={}/{} pr={} pr_url={} engine={} command_line={}",
-                owner, repo, pr.number, pr_url, selected_engine.fingerprint, command
+            tracing::info!(
+                pr_url = %pr_url,
+                engine = %selected_engine.fingerprint,
+                command_line = %command,
+                "running ci engine"
             );
             let output = self
                 .shell

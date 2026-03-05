@@ -295,7 +295,7 @@ pub async fn dispatch(
                             None,
                         )
                         .await;
-                        println!("received Ctrl+C, exiting ci once");
+                        tracing::info!("received Ctrl+C, exiting ci once");
                     }
                 }
             }
@@ -332,7 +332,7 @@ pub async fn dispatch(
                     max_concurrent_api,
                     "ci",
                 )?;
-                println!("ci daemon started: interval={}s", interval_secs);
+                tracing::info!(interval_secs = interval_secs, "ci daemon started");
                 let mut cycle_engine_start: usize = 0;
                 loop {
                     let engine_start_index = cycle_engine_start;
@@ -354,7 +354,7 @@ pub async fn dispatch(
                             cache_cleanup_hours,
                         ) => {
                             if let Err(err) = r {
-                                eprintln!("ci cycle failed: {err:#}");
+                                tracing::error!(error = %format!("{err:#}"), "ci cycle failed");
                             }
                         }
                         _ = wait_for_shutdown_signal() => {
@@ -370,13 +370,13 @@ pub async fn dispatch(
                         }
                     }
                     if stop_daemon {
-                        println!("received Ctrl+C, exiting ci daemon");
+                        tracing::info!("received Ctrl+C, exiting ci daemon");
                         break;
                     }
                     tokio::select! {
                         _ = sleep(Duration::from_secs(interval_secs)) => {}
                         _ = wait_for_shutdown_signal() => {
-                            println!("received Ctrl+C, exiting ci daemon");
+                            tracing::info!("received Ctrl+C, exiting ci daemon");
                             break;
                         }
                     }
@@ -453,7 +453,7 @@ pub async fn dispatch(
                             None,
                         )
                         .await;
-                        println!("received Ctrl+C, exiting review once");
+                        tracing::info!("received Ctrl+C, exiting review once");
                     }
                 }
             }
@@ -501,7 +501,7 @@ pub async fn dispatch(
                 let wake_notify = Arc::new(Notify::new());
                 let status_task = tokio::spawn(async move {
                     while let Ok(msg) = status_rx.recv().await {
-                        println!("[STATUS] {msg}");
+                        tracing::info!(status = %msg, "review daemon status");
                     }
                 });
                 let skip_flag_for_input = skip_flag.clone();
@@ -513,7 +513,7 @@ pub async fn dispatch(
                         if line.trim().eq_ignore_ascii_case("skip") {
                             skip_flag_for_input.store(true, Ordering::Relaxed);
                             wake_notify_for_input.notify_one();
-                            println!("[CONTROL] skip received; next pending PR will be skipped");
+                            tracing::info!("skip received; next pending PR will be skipped");
                         }
                     }
                 });
@@ -524,8 +524,8 @@ pub async fn dispatch(
                     max_concurrent_api,
                     "review",
                 )?;
-                println!("review daemon started: interval={}s", interval_secs);
-                println!("control: type `skip` then Enter to skip next pending PR");
+                tracing::info!(interval_secs = interval_secs, "review daemon started");
+                tracing::info!("control: type `skip` then Enter to skip next pending PR");
                 let mut cycle_engine_start: usize = 0;
                 loop {
                     let engine_start_index = cycle_engine_start;
@@ -556,7 +556,7 @@ pub async fn dispatch(
                         ) => {
                             if let Err(err) = r {
                                 let _ = status_tx.send(format!("cycle:failed error={err:#}"));
-                                eprintln!("review cycle failed: {err:#}");
+                                tracing::error!(error = %format!("{err:#}"), "review cycle failed");
                             } else {
                                 let _ = status_tx.send("cycle:done".to_string());
                             }
@@ -574,7 +574,7 @@ pub async fn dispatch(
                         }
                     }
                     if stop_daemon {
-                        println!("received Ctrl+C, exiting daemon");
+                        tracing::info!("received Ctrl+C, exiting daemon");
                         break;
                     }
 
@@ -586,7 +586,7 @@ pub async fn dispatch(
                             let _ = status_tx.send("control:wakeup".to_string());
                         }
                         _ = wait_for_shutdown_signal() => {
-                            println!("received Ctrl+C, exiting daemon");
+                            tracing::info!("received Ctrl+C, exiting daemon");
                             break;
                         }
                     }
@@ -656,7 +656,7 @@ pub async fn dispatch(
                             None,
                         )
                         .await;
-                        println!("received Ctrl+C, exiting review ad-hoc");
+                        tracing::info!("received Ctrl+C, exiting review ad-hoc");
                     }
                 }
             }
@@ -681,7 +681,11 @@ pub async fn dispatch(
                                 Ok(client) => client,
                                 Err(err) => {
                                     failed += 1;
-                                    eprintln!("clean_failed url={} error={err:#}", pr_url);
+                                    tracing::error!(
+                                        pr_url = %pr_url,
+                                        error = %format!("{err:#}"),
+                                        "clean failed"
+                                    );
                                     continue;
                                 }
                             };
@@ -690,12 +694,20 @@ pub async fn dispatch(
                                     .await
                             {
                                 failed += 1;
-                                eprintln!("clean_failed url={} error={err:#}", pr_url);
+                                tracing::error!(
+                                    pr_url = %pr_url,
+                                    error = %format!("{err:#}"),
+                                    "clean failed"
+                                );
                             }
                         }
                         Err(err) => {
                             failed += 1;
-                            eprintln!("clean_failed url={} error={err:#}", pr_url);
+                            tracing::error!(
+                                pr_url = %pr_url,
+                                error = %format!("{err:#}"),
+                                "clean failed"
+                            );
                         }
                     }
                 }
@@ -819,7 +831,7 @@ fn print_review_engine_list(engine_specs: &[EngineSpec], prompt_template: Option
         })
         .collect::<Vec<_>>()
         .join(", ");
-    println!("review engines: [{}]", engine_pairs);
+    tracing::info!(engines = %engine_pairs, "review engines");
 }
 
 fn expand_engine_preview(command: &str, prompt_template: Option<&str>) -> String {
@@ -886,14 +898,20 @@ async fn shutdown_cycle(
     }
     let initial_children = ctx.child_count().await;
     let child_snapshot = ctx.list_children().await;
-    println!(
-        "shutdown:{} graceful_begin run_id={} in_flight_children={} cancel_reason=signal",
-        kind,
-        ctx.run_id(),
-        initial_children
+    tracing::info!(
+        kind = kind,
+        run_id = ctx.run_id(),
+        in_flight_children = initial_children,
+        cancel_reason = "signal",
+        "shutdown graceful begin"
     );
     for (pid, label) in child_snapshot {
-        println!("shutdown:{} child_pid={} {}", kind, pid, label);
+        tracing::info!(
+            kind = kind,
+            child_pid = pid,
+            child_label = %label,
+            "shutdown in-flight child"
+        );
     }
     if let Some(tx) = status_tx {
         let _ = tx.send(format!(
@@ -904,7 +922,7 @@ async fn shutdown_cycle(
         ));
     }
     if initial_children == 0 {
-        println!("shutdown:{} graceful_end in_flight_children=0", kind);
+        tracing::info!(kind = kind, in_flight_children = 0, "shutdown graceful end");
         if let Some(tx) = status_tx {
             let _ = tx.send(format!(
                 "cycle:graceful_shutdown_end kind={} run_id={} in_flight_children=0",
@@ -919,7 +937,7 @@ async fn shutdown_cycle(
     loop {
         let remaining_children = ctx.child_count().await;
         if remaining_children == 0 {
-            println!("shutdown:{} graceful_end in_flight_children=0", kind);
+            tracing::info!(kind = kind, in_flight_children = 0, "shutdown graceful end");
             if let Some(tx) = status_tx {
                 let _ = tx.send(format!(
                     "cycle:graceful_shutdown_end kind={} run_id={} in_flight_children=0",
@@ -937,16 +955,17 @@ async fn shutdown_cycle(
         tokio::select! {
             _ = sleep(Duration::from_millis(200)) => {}
             _ = wait_for_shutdown_signal() => {
-                println!(
-                    "shutdown:{} second_ctrl_c immediate_force_kill cancel_reason=signal_second",
-                    kind
+                tracing::warn!(
+                    kind = kind,
+                    cancel_reason = "signal_second",
+                    "second Ctrl+C received, forcing kill"
                 );
                 break;
             }
         }
     }
 
-    println!("shutdown:{} force_kill_begin", kind);
+    tracing::warn!(kind = kind, "shutdown force kill begin");
     if let Some(tx) = status_tx {
         let _ = tx.send(format!(
             "cycle:force_kill_begin kind={} run_id={} cancel_reason=signal",
@@ -955,9 +974,10 @@ async fn shutdown_cycle(
         ));
     }
     let killed = ctx.kill_all_children(process_manager).await;
-    println!(
-        "shutdown:{} force_kill_end killed_children={}",
-        kind, killed
+    tracing::warn!(
+        kind = kind,
+        killed_children = killed,
+        "shutdown force kill end"
     );
     if let Some(tx) = status_tx {
         let _ = tx.send(format!(

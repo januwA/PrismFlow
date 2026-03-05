@@ -23,9 +23,9 @@ use tracing_subscriber::EnvFilter;
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    init_tracing();
-
     let cli = Cli::parse();
+    init_tracing(cli.log_level);
+
     let shell_override = cli.shell.clone();
     let local_config_repo = Arc::new(LocalConfigAdapter::new()?);
     let config_repo: Arc<dyn ConfigRepository> = local_config_repo.clone();
@@ -60,7 +60,11 @@ async fn main() -> Result<()> {
     Ok(())
 }
 
-fn init_tracing() {
-    let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
+fn init_tracing(log_level: Option<interface::cli::LogLevel>) {
+    let filter = if let Some(level) = log_level {
+        EnvFilter::new(level.as_str())
+    } else {
+        EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"))
+    };
     let _ = tracing_subscriber::fmt().with_env_filter(filter).try_init();
 }

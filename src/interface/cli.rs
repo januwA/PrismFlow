@@ -1,4 +1,25 @@
-use clap::{ArgAction, Args, Parser, Subcommand};
+use clap::{ArgAction, Args, Parser, Subcommand, ValueEnum};
+
+#[derive(Debug, Clone, Copy, ValueEnum)]
+pub enum LogLevel {
+    Trace,
+    Debug,
+    Info,
+    Warn,
+    Error,
+}
+
+impl LogLevel {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Trace => "trace",
+            Self::Debug => "debug",
+            Self::Info => "info",
+            Self::Warn => "warn",
+            Self::Error => "error",
+        }
+    }
+}
 
 #[derive(Debug, Parser)]
 #[command(
@@ -9,6 +30,13 @@ use clap::{ArgAction, Args, Parser, Subcommand};
     after_long_help = "顶层 COMMAND 可选：\n  repo    仓库管理\n  auth    认证管理\n  scan    扫描模式（只读）\n  ci      CI 失败分析并回写建议\n  review  审查模式（会写评论）\n\n配置文件位置：\n  repos.json 位于系统配置目录下的 pr-reviewer/repos.json\n  Windows 示例：C:\\Users\\<用户名>\\AppData\\Roaming\\pr-reviewer\\repos.json\n  token 文件：同目录下 auth_token\n\n示例：\n  cargo run -- repo list\n  cargo run -- scan once\n  cargo run -- ci once --engine gemini-cli \"gemini -y -p \\\"$(cat {ci_file})\\\"\"\n  cargo run -- review daemon --interval-secs 30"
 )]
 pub struct Cli {
+    #[arg(
+        long,
+        global = true,
+        value_enum,
+        help = "日志级别（trace/debug/info/warn/error）；未设置时优先读取 RUST_LOG"
+    )]
+    pub log_level: Option<LogLevel>,
     #[arg(
         long,
         global = true,

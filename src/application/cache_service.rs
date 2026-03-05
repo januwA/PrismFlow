@@ -70,7 +70,7 @@ impl<'a> CacheCleanupService<'a> {
         let stats = self.cleanup_stale_cache_under(&cwd, stale_after, SystemTime::now());
 
         if stats.has_changes() {
-            println!("{}", stats.to_log_string(&cwd, cache_cleanup_hours));
+            tracing::info!("{}", stats.to_log_string(&cwd, cache_cleanup_hours));
         }
     }
 
