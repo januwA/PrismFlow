@@ -38,6 +38,28 @@ pub async fn dispatch(
     fs: &dyn FileSystem,
     git: &dyn GitService,
 ) -> Result<()> {
+    let global_cancel = tokio_util::sync::CancellationToken::new();
+    let cloned_cancel = global_cancel.clone();
+    tokio::spawn(async move {
+        #[cfg(windows)]
+        {
+            use tokio::signal::windows::{ctrl_break, ctrl_c};
+            if let (Ok(mut sig_c), Ok(mut sig_break)) = (ctrl_c(), ctrl_break()) {
+                tokio::select! {
+                    _ = sig_c.recv() => {}
+                    _ = sig_break.recv() => {}
+                }
+            } else {
+                let _ = tokio::signal::ctrl_c().await;
+            }
+        }
+        #[cfg(not(windows))]
+        {
+            let _ = tokio::signal::ctrl_c().await;
+        }
+        cloned_cancel.cancel();
+    });
+
     match command {
         Commands::Repo(repo) => match repo.command {
             RepoSubcommand::Add { full_name } => {
@@ -257,6 +279,13 @@ pub async fn dispatch(
                     max_concurrent_api,
                     "ci",
                 )?;
+                let once_ctx_cloned = once_ctx.clone();
+                let cancel_link = global_cancel.clone();
+                tokio::spawn(async move {
+                    cancel_link.cancelled().await;
+                    once_ctx_cloned.cancel();
+                });
+                let mut cancelled_by_global = false;
                 tokio::select! {
                     r = run_ci_once(
                         config_repo.as_ref(),
@@ -279,19 +308,20 @@ pub async fn dispatch(
                         once_ctx.clone(),
                         cache_cleanup_hours,
                     ) => {
-                        r?;
+                        if global_cancel.is_cancelled() {
+                            cancelled_by_global = true;
+                        } else {
+                            r?;
+                        }
                     }
-                    _ = wait_for_shutdown_signal() => {
-                        shutdown_cycle(
-                            "ci",
-                            &once_ctx,
-                            SHUTDOWN_GRACE_SECS,
-                            process_manager,
-                            None,
-                        )
+                    _ = global_cancel.cancelled() => {
+                        cancelled_by_global = true;
+                    }
+                }
+                if cancelled_by_global {
+                    shutdown_cycle("ci", &once_ctx, SHUTDOWN_GRACE_SECS, process_manager, None)
                         .await;
-                        tracing::info!("received Ctrl+C, exiting ci once");
-                    }
+                    tracing::info!("received Ctrl+C, exiting ci once");
                 }
             }
             CiSubcommand::Daemon {
@@ -333,6 +363,12 @@ pub async fn dispatch(
                     let engine_start_index = cycle_engine_start;
                     cycle_engine_start = cycle_engine_start.wrapping_add(1);
                     let cycle_ctx = Arc::new(TaskContext::new("ci-daemon-cycle"));
+                    let cycle_ctx_cloned = cycle_ctx.clone();
+                    let cancel_link = global_cancel.clone();
+                    tokio::spawn(async move {
+                        cancel_link.cancelled().await;
+                        cycle_ctx_cloned.cancel();
+                    });
                     let mut stop_daemon = false;
                     tokio::select! {
                         r = run_ci_once(
@@ -348,32 +384,35 @@ pub async fn dispatch(
                             cycle_ctx.clone(),
                             cache_cleanup_hours,
                         ) => {
-                            if let Err(err) = r {
+                            if global_cancel.is_cancelled() {
+                                stop_daemon = true;
+                            } else if let Err(err) = r {
                                 tracing::error!(error = %format!("{err:#}"), "ci cycle failed");
                             }
                         }
-                        _ = wait_for_shutdown_signal() => {
+                        _ = global_cancel.cancelled() => {
                             stop_daemon = true;
-                            shutdown_cycle(
-                                "ci",
-                                &cycle_ctx,
-                                SHUTDOWN_GRACE_SECS,
-                                process_manager,
-                                None,
-                            )
-                            .await;
                         }
                     }
-                    if stop_daemon {
+                    if stop_daemon || global_cancel.is_cancelled() {
+                        shutdown_cycle(
+                            "ci",
+                            &cycle_ctx,
+                            SHUTDOWN_GRACE_SECS,
+                            process_manager,
+                            None,
+                        )
+                        .await;
                         tracing::info!("received Ctrl+C, exiting ci daemon");
                         break;
                     }
                     tokio::select! {
                         _ = sleep(Duration::from_secs(interval_secs)) => {}
-                        _ = wait_for_shutdown_signal() => {
-                            tracing::info!("received Ctrl+C, exiting ci daemon");
-                            break;
-                        }
+                        _ = global_cancel.cancelled() => {}
+                    }
+                    if global_cancel.is_cancelled() {
+                        tracing::info!("received Ctrl+C, exiting ci daemon");
+                        break;
                     }
                 }
             }
@@ -424,6 +463,13 @@ pub async fn dispatch(
                     max_concurrent_api,
                     "review",
                 )?;
+                let once_ctx_cloned = once_ctx.clone();
+                let cancel_link = global_cancel.clone();
+                tokio::spawn(async move {
+                    cancel_link.cancelled().await;
+                    once_ctx_cloned.cancel();
+                });
+                let mut cancelled_by_global = false;
                 tokio::select! {
                     r = run_review_once(
                         config_repo.as_ref(),
@@ -437,19 +483,26 @@ pub async fn dispatch(
                         false,
                         None,
                     ) => {
-                        r?;
+                        if global_cancel.is_cancelled() {
+                            cancelled_by_global = true;
+                        } else {
+                            r?;
+                        }
                     }
-                    _ = wait_for_shutdown_signal() => {
-                        shutdown_cycle(
-                            "review",
-                            &once_ctx,
-                            SHUTDOWN_GRACE_SECS,
-                            process_manager,
-                            None,
-                        )
-                        .await;
-                        tracing::info!("received Ctrl+C, exiting review once");
+                    _ = global_cancel.cancelled() => {
+                        cancelled_by_global = true;
                     }
+                }
+                if cancelled_by_global {
+                    shutdown_cycle(
+                        "review",
+                        &once_ctx,
+                        SHUTDOWN_GRACE_SECS,
+                        process_manager,
+                        None,
+                    )
+                    .await;
+                    tracing::info!("received Ctrl+C, exiting review once");
                 }
             }
             ReviewSubcommand::Daemon {
@@ -530,6 +583,12 @@ pub async fn dispatch(
                     }
                     let _ = status_tx.send("cycle:start".to_string());
                     let cycle_ctx = Arc::new(TaskContext::new("review-daemon-cycle"));
+                    let cycle_ctx_cloned = cycle_ctx.clone();
+                    let cancel_link = global_cancel.clone();
+                    tokio::spawn(async move {
+                        cancel_link.cancelled().await;
+                        cycle_ctx_cloned.cancel();
+                    });
                     let mut stop_daemon = false;
                     tokio::select! {
                         r = run_review_once(
@@ -549,26 +608,28 @@ pub async fn dispatch(
                             true,
                             Some(&status_tx),
                         ) => {
-                            if let Err(err) = r {
+                            if global_cancel.is_cancelled() {
+                                stop_daemon = true;
+                            } else if let Err(err) = r {
                                 let _ = status_tx.send(format!("cycle:failed error={err:#}"));
                                 tracing::error!(error = %format!("{err:#}"), "review cycle failed");
                             } else {
                                 let _ = status_tx.send("cycle:done".to_string());
                             }
                         }
-                        _ = wait_for_shutdown_signal() => {
+                        _ = global_cancel.cancelled() => {
                             stop_daemon = true;
-                            shutdown_cycle(
-                                "review",
-                                &cycle_ctx,
-                                SHUTDOWN_GRACE_SECS,
-                                process_manager,
-                                Some(&status_tx),
-                            )
-                            .await;
                         }
                     }
-                    if stop_daemon {
+                    if stop_daemon || global_cancel.is_cancelled() {
+                        shutdown_cycle(
+                            "review",
+                            &cycle_ctx,
+                            SHUTDOWN_GRACE_SECS,
+                            process_manager,
+                            Some(&status_tx),
+                        )
+                        .await;
                         tracing::info!("received Ctrl+C, exiting daemon");
                         break;
                     }
@@ -580,10 +641,11 @@ pub async fn dispatch(
                         _ = wake_notify.notified() => {
                             let _ = status_tx.send("control:wakeup".to_string());
                         }
-                        _ = wait_for_shutdown_signal() => {
-                            tracing::info!("received Ctrl+C, exiting daemon");
-                            break;
-                        }
+                        _ = global_cancel.cancelled() => {}
+                    }
+                    if global_cancel.is_cancelled() {
+                        tracing::info!("received Ctrl+C, exiting daemon");
+                        break;
                     }
                 }
                 drop(status_tx);
@@ -625,6 +687,13 @@ pub async fn dispatch(
                     max_concurrent_api,
                     "ad-hoc review",
                 )?;
+                let adhoc_ctx_cloned = adhoc_ctx.clone();
+                let cancel_link = global_cancel.clone();
+                tokio::spawn(async move {
+                    cancel_link.cancelled().await;
+                    adhoc_ctx_cloned.cancel();
+                });
+                let mut cancelled_by_global = false;
                 tokio::select! {
                     r = run_review_ad_hoc(
                         config_repo.as_ref(),
@@ -639,19 +708,26 @@ pub async fn dispatch(
                         adhoc_ctx.clone(),
                         cache_cleanup_hours,
                     ) => {
-                        r?;
+                        if global_cancel.is_cancelled() {
+                            cancelled_by_global = true;
+                        } else {
+                            r?;
+                        }
                     }
-                    _ = wait_for_shutdown_signal() => {
-                        shutdown_cycle(
-                            "review",
-                            &adhoc_ctx,
-                            SHUTDOWN_GRACE_SECS,
-                            process_manager,
-                            None,
-                        )
-                        .await;
-                        tracing::info!("received Ctrl+C, exiting review ad-hoc");
+                    _ = global_cancel.cancelled() => {
+                        cancelled_by_global = true;
                     }
+                }
+                if cancelled_by_global {
+                    shutdown_cycle(
+                        "review",
+                        &adhoc_ctx,
+                        SHUTDOWN_GRACE_SECS,
+                        process_manager,
+                        None,
+                    )
+                    .await;
+                    tracing::info!("received Ctrl+C, exiting review ad-hoc");
                 }
             }
             ReviewSubcommand::Clean {
@@ -892,6 +968,12 @@ async fn shutdown_cycle(
     }
     let initial_children = ctx.child_count().await;
     let child_snapshot = ctx.list_children().await;
+
+    println!(
+        "\n[PrismFlow] 收到终止信号，正在对 [{}] 执行优雅关机 (优雅宽限期: {} 秒)...",
+        kind, grace_secs
+    );
+
     tracing::info!(
         kind = kind,
         run_id = ctx.run_id(),
@@ -899,10 +981,18 @@ async fn shutdown_cycle(
         cancel_reason = "signal",
         "shutdown graceful begin"
     );
-    for (pid, label) in child_snapshot {
+
+    if initial_children > 0 {
+        println!(
+            "[PrismFlow] 检测到有 {} 个运行中的后台子进程，正在发送取消信号并清理：",
+            initial_children
+        );
+    }
+    for (pid, label) in &child_snapshot {
+        println!("  -> 终止子进程 PID: {} ({})", pid, label);
         tracing::info!(
             kind = kind,
-            child_pid = pid,
+            child_pid = *pid,
             child_label = %label,
             "shutdown in-flight child"
         );
@@ -916,6 +1006,7 @@ async fn shutdown_cycle(
         ));
     }
     if initial_children == 0 {
+        println!("[PrismFlow] 没有在运行中的子进程。优雅关机结束！");
         tracing::info!(kind = kind, in_flight_children = 0, "shutdown graceful end");
         if let Some(tx) = status_tx {
             let _ = tx.send(format!(
@@ -928,9 +1019,13 @@ async fn shutdown_cycle(
     }
 
     let deadline = tokio::time::Instant::now() + Duration::from_secs(grace_secs);
+    let mut last_remaining = initial_children;
+    println!("[PrismFlow] 正在等待子进程安全退出 (再次按下 Ctrl+C 可立即强制终止)...");
+
     loop {
         let remaining_children = ctx.child_count().await;
         if remaining_children == 0 {
+            println!("[PrismFlow] 所有后台子进程已安全退出，优雅关机结束。");
             tracing::info!(kind = kind, in_flight_children = 0, "shutdown graceful end");
             if let Some(tx) = status_tx {
                 let _ = tx.send(format!(
@@ -942,13 +1037,26 @@ async fn shutdown_cycle(
             return;
         }
 
+        if remaining_children != last_remaining {
+            println!(
+                "[PrismFlow] 剩余运行中的子进程: {} 个...",
+                remaining_children
+            );
+            last_remaining = remaining_children;
+        }
+
         if tokio::time::Instant::now() >= deadline {
+            println!(
+                "[PrismFlow] 优雅宽限时间已到，仍有 {} 个子进程未能按时退出。",
+                remaining_children
+            );
             break;
         }
 
         tokio::select! {
             _ = sleep(Duration::from_millis(200)) => {}
             _ = wait_for_shutdown_signal() => {
+                println!("\n[PrismFlow] 收到第二次 Ctrl+C 信号！正在强制杀死进程树并立即退出...");
                 tracing::warn!(
                     kind = kind,
                     cancel_reason = "signal_second",
@@ -959,6 +1067,7 @@ async fn shutdown_cycle(
         }
     }
 
+    println!("[PrismFlow] 正在强制杀死整棵残留子进程树...");
     tracing::warn!(kind = kind, "shutdown force kill begin");
     if let Some(tx) = status_tx {
         let _ = tx.send(format!(
@@ -968,6 +1077,10 @@ async fn shutdown_cycle(
         ));
     }
     let killed = ctx.kill_all_children(process_manager).await;
+    println!(
+        "[PrismFlow] 已成功强制终止 {} 个后台残留进程。程序退出完成。",
+        killed
+    );
     tracing::warn!(
         kind = kind,
         killed_children = killed,

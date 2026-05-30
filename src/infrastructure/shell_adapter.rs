@@ -173,6 +173,10 @@ impl ShellAdapter for CommandShellAdapter {
             tokio::select! {
                 out = child.wait() => out,
                 _ = task_ctx.cancelled() => {
+                    if let Some(p) = pid {
+                        let pm = crate::infrastructure::process_manager::OsProcessManager;
+                        pm.kill_process_tree(p);
+                    }
                     let _ = child.kill().await;
                     if let (Some(task_ctx), Some(pid)) = (ctx, pid) {
                         task_ctx.unregister_child(pid).await;
@@ -180,6 +184,10 @@ impl ShellAdapter for CommandShellAdapter {
                     anyhow::bail!(DomainError::CancelledBySignal);
                 }
                 _ = sleep(Duration::from_secs(COMMAND_TIMEOUT_SECS)) => {
+                    if let Some(p) = pid {
+                        let pm = crate::infrastructure::process_manager::OsProcessManager;
+                        pm.kill_process_tree(p);
+                    }
                     let _ = child.kill().await;
                     if let (Some(task_ctx), Some(pid)) = (ctx, pid) {
                         task_ctx.unregister_child(pid).await;
@@ -191,6 +199,10 @@ impl ShellAdapter for CommandShellAdapter {
             tokio::select! {
                 out = child.wait() => out?,
                 _ = sleep(Duration::from_secs(COMMAND_TIMEOUT_SECS)) => {
+                    if let Some(p) = pid {
+                        let pm = crate::infrastructure::process_manager::OsProcessManager;
+                        pm.kill_process_tree(p);
+                    }
                     let _ = child.kill().await;
                     anyhow::bail!("command line timed out after {}s", COMMAND_TIMEOUT_SECS);
                 }

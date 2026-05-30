@@ -464,18 +464,30 @@ impl<'a> ReviewWorkflow<'a> {
             if comments.iter().any(|body| body.contains(&completed_anchor))
                 || labels.iter().any(|l| l == &reviewed_label)
             {
+                self.mark_stage(ReviewStage::Skipped, &pr_url);
+                self.emit_status(format!("pr_url={} stage=Skipped reason=completed", pr_url));
                 return PrReviewOutcome::SkippedCompleted;
             }
 
             if let Some(latest_ts) = newest_processing_ts(&comments, &processing_prefix) {
                 let age_secs = now_unix_secs() - latest_ts;
                 if age_secs <= PROCESSING_TTL_SECS {
+                    self.mark_stage(ReviewStage::Skipped, &pr_url);
+                    self.emit_status(format!(
+                        "pr_url={} stage=Skipped reason=processing-cooldown",
+                        pr_url
+                    ));
                     return PrReviewOutcome::SkippedProcessing;
                 }
             }
         } else if let Some(latest_ts) = newest_processing_ts(&comments, &processing_prefix) {
             let age_secs = now_unix_secs() - latest_ts;
             if age_secs <= ADHOC_COOLDOWN_SECS {
+                self.mark_stage(ReviewStage::Skipped, &pr_url);
+                self.emit_status(format!(
+                    "pr_url={} stage=Skipped reason=adhoc-cooldown",
+                    pr_url
+                ));
                 return PrReviewOutcome::SkippedProcessing;
             }
         }
