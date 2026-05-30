@@ -501,7 +501,7 @@ pub async fn dispatch(
                 });
                 let skip_flag_for_input = skip_flag.clone();
                 let wake_notify_for_input = wake_notify.clone();
-                let input_task = tokio::task::spawn_blocking(move || {
+                let _input_thread = std::thread::spawn(move || {
                     use std::io::{self, BufRead};
                     let stdin = io::stdin();
                     for line in stdin.lock().lines().map_while(|v| v.ok()) {
@@ -588,7 +588,6 @@ pub async fn dispatch(
                 }
                 drop(status_tx);
                 let _ = status_task.await;
-                input_task.abort();
             }
             ReviewSubcommand::AdHoc {
                 pr_url,

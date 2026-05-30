@@ -30,6 +30,31 @@ impl GitService for LocalGitAdapter {
         Ok(())
     }
 
+    async fn clone_repo_with_depth(
+        &self,
+        url: &str,
+        target_dir: &Path,
+        depth: usize,
+        ctx: Option<&dyn CommandContext>,
+    ) -> Result<()> {
+        let depth_str = depth.max(1).to_string();
+        run_git_command(
+            ctx,
+            &[
+                "clone",
+                "--no-checkout",
+                "--depth",
+                &depth_str,
+                url,
+                &target_dir.to_string_lossy(),
+            ],
+            None,
+            "git clone",
+        )
+        .await?;
+        Ok(())
+    }
+
     async fn fetch(
         &self,
         target_dir: &Path,

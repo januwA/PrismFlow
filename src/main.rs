@@ -20,6 +20,7 @@ use infrastructure::{
 };
 use interface::cli::Cli;
 use tracing_subscriber::EnvFilter;
+use tracing_subscriber::fmt::time::ChronoLocal;
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -66,5 +67,8 @@ fn init_tracing(log_level: Option<interface::cli::LogLevel>) {
     } else {
         EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"))
     };
-    let _ = tracing_subscriber::fmt().with_env_filter(filter).try_init();
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter(filter)
+        .with_timer(ChronoLocal::rfc_3339())
+        .try_init();
 }

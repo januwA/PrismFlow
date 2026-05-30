@@ -113,7 +113,7 @@ pub struct ReviewWorkflowOptions {
     pub agent_prompt_dirs: Vec<String>,
     pub clone_repo_enabled: bool,
     pub clone_workspace_dir: String,
-    pub clone_depth: usize,
+    pub clone_depth: Option<usize>,
     pub cli_agents: Vec<String>,
     pub include_repos: Vec<String>,
     pub exclude_repos: Vec<String>,
@@ -139,7 +139,7 @@ impl Default for ReviewWorkflowOptions {
             agent_prompt_dirs: vec![],
             clone_repo_enabled: false,
             clone_workspace_dir: ".prismflow/repo-cache".to_string(),
-            clone_depth: 2,
+            clone_depth: None,
             cli_agents: vec![],
             include_repos: vec![],
             exclude_repos: vec![],
@@ -532,6 +532,7 @@ impl<'a> ReviewWorkflow<'a> {
                 .get_pull_request_git_context(owner, repo, pr.number)
                 .await
             {
+                let clone_depth = self.resolve_clone_depth(owner, repo, pr.number).await;
                 if let Ok(repo_dir) = self
                     .prepare_repo_checkout(
                         &ctx.head_clone_url,
@@ -540,6 +541,7 @@ impl<'a> ReviewWorkflow<'a> {
                         owner,
                         repo,
                         pr.number,
+                        clone_depth,
                     )
                     .await
                 {
@@ -549,7 +551,9 @@ impl<'a> ReviewWorkflow<'a> {
                         .as_deref()
                         .map(|c| c as &dyn CommandContext);
                     if let Ok(commit_count) = self.git.commit_count(&repo_dir, cmd_ctx).await {
-                        if commit_count <= 1 {
+                        // With shallow depth=1 the local history count is not reliable,
+                        // so only apply this historical bootstrap skip when depth > 1.
+                        if clone_depth > 1 && commit_count <= 1 {
                             self.emit_status(format!(
                                 "pr_url={} stage=Skipped reason=single-commit-history",
                                 pr_url
@@ -757,6 +761,7 @@ impl<'a> ReviewWorkflow<'a> {
         owner: &str,
         repo: &str,
         pr_number: u64,
+        clone_depth: usize,
     ) -> Result<PathBuf> {
         let cwd = self.fs.current_dir()?;
         let root = cwd.join(&self.options.clone_workspace_dir);
@@ -782,7 +787,7 @@ impl<'a> ReviewWorkflow<'a> {
 
         if !self.fs.exists(&target.join(".git")) {
             self.git
-                .clone_repo(clone_url, &target, ctx)
+                .clone_repo_with_depth(clone_url, &target, clone_depth, ctx)
                 .await
                 .context("git clone failed")?;
         }
@@ -790,13 +795,13 @@ impl<'a> ReviewWorkflow<'a> {
         // Fetch by sha
         if let Err(_) = self
             .git
-            .fetch(&target, "origin", head_sha, self.options.clone_depth, ctx)
+            .fetch(&target, "origin", head_sha, clone_depth, ctx)
             .await
         {
             // fallback fetch by ref
             let refspec = format!("refs/heads/{head_ref}");
             self.git
-                .fetch(&target, "origin", &refspec, self.options.clone_depth, ctx)
+                .fetch(&target, "origin", &refspec, clone_depth, ctx)
                 .await
                 .context("git fetch by ref failed")?;
         }
@@ -814,6 +819,29 @@ impl<'a> ReviewWorkflow<'a> {
         }
 
         Ok(target)
+    }
+
+    async fn resolve_clone_depth(&self, owner: &str, repo: &str, pr_number: u64) -> usize {
+        if let Some(depth) = self.options.clone_depth {
+            return depth.max(1);
+        }
+        match self
+            .github
+            .get_pull_request_commit_count(owner, repo, pr_number)
+            .await
+        {
+            Ok(depth) => depth.max(1),
+            Err(err) => {
+                tracing::warn!(
+                    owner = owner,
+                    repo = repo,
+                    pr_number = pr_number,
+                    error = %err,
+                    "failed to resolve clone depth from PR commits, fallback to depth=2"
+                );
+                2
+            }
+        }
     }
 
     async fn with_retry<T, F, Fut>(&self, mut op: F) -> Result<T>
@@ -1232,8 +1260,15 @@ impl<'a> ReviewWorkflow<'a> {
                 return Err(e);
             }
         };
+        let trimmed_output = output.trim();
+        if is_engine_execution_error_summary(trimmed_output) {
+            anyhow::bail!(
+                "engine returned execution error sentinel output: {}",
+                trimmed_output
+            );
+        }
 
-        let summary = if output.trim().is_empty() {
+        let summary = if trimmed_output.is_empty() {
             "Shell engine returned empty output.".to_string()
         } else {
             output
@@ -1282,6 +1317,10 @@ fn cache_now_unix_secs_u64() -> u64 {
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs()
+}
+
+fn is_engine_execution_error_summary(summary: &str) -> bool {
+    summary.trim().eq_ignore_ascii_case("Execution error")
 }
 
 fn find_latest_timestamped_cache_dir(root: &std::path::Path, base_name: &str) -> Option<PathBuf> {
@@ -2449,7 +2488,7 @@ mod tests {
                 .expect("lock calls")
                 .push(command_line.to_string());
             if command_line.contains("engine-a") {
-                return Err(anyhow!("temporary timeout while running engine-a"));
+                return Ok("Execution error".to_string());
             }
             Ok("src/lib.rs:2: fallback engine review".to_string())
         }
@@ -2505,7 +2544,7 @@ mod tests {
             &git,
             normalize_test_opts(ReviewWorkflowOptions {
                 clone_workspace_dir: ".prismflow/test-review-cache".to_string(),
-                clone_depth: 1,
+                clone_depth: Some(1),
                 ..ReviewWorkflowOptions::default()
             }),
         );
@@ -2518,6 +2557,7 @@ mod tests {
                 "owner",
                 "repo",
                 7,
+                1,
             )
             .await
             .expect("prepare_repo_checkout should succeed with fallback fetch");
@@ -2557,7 +2597,7 @@ mod tests {
             &git,
             normalize_test_opts(ReviewWorkflowOptions {
                 clone_workspace_dir: workspace.to_string(),
-                clone_depth: 1,
+                clone_depth: Some(1),
                 ..ReviewWorkflowOptions::default()
             }),
         );
@@ -2570,6 +2610,7 @@ mod tests {
                 "owner",
                 "repo",
                 7,
+                1,
             )
             .await
             .expect("prepare_repo_checkout should refresh timestamped dir");
@@ -2818,6 +2859,7 @@ mod tests {
             &git,
             ReviewWorkflowOptions {
                 clone_repo_enabled: true,
+                clone_depth: Some(2),
                 ..normalize_test_opts(ReviewWorkflowOptions::default())
             },
         )
@@ -3254,7 +3296,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn engine_failure_cleans_processing_anchor_and_falls_back_to_next_engine() {
+    async fn engine_execution_error_output_falls_back_to_next_engine() {
         let github = MockGitHub {
             prs: vec![PullRequestSummary {
                 number: 1,

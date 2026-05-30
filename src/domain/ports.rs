@@ -96,6 +96,17 @@ pub trait GitHubRepository: Send + Sync {
     ) -> Result<Vec<String>> {
         Ok(Vec::new())
     }
+    async fn get_pull_request_commit_count(
+        &self,
+        owner: &str,
+        repo: &str,
+        pull_number: u64,
+    ) -> Result<usize> {
+        let commits = self
+            .list_pull_request_commit_messages(owner, repo, pull_number)
+            .await?;
+        Ok(commits.len().max(1))
+    }
     async fn list_issue_comment_bodies(
         &self,
         owner: &str,
@@ -188,6 +199,16 @@ pub trait GitService: Send + Sync {
         target_dir: &Path,
         ctx: Option<&dyn CommandContext>,
     ) -> Result<()>;
+    async fn clone_repo_with_depth(
+        &self,
+        url: &str,
+        target_dir: &Path,
+        depth: usize,
+        ctx: Option<&dyn CommandContext>,
+    ) -> Result<()> {
+        let _ = depth;
+        self.clone_repo(url, target_dir, ctx).await
+    }
     async fn fetch(
         &self,
         target_dir: &Path,

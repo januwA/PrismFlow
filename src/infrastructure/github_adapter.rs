@@ -294,6 +294,23 @@ impl GitHubRepository for OctocrabGitHubRepository {
         Ok(messages)
     }
 
+    async fn get_pull_request_commit_count(
+        &self,
+        owner: &str,
+        repo: &str,
+        pull_number: u64,
+    ) -> Result<usize> {
+        #[derive(Debug, Deserialize)]
+        struct PullDto {
+            commits: usize,
+        }
+
+        let _permit = self.acquire_api_permit().await?;
+        let route = format!("/repos/{owner}/{repo}/pulls/{pull_number}");
+        let pr: PullDto = self.client.get(route, None::<&()>).await?;
+        Ok(pr.commits.max(1))
+    }
+
     async fn list_issue_comment_bodies(
         &self,
         owner: &str,

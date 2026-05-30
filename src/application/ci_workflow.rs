@@ -45,7 +45,7 @@ pub struct CiWorkflowOptions {
     pub engine_prompt: Option<String>,
     pub clone_repo_enabled: bool,
     pub clone_workspace_dir: String,
-    pub clone_depth: usize,
+    pub clone_depth: Option<usize>,
     pub include_repos: Vec<String>,
     pub exclude_repos: Vec<String>,
     pub task_context: Option<Arc<TaskContext>>,
@@ -60,7 +60,7 @@ impl Default for CiWorkflowOptions {
             engine_prompt: None,
             clone_repo_enabled: false,
             clone_workspace_dir: ".prismflow/ci-repo-cache".to_string(),
-            clone_depth: 2,
+            clone_depth: None,
             include_repos: vec![],
             exclude_repos: vec![],
             task_context: None,
@@ -216,6 +216,7 @@ impl<'a> CiWorkflow<'a> {
                             owner,
                             repo,
                             pr.number,
+                            self.resolve_clone_depth(owner, repo, pr.number).await,
                         )
                         .await
                     {
@@ -323,6 +324,7 @@ impl<'a> CiWorkflow<'a> {
         owner: &str,
         repo: &str,
         pr_number: u64,
+        clone_depth: usize,
     ) -> Result<PathBuf> {
         let cwd = self.fs.current_dir().unwrap_or_else(|_| PathBuf::from("."));
         let root = cwd.join(&self.options.clone_workspace_dir);
@@ -347,7 +349,7 @@ impl<'a> CiWorkflow<'a> {
 
         if !self.fs.exists(&target.join(".git")) {
             self.git
-                .clone_repo(clone_url, &target, ctx)
+                .clone_repo_with_depth(clone_url, &target, clone_depth, ctx)
                 .await
                 .context("git clone failed")?;
         }
@@ -355,13 +357,13 @@ impl<'a> CiWorkflow<'a> {
         // Fetch by sha
         if let Err(_) = self
             .git
-            .fetch(&target, "origin", head_sha, self.options.clone_depth, ctx)
+            .fetch(&target, "origin", head_sha, clone_depth, ctx)
             .await
         {
             // fallback fetch by ref
             let refspec = format!("refs/heads/{head_ref}");
             self.git
-                .fetch(&target, "origin", &refspec, self.options.clone_depth, ctx)
+                .fetch(&target, "origin", &refspec, clone_depth, ctx)
                 .await
                 .context("git fetch by ref failed")?;
         }
@@ -379,6 +381,29 @@ impl<'a> CiWorkflow<'a> {
         }
 
         Ok(target)
+    }
+
+    async fn resolve_clone_depth(&self, owner: &str, repo: &str, pr_number: u64) -> usize {
+        if let Some(depth) = self.options.clone_depth {
+            return depth.max(1);
+        }
+        match self
+            .github
+            .get_pull_request_commit_count(owner, repo, pr_number)
+            .await
+        {
+            Ok(depth) => depth.max(1),
+            Err(err) => {
+                tracing::warn!(
+                    owner = owner,
+                    repo = repo,
+                    pr_number = pr_number,
+                    error = %err,
+                    "failed to resolve clone depth from PR commits, fallback to depth=2"
+                );
+                2
+            }
+        }
     }
 }
 
@@ -1046,7 +1071,7 @@ mod tests {
             &git,
             CiWorkflowOptions {
                 clone_workspace_dir: ".prismflow/test-ci-cache".to_string(),
-                clone_depth: 1,
+                clone_depth: Some(1),
                 ..CiWorkflowOptions::default()
             },
         );
@@ -1059,6 +1084,7 @@ mod tests {
                 "owner",
                 "repo",
                 42,
+                1,
             )
             .await
             .expect("prepare_repo_checkout should succeed with fallback fetch");
@@ -1103,7 +1129,7 @@ mod tests {
             &git,
             CiWorkflowOptions {
                 clone_workspace_dir: workspace.to_string(),
-                clone_depth: 1,
+                clone_depth: Some(1),
                 ..CiWorkflowOptions::default()
             },
         );
@@ -1116,6 +1142,7 @@ mod tests {
                 "owner",
                 "repo",
                 42,
+                1,
             )
             .await
             .expect("prepare_repo_checkout should refresh timestamped dir");
