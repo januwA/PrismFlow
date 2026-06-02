@@ -392,7 +392,7 @@ impl<'a> CiWorkflow<'a> {
             .get_pull_request_commit_count(owner, repo, pr_number)
             .await
         {
-            Ok(depth) => depth.max(1),
+            Ok(depth) => depth.max(1) + 1,
             Err(err) => {
                 tracing::warn!(
                     owner = owner,

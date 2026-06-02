@@ -142,7 +142,6 @@ mod tests {
         collections::HashMap,
         fs,
         path::{Path, PathBuf},
-        sync::Arc,
         time::{SystemTime, UNIX_EPOCH},
     };
 
